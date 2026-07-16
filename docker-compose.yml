@@ -1,0 +1,14 @@
+services:
+  pihub:
+    build: .
+    container_name: pihub
+    env_file: .env
+    ports:
+      - "${PIHUB_MANAGER_PORT:-4000}:${PIHUB_MANAGER_PORT:-4000}"
+      - "4100-4199:4100-4199"
+    volumes:
+      - pihub-data:/data
+    restart: unless-stopped
+
+volumes:
+  pihub-data:

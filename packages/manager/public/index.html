@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pihub · manager</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- ==================== LOGIN ==================== -->
+  <div id="login" class="hidden">
+    <form id="login-form" class="login-card">
+      <div class="login-logo">pihub</div>
+      <div class="login-subtitle">Accede al panel de control</div>
+      <div class="input-group">
+        <label class="input-label" for="token-input">Token de acceso</label>
+        <input id="token-input" type="password" class="input input-mono" placeholder="API_TOKEN" autofocus />
+      </div>
+      <button type="submit" class="btn btn-primary btn-lg" style="width: 100%; margin-top: var(--space-2)">Entrar</button>
+      <p id="login-error" class="error" style="text-align: center; margin-top: var(--space-3)"></p>
+    </form>
+  </div>
+
+  <!-- ==================== APP ==================== -->
+  <div id="app" class="hidden">
+    <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+    <div class="app-shell">
+      <aside class="app-sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div class="sidebar-logo">pihub</div>
+          <div class="sidebar-subtitle">Manager</div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <div class="sidebar-section">
+            <div class="sidebar-section-label">Manager</div>
+            <a class="sidebar-link active" data-screen="agents">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+              Agentes
+            </a>
+            <a class="sidebar-link" data-screen="packages">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3z"/><path d="M2 5l6 3m0 0l6-3m-6 3v6"/></svg>
+              Paquetes
+            </a>
+            <a class="sidebar-link" data-screen="env">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4h8v8H4z"/><path d="M4 8h8M8 4v8"/></svg>
+              Variables
+            </a>
+            <a class="sidebar-link hidden" id="nav-oauth" data-screen="oauth">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1"/></svg>
+              OAuth
+            </a>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button id="theme-toggle" class="sidebar-theme-toggle" type="button">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="3"/><path d="M8 1v2m0 10v2M1 8h2m10 0h2m-2.5-5.5L12 4.5m-8 7l-1.5 1.5M13.5 11.5L12 10.5m-8-7L2.5 2"/></svg>
+            <span id="theme-label">Tema claro</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="app-main">
+        <div class="mobile-header">
+          <button class="mobile-hamburger" id="hamburger" type="button" aria-label="Menú">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+          </button>
+          <span class="mobile-title">pihub manager</span>
+        </div>
+
+        <!-- ===== AGENTS ===== -->
+        <div class="screen active" id="screen-agents">
+          <div class="screen-header">
+            <h1 class="screen-title">Agentes</h1>
+            <span id="status-line" class="list-item-sub"></span>
+          </div>
+          <div class="screen-body">
+            <div id="agent-list" class="card-grid"></div>
+
+            <details id="create-agent" class="create-panel">
+              <summary>
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 2v10M2 7h10"/></svg>
+                Nuevo agente
+              </summary>
+              <div class="card">
+                <form id="create-form" class="form-stack">
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="new-name">Nombre</label>
+                    <input id="new-name" class="input" placeholder="minúsculas, guiones" required />
+                  </div>
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="new-model">Modelo</label>
+                    <select id="new-model-select" class="select hidden"></select>
+                    <input id="new-model" class="input input-mono" placeholder="proveedor/id (opcional)" />
+                  </div>
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="new-telegram">Token bot Telegram</label>
+                    <input id="new-telegram" class="input input-mono" placeholder="opcional" />
+                  </div>
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="new-system">System prompt / persona</label>
+                    <textarea id="new-system" class="input" rows="4" placeholder="Opcional. Ej: Eres un dev senior con 10 años de experiencia…"></textarea>
+                  </div>
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="new-packages">Paquetes iniciales</label>
+                    <input id="new-packages" class="input" placeholder="separados por coma (opcional)" />
+                  </div>
+                  <div style="display: flex; align-items: center; gap: var(--space-3)">
+                    <button type="submit" class="btn btn-primary">Crear</button>
+                    <span id="create-error" class="error" style="margin: 0"></span>
+                  </div>
+                </form>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- ===== AGENT WORKSPACE ===== -->
+        <div class="screen agent-workspace-screen" id="screen-agent">
+          <div class="screen-header agent-screen-header">
+            <div class="agent-heading">
+              <button id="agent-back" class="btn btn-ghost btn-sm" type="button" aria-label="Volver a agentes">←</button>
+              <div>
+                <h1 class="screen-title" id="selected-agent-name">Agent</h1>
+                <div class="list-item-sub" id="selected-agent-model"></div>
+              </div>
+            </div>
+            <span id="agent-connection" class="chip"><span class="chip-dot"></span><span id="agent-connection-text">Desconectado</span></span>
+          </div>
+
+          <div class="agent-tabs" role="tablist" aria-label="Vista del Agent">
+            <button id="agent-tab-chat" class="agent-tab active" type="button" role="tab">Chat</button>
+            <button id="agent-tab-resources" class="agent-tab" type="button" role="tab">Recursos</button>
+          </div>
+
+          <div id="agent-panel-chat" class="agent-panel active">
+            <div id="agent-messages" class="chat-messages"></div>
+            <div class="chat-input-bar">
+              <div id="agent-command-menu" class="command-menu hidden"></div>
+              <form id="agent-chat-form" class="chat-input-wrapper">
+                <button id="agent-attach" type="button" class="chat-icon-btn" aria-label="Adjuntar archivo" title="Adjuntar archivo">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
+                </button>
+                <input id="agent-attach-input" type="file" class="hidden" accept=".txt,.md,.json,.js,.jsx,.ts,.tsx,.py,.csv,.log,.yml,.yaml,.html,.css,.sh,text/*" />
+                <textarea id="agent-chat-input" class="input chat-input" rows="1" placeholder="Escribe un mensaje…"></textarea>
+                <button id="agent-mic" class="chat-icon-btn hidden" type="button" aria-label="Enviar audio" title="Enviar audio">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5a2 2 0 0 0-2 2v4a2 2 0 0 0 4 0v-4a2 2 0 0 0-2-2Z"/><path d="M4 7.5v.5a4 4 0 0 0 8 0v-.5"/><path d="M8 12v2.5M6 14.5h4"/></svg>
+                </button>
+                <button id="agent-send" class="chat-icon-btn chat-send" type="submit" aria-label="Enviar">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
+                </button>
+                <button id="agent-abort" class="chat-icon-btn chat-abort hidden" type="button" aria-label="Abortar">
+                  <svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>
+                </button>
+              </form>
+            </div>
+          </div>
+
+          <div id="agent-panel-resources" class="agent-panel">
+            <div class="agent-resources-grid">
+              <section class="card resource-card">
+                <div class="card-title">Instalar recurso</div>
+                <p class="list-item-sub">Skills, extensiones, prompts y templates mediante un paquete pi.</p>
+                <form id="agent-package-form" class="form-stack">
+                  <input id="agent-package-source" class="input input-mono" placeholder="npm:@scope/pkg · git:github.com/user/repo" />
+                  <div class="resource-form-actions">
+                    <label><input type="radio" name="agent-package-scope" value="agent" checked /> Este Agent</label>
+                    <label><input type="radio" name="agent-package-scope" value="global" /> Global</label>
+                    <button class="btn btn-primary" type="submit">Instalar</button>
+                  </div>
+                  <p id="agent-package-status" class="list-item-sub"></p>
+                </form>
+              </section>
+
+              <section class="card resource-card">
+                <div class="card-title">Añadir secreto o variable</div>
+                <p class="list-item-sub">Los valores guardados nunca se muestran.</p>
+                <form id="agent-env-form" class="form-stack">
+                  <div class="input-row">
+                    <input id="agent-env-key" class="input input-mono" placeholder="CLAVE" />
+                    <input id="agent-env-value" class="input input-mono" type="password" placeholder="valor" />
+                  </div>
+                  <div class="resource-form-actions">
+                    <label><input type="radio" name="agent-env-scope" value="agent" checked /> Este Agent</label>
+                    <label><input type="radio" name="agent-env-scope" value="global" /> Global</label>
+                    <button class="btn btn-primary" type="submit">Guardar</button>
+                  </div>
+                  <p id="agent-env-status" class="list-item-sub"></p>
+                </form>
+              </section>
+
+              <section class="card resource-card">
+                <div class="card-title" style="display: flex; align-items: center; gap: var(--space-3)">
+                  Bot de Telegram
+                  <span id="agent-telegram-chip" class="chip"><span class="chip-dot"></span><span id="agent-telegram-chip-text">Sin configurar</span></span>
+                </div>
+                <p class="list-item-sub">El token nunca se muestra. Guardar o quitar reinicia el Agent.</p>
+                <form id="agent-telegram-form" class="form-stack">
+                  <input id="agent-telegram-token" class="input input-mono" type="password" placeholder="token de @BotFather" autocomplete="off" />
+                  <div class="resource-form-actions">
+                    <button id="agent-telegram-remove" class="btn btn-ghost btn-sm hidden" type="button" style="color: var(--danger)">Quitar bot</button>
+                    <button class="btn btn-primary" type="submit">Guardar token</button>
+                  </div>
+                  <p id="agent-telegram-status" class="list-item-sub"></p>
+                </form>
+              </section>
+
+              <section class="card resource-card">
+                <div class="card-title" style="display: flex; align-items: center; gap: var(--space-3)">
+                  Voz (TTS)
+                  <span id="agent-voice-chip" class="chip"><span class="chip-dot"></span><span id="agent-voice-chip-text">Voz global</span></span>
+                </div>
+                <p class="list-item-sub">Voz de kokoro con la que este Agent responde audios en Telegram. Vacío = voz global de la plataforma. Guardar reinicia el Agent.</p>
+                <form id="agent-voice-form" class="form-stack">
+                  <input id="agent-voice-input" class="input input-mono" placeholder="p.ej. af_heart" autocomplete="off" />
+                  <div class="resource-form-actions">
+                    <button id="agent-voice-remove" class="btn btn-ghost btn-sm hidden" type="button" style="color: var(--danger)">Usar voz global</button>
+                    <button class="btn btn-primary" type="submit">Guardar voz</button>
+                  </div>
+                  <p id="agent-voice-status" class="list-item-sub"></p>
+                </form>
+              </section>
+
+              <section class="resource-list-section">
+                <div class="card-title">Recursos de este Agent</div>
+                <div id="agent-packages" class="list"></div>
+              </section>
+              <section class="resource-list-section">
+                <div class="card-title">Recursos globales</div>
+                <div id="agent-global-packages" class="list"></div>
+              </section>
+              <section class="resource-list-section">
+                <div class="card-title">Variables de este Agent</div>
+                <div id="agent-env" class="list"></div>
+              </section>
+              <section class="resource-list-section">
+                <div class="card-title">Variables globales</div>
+                <div id="agent-global-env" class="list"></div>
+              </section>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== PACKAGES ===== -->
+        <div class="screen" id="screen-packages">
+          <div class="screen-header">
+            <h1 class="screen-title">Paquetes globales</h1>
+          </div>
+          <div class="screen-body">
+            <div class="card" style="margin-bottom: var(--space-6)">
+              <div class="card-title" style="margin-bottom: var(--space-4)">Instalar paquete global</div>
+              <form id="install-form" class="form-stack">
+                <div class="input-group" style="margin: 0">
+                  <label class="input-label" for="install-source">Origen</label>
+                  <input id="install-source" class="input input-mono" placeholder="npm:@foo/bar · git:github.com/user/repo@v1" />
+                </div>
+                <div style="display: flex; align-items: center; gap: var(--space-3)">
+                  <button type="submit" class="btn btn-primary">Instalar global</button>
+                  <span id="install-status" class="list-item-sub"></span>
+                </div>
+              </form>
+            </div>
+
+            <div class="card-title" style="margin-bottom: var(--space-3)">Instalados</div>
+            <div id="global-packages" class="list"></div>
+          </div>
+        </div>
+
+        <!-- ===== ENV VARS ===== -->
+        <div class="screen" id="screen-env">
+          <div class="screen-header">
+            <h1 class="screen-title">Variables de entorno</h1>
+          </div>
+          <div class="screen-body">
+            <div class="warning-banner">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 2l6.5 11H1.5z"/><path d="M8 7v3M8 12v.5"/></svg>
+              Guardar reiniciará todos los agentes activos
+            </div>
+
+            <div class="card" style="margin: var(--space-4) 0 var(--space-6)">
+              <div class="card-title" style="margin-bottom: var(--space-4)">Añadir variable global</div>
+              <p class="list-item-sub" style="margin-bottom: var(--space-4)">Secretos y config compartidos por todos los agentes (p.ej. <code>GITHUB_TOKEN</code>). Los valores no se muestran.</p>
+              <form id="env-form" class="form-stack">
+                <div class="input-row">
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="env-key">Clave</label>
+                    <input id="env-key" class="input input-mono" placeholder="CLAVE" />
+                  </div>
+                  <div class="input-group" style="margin: 0">
+                    <label class="input-label" for="env-value">Valor</label>
+                    <input id="env-value" type="password" class="input input-mono" placeholder="valor" />
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: var(--space-3)">
+                  <button type="submit" class="btn btn-primary">Guardar global</button>
+                  <span id="env-status" class="list-item-sub"></span>
+                </div>
+              </form>
+            </div>
+
+            <div class="card-title" style="margin-bottom: var(--space-3)">Definidas</div>
+            <div id="global-env" class="list"></div>
+          </div>
+        </div>
+
+        <!-- ===== OAUTH ===== -->
+        <div class="screen" id="screen-oauth">
+          <div class="screen-header">
+            <h1 class="screen-title">Proveedores OAuth</h1>
+          </div>
+          <div class="screen-body" id="oauth-section">
+            <div id="oauth-list" class="card-grid"></div>
+            <div id="oauth-flow" class="hidden card" style="margin-top: var(--space-6)">
+              <p id="oauth-msg"></p>
+              <a id="oauth-url" target="_blank" rel="noopener"></a>
+              <p id="oauth-code" class="list-item-sub"></p>
+              <form id="oauth-input-form" class="hidden" style="display: flex; gap: var(--space-3)">
+                <input id="oauth-input" class="input" placeholder="pega aquí el código" />
+                <button type="submit" class="btn btn-primary">Enviar</button>
+              </form>
+              <div id="oauth-select" class="hidden"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script type="module" src="/panel.js"></script>
+</body>
+</html>

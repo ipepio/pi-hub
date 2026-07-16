@@ -1,0 +1,28 @@
+# Dependencias
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Entorno y datos sensibles
+.env
+data/
+models.json
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# TypeScript incremental
+*.tsbuildinfo

@@ -1,0 +1,21 @@
+{
+  "agents": [
+    {
+      "name": "asistente",
+      "model": "anthropic/claude-sonnet-5",
+      "thinkingLevel": "medium",
+      "systemPromptFile": "/data/provision/asistente.md",
+      "telegramToken": "${ASISTENTE_TELEGRAM_TOKEN}",
+      "ttsVoice": "af_heart",
+      "memory": { "sharedAccess": "read" },
+      "packages": ["npm:@ejemplo/skill"],
+      "enabled": true
+    },
+    {
+      "name": "vigia",
+      "model": "${VIGIA_MODEL}",
+      "systemPrompt": "Eres un agente de monitorización. Observa y reporta, no cambies nada.",
+      "enabled": false
+    }
+  ]
+}

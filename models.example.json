@@ -1,0 +1,43 @@
+{
+  "providers": {
+    "mi-proveedor": {
+      "baseUrl": "https://api.ejemplo.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$MI_PROVEEDOR_API_KEY",
+      "timeoutSeconds": 300,
+      "models": [
+        {
+          "id": "modelo-1",
+          "name": "Modelo 1 (Mi Proveedor)",
+          "api": "openai-completions",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 128000,
+          "maxTokens": 32000
+        },
+        {
+          "id": "modelo-2",
+          "name": "Modelo 2 (Mi Proveedor)",
+          "api": "openai-completions",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 64000,
+          "maxTokens": 16000
+        }
+      ],
+      "authHeader": true
+    }
+  }
+}

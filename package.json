@@ -1,0 +1,18 @@
+{
+  "name": "pihub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "node --test --experimental-strip-types packages/shared/test/*.test.js packages/runner/test/*.test.js packages/manager/test/*.test.js packages/memory-extension/test/*.test.js",
+    "start": "node packages/manager/dist/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
