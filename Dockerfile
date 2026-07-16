@@ -1,5 +1,10 @@
 FROM ubuntu:24.04
 
+# OCI labels — set via docker build --label or CI
+LABEL org.opencontainers.image.version="pihub:0.1.0"
+LABEL org.opencontainers.image.source="https://github.com/earendil-works/goguest_agent_pi"
+LABEL org.opencontainers.image.ref="0.80.3"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,7 +17,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # pi CLI global (para `pi install/remove/list` desde el manager)
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.3
 
 WORKDIR /app
 
