@@ -1,155 +1,190 @@
-// T01.03 — Contract Red tests para `/api/v1` del Manager
-// Estos tests demuestran que la interfaz versionada y el service auth
-// aún NO existen. Deben fallar con mensajes claros de "capacidad ausente".
+// T01.03 — Contract Red tests para `/api/v1` del Manager.
+//
+// Estos tests afirman el comportamiento OBJETIVO descrito en
+// docs/manager-api-v1.md, no el comportamiento actual. Deben fallar hoy
+// porque la interfaz versionada y el error envelope todavía no existen;
+// la MISMA suite, sin editar, debe pasar a verde cuando H01.01/H01.02 la
+// implementen (Red → Green real, no una descripción de la ausencia).
+//
+// Requiere un Manager real arrancado y accesible (docker compose up),
+// igual que el resto de suites de contrato del roadmap. Variables:
+//   MANAGER_URL — default http://127.0.0.1:4000
+//   API_TOKEN   — credencial de servicio actual del Manager en ejecución
+//                 (se lee de esta env var o, si falta, del .env del repo;
+//                 nunca se hardcodea ni se loguea).
 //
 // Ejecutar con: npm run test:contract-red
 
-import { describe, it } from "node:test";
+import { describe, it, before } from "node:test";
 import assert from "node:assert";
-import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const BASE_URL = "http://127.0.0.1:4000";
+const MANAGER_URL = process.env.MANAGER_URL ?? "http://127.0.0.1:4000";
 
-/**
- * Helper para hacer requests HTTP con auth opcional.
- */
-async function request(
-  path: string,
-  options: {
-    method?: string;
-    body?: unknown;
-    token?: string;
-  } = {}
-): Promise<{ status: number; body: unknown }> {
-  const url = new URL(path, BASE_URL);
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (options.token) {
-    headers["Authorization"] = `Bearer ${options.token}`;
+function loadApiToken(): string {
+  if (process.env.API_TOKEN) return process.env.API_TOKEN;
+
+  const envPath = fileURLToPath(new URL("../../../.env", import.meta.url));
+  try {
+    const raw = readFileSync(envPath, "utf8");
+    const match = raw.match(/^API_TOKEN=(.*)$/m);
+    if (match?.[1]) return match[1].trim();
+  } catch {
+    // handled below
   }
 
-  const res = await fetch(url.toString(), {
+  throw new Error(
+    "API_TOKEN no disponible: exporta API_TOKEN o arranca el Manager con " +
+      "`docker compose up` (lee .env) antes de correr esta suite.",
+  );
+}
+
+let VALID_TOKEN: string;
+
+before(() => {
+  VALID_TOKEN = loadApiToken();
+});
+
+async function request(
+  path: string,
+  options: { method?: string; body?: unknown; auth?: "valid" | "invalid" | "none" } = {},
+): Promise<{ status: number; body: unknown; rawText: string }> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const auth = options.auth ?? "valid";
+  if (auth === "valid") headers["Authorization"] = `Bearer ${VALID_TOKEN}`;
+  if (auth === "invalid") headers["Authorization"] = "Bearer this-token-is-not-valid";
+
+  const res = await fetch(new URL(path, MANAGER_URL), {
     method: options.method ?? "GET",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
 
-  const bodyText = await res.text();
+  const rawText = await res.text();
   let body: unknown;
   try {
-    body = JSON.parse(bodyText);
+    body = JSON.parse(rawText);
   } catch {
-    body = bodyText;
+    body = rawText;
   }
 
-  return { status: res.status, body };
+  return { status: res.status, body, rawText };
 }
 
-describe("T01.03 — Contract Red: /api/v1 no existe todavía", () => {
-  it("RED: GET /api/v1/health responde 404 porque la ruta no existe", async () => {
-    // Spec §4.2: GET /api/v1/health debe responder con health envelope
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/health");
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-  });
+/** Spec §7: ningún response debe filtrar paths, puertos de Runner o el token. */
+function assertNoInternalsLeaked(rawText: string) {
+  assert.doesNotMatch(rawText, /\/data\b/, "no debe exponer el path de datos interno");
+  assert.doesNotMatch(rawText, /\b41\d{2}\b/, "no debe exponer puertos de Runner (4100-4199)");
+  assert.doesNotMatch(rawText, new RegExp(VALID_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no debe exponer el token de servicio");
+}
 
-  it("RED: GET /api/v1/readiness responde 404 porque la ruta no existe", async () => {
-    // Spec §4.2: GET /api/v1/readiness debe responder con readiness envelope
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/readiness");
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-  });
+describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () => {
+  describe("§3.3 — Service auth", () => {
+    it("sin credencial responde 401 con {code: MISSING_AUTH, correlationId}", async () => {
+      const { status, body, rawText } = await request("/api/status", { auth: "none" });
 
-  it("RED: GET /api/v1/agents responde 404 porque la ruta no existe", async () => {
-    // Spec §4.3: GET /api/v1/agents debe listar agentes
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents");
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1/agents no está implementado");
-  });
-
-  it("RED: POST /api/v1/agents sin auth responde 404 (no 401 con error tipado)", async () => {
-    // Spec §3.3: sin auth debe recibir 401 con {code: "MISSING_AUTH", ...}
-    // Red: la ruta no existe → 404, no el 401 esperado
-    const { status } = await request("/api/v1/agents", { method: "POST", body: { name: "test" } });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-  });
-
-  it("RED: POST /api/v1/agents con auth inválida responde 401 con MISSING_AUTH o INVALID_AUTH", async () => {
-    // Spec §3.3: con token inválido debe recibir 401 con {code: "INVALID_AUTH", ...}
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents", {
-      method: "POST",
-      body: { name: "test" },
-      token: "token-invalido-12345",
+      assert.strictEqual(status, 401);
+      assert.strictEqual(
+        (body as { code?: string }).code,
+        "MISSING_AUTH",
+        `esperaba code MISSING_AUTH, respuesta actual: ${rawText}`,
+      );
+      assert.ok((body as { correlationId?: string }).correlationId, "falta correlationId");
     });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-  });
 
-  it("RED: POST /api/v1/agents con credencial ausente responde 401 con MISSING_AUTH", async () => {
-    // Spec §3.3: sin credencial debe recibir 401 con {code: "MISSING_AUTH", ...}
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents", {
-      method: "POST",
-      body: { name: "test" },
+    it("con credencial inválida responde 401 con {code: INVALID_AUTH}", async () => {
+      const { status, body, rawText } = await request("/api/status", { auth: "invalid" });
+
+      assert.strictEqual(status, 401);
+      assert.strictEqual(
+        (body as { code?: string }).code,
+        "INVALID_AUTH",
+        `esperaba code INVALID_AUTH (distinto de MISSING_AUTH), respuesta actual: ${rawText}`,
+      );
     });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
   });
 
-  it("RED: POST /api/v1/agents con body inválido responde 400 con BAD_REQUEST", async () => {
-    // Spec §4.3: body inválido debe recibir 400 con {code: "BAD_REQUEST", ...}
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents", {
-      method: "POST",
-      body: {}, // sin nombre
+  describe("§4.2 — Health y Readiness", () => {
+    it("GET /api/v1/health responde 200 con {status: ok, version, timestamp}", async () => {
+      const { status, body, rawText } = await request("/api/v1/health");
+
+      assert.strictEqual(status, 200, `todavía no existe /api/v1: ${rawText}`);
+      const parsed = body as { status?: string; version?: string; timestamp?: string };
+      assert.strictEqual(parsed.status, "ok");
+      assert.ok(parsed.version);
+      assert.ok(parsed.timestamp);
     });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-  });
 
-  it("RED: Los errores del servidor no exponen paths, puertos ni tokens internos", async () => {
-    // Spec §3.3 y §7: los errores nunca exponen secretos ni detalles internos
-    // Red: no hay forma de verificar esto porque la ruta no existe
-    const { status, body } = await request("/api/v1/agents/this-does-not-exist");
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1 no está implementado");
-    // Una vez implementado, se verificaría que el body es {code, message, correlationId}
-    // y no contiene paths, puertos, ni tokens.
-  });
+    it("GET /api/v1/readiness responde 200 con {status, checks: []}", async () => {
+      const { status, body, rawText } = await request("/api/v1/readiness");
 
-  it("RED: POST /api/v1/agents/:name/sessions no existe", async () => {
-    // Spec §4.4: POST /api/v1/agents/:name/sessions debe crear sesión
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents/test-agent/sessions", {
-      method: "POST",
-      body: { channel: "web", sessionKey: "test-key" },
+      assert.strictEqual(status, 200, `todavía no existe /api/v1: ${rawText}`);
+      assert.ok(Array.isArray((body as { checks?: unknown[] }).checks));
     });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1/sessions no está implementado");
   });
 
-  it("RED: POST /api/v1/agents/:name/turns no existe", async () => {
-    // Spec §4.5: POST /api/v1/agents/:name/turns debe ejecutar turno con streaming
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents/test-agent/turns", {
-      method: "POST",
-      body: {
-        sessionKey: "test-key",
-        turnId: "turn-001",
-        idempotencyKey: "idem-001",
-        correlationId: "req-001",
-        message: "Hola",
-      },
+  describe("§4.3 — Agents", () => {
+    it("GET /api/v1/agents responde 200 con un array", async () => {
+      const { status, body, rawText } = await request("/api/v1/agents");
+
+      assert.strictEqual(status, 200, `todavía no existe /api/v1/agents: ${rawText}`);
+      assert.ok(Array.isArray(body));
     });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1/turns no está implementado");
+
+    it("POST /api/v1/agents con body inválido responde 400 con {code: BAD_REQUEST}", async () => {
+      const { status, body, rawText } = await request("/api/v1/agents", {
+        method: "POST",
+        body: {},
+      });
+
+      assert.strictEqual(status, 400, `todavía no existe /api/v1/agents: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "BAD_REQUEST");
+    });
+
+    it("DELETE /api/v1/agents/:name inexistente responde 404 con {code: AGENT_NOT_FOUND}", async () => {
+      const { status, body, rawText } = await request("/api/v1/agents/does-not-exist-xyz", {
+        method: "DELETE",
+      });
+
+      assert.strictEqual(status, 404, `respuesta actual: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "AGENT_NOT_FOUND");
+      assertNoInternalsLeaked(rawText);
+    });
   });
 
-  it("RED: GET /api/v1/agents/:name/turns/:id no existe", async () => {
-    // Spec §4.5: GET /api/v1/agents/:name/turns/:id debe leer estado del turno
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents/test-agent/turns/turn-001");
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1/turns/:id no está implementado");
+  describe("§4.4 — Sesiones", () => {
+    it("POST /api/v1/agents/:name/sessions con agente inexistente responde 404 AGENT_NOT_FOUND", async () => {
+      const { status, body, rawText } = await request(
+        "/api/v1/agents/does-not-exist-xyz/sessions",
+        { method: "POST", body: { channel: "web", sessionKey: "test-key" } },
+      );
+
+      assert.strictEqual(status, 404, `todavía no existe /api/v1/.../sessions: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "AGENT_NOT_FOUND");
+    });
   });
 
-  it("RED: DELETE /api/v1/agents/:name no existe", async () => {
-    // Spec §4.3: DELETE /api/v1/agents/:name debe eliminar agente
-    // Red: la ruta no existe → 404
-    const { status } = await request("/api/v1/agents/test-agent", { method: "DELETE" });
-    assert.strictEqual(status, 404, "Se esperaba 404 porque /api/v1/agents/:name no está implementado");
+  describe("§4.5 y §5 — Turnos: campos obligatorios", () => {
+    it("POST /api/v1/agents/:name/turns sin turnId/idempotencyKey/correlationId responde 400", async () => {
+      const { status, body, rawText } = await request(
+        "/api/v1/agents/does-not-exist-xyz/turns",
+        { method: "POST", body: { sessionKey: "test-key", message: "hola" } },
+      );
+
+      assert.strictEqual(status, 400, `todavía no existe /api/v1/.../turns: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "BAD_REQUEST");
+    });
+  });
+
+  describe("§3.1 — Rotación de credencial", () => {
+    it("POST /api/v1/auth/rotate existe como ruta autenticada", async () => {
+      const { status, rawText } = await request("/api/v1/auth/rotate", {
+        method: "POST",
+        body: { oldToken: VALID_TOKEN, newToken: "placeholder-new-token-1234567890" },
+      });
+
+      assert.notStrictEqual(status, 404, `la ruta de rotación todavía no existe: ${rawText}`);
+    });
   });
 });
