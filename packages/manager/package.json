@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:contract-red": "node --test test/contract-red.test.ts"
   },
   "dependencies": {
     "@pihub/shared": "0.1.0",
