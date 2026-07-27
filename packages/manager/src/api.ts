@@ -108,12 +108,16 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
       return;
     }
     // El panel no cambia: mismo 401 y sigue aceptando su cookie de sesión.
-    // Solo el CUERPO del error adopta el vocabulario estable de `/api/v1`
-    // (spec §3.3), que distingue "no mandé credencial" de "mi credencial ya
-    // no vale" — `panel.js` únicamente mira `res.status === 401`.
+    // El cuerpo GANA el vocabulario estable de `/api/v1` (spec §3.3), que
+    // distingue "no mandé credencial" de "mi credencial ya no vale", pero
+    // CONSERVA `error` para no romper el panel: `panel.js` solo mira
+    // `res.status === 401` para el login, pero sí lee `body.error` en otras
+    // operaciones (subida, instalación de paquetes, env) y ahí mostraría
+    // `undefined` si el campo desapareciera. Aditivo, nunca sustitutivo.
     const presented = Boolean(authorization) || (cookie ?? "").includes(`${AUTH_COOKIE}=`);
     const code = presented ? "INVALID_AUTH" : "MISSING_AUTH";
-    return c.json(apiError(code, "Service credential required", correlationIdOf(c)), 401);
+    const envelope = apiError(code, "Service credential required", correlationIdOf(c));
+    return c.json({ ...envelope, error: "No autorizado" }, 401);
   });
 
   app.get("/api/status", async (c) => {
