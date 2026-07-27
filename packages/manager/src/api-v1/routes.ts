@@ -1,4 +1,6 @@
 import { Hono, type Context } from "hono";
+import { streamSSE } from "hono/streaming";
+import WebSocket from "ws";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import { listAgents, readAgent, type AgentStatus, type PihubEnv } from "@pihub/shared";
@@ -6,6 +8,7 @@ import { createAgent, deleteAgent, updateAgent } from "../agents.js";
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyServiceAuth } from "./auth.js";
+import { isDuplicateTurn, rememberTurn, toTurnEvent } from "./turns.js";
 import {
   createAgentV1Schema,
   createSessionV1Schema,
@@ -40,6 +43,8 @@ export function correlationIdOf(c: {
  */
 export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<ApiV1Env> {
   const app = new Hono<ApiV1Env>();
+  /** Idempotencia de turnos por instancia del Manager (spec §5). */
+  const turnosVistos = new Map<string, string>();
 
   app.use("*", async (c, next) => {
     c.set("correlationId", correlationIdOf(c));
@@ -183,10 +188,97 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    // El turno real (streaming SSE contra el Runner) es H01.04 completo y
-    // no está implementado todavía. Se declara indisponible en vez de
-    // devolver un turno falso que parezca funcionar.
-    return fail(c, "RESOURCE_UNAVAILABLE", "Turn execution not implemented yet");
+    const { turnId, idempotencyKey, message } = parsed.data;
+
+    // Idempotencia (spec §5): un reintento con la MISMA key no ejecuta
+    // otra vez — devuelve el turno original y punto. Es lo que permite
+    // al dashboard reintentar tras un corte de red sin duplicar la
+    // ejecución.
+    const yaVisto = isDuplicateTurn(turnosVistos, idempotencyKey);
+    if (yaVisto !== undefined) {
+      return c.json({ turnId: yaVisto, duplicate: true });
+    }
+    rememberTurn(turnosVistos, idempotencyKey, turnId);
+
+    const estado = await supervisor.statusOf(config);
+    if (estado.state !== "running") {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+    }
+
+    // Puente WebSocket → SSE. El Runner solo acepta prompts por WS
+    // (`/ws`), y la spec §7 prohíbe exponer WebSockets al dashboard: el
+    // Manager traduce. El puerto del Runner NUNCA sale de aquí.
+    return streamSSE(c, async (stream) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${estado.port}/ws`, {
+        headers: { authorization: `Bearer ${env.apiToken}` },
+      });
+
+      await new Promise<void>((resolve) => {
+        let cerrado = false;
+        const cerrar = () => {
+          if (cerrado) return;
+          cerrado = true;
+          try {
+            ws.close();
+          } catch {
+            // El socket ya podía estar cerrado; da igual.
+          }
+          resolve();
+        };
+
+        // Si el cliente se va, se corta el turno: mantener el WS abierto
+        // contra un Runner que sigue generando sería una fuga.
+        stream.onAbort(cerrar);
+
+        ws.on("open", () => {
+          ws.send(JSON.stringify({ type: "prompt", text: message }));
+        });
+
+        // Las escrituras se ENCADENAN: `writeSSE` es asíncrona y los
+        // mensajes del WS llegan en ráfaga. Sin esta cadena, el evento
+        // terminal cerraba el stream antes de que su propia escritura se
+        // vaciara y `turn-complete` NO llegaba nunca al cliente —
+        // encontrado con un turno real, no en los tests unitarios.
+        let escrituras: Promise<void> = Promise.resolve();
+        const emitir = (evento: { event: string; data: Record<string, unknown> }) => {
+          escrituras = escrituras.then(() =>
+            stream.writeSSE({ event: evento.event, data: JSON.stringify(evento.data) }),
+          );
+          return escrituras;
+        };
+
+        ws.on("message", (raw: unknown) => {
+          let mensaje: { type: string; delta?: string; message?: string };
+          try {
+            mensaje = JSON.parse(String(raw)) as typeof mensaje;
+          } catch {
+            return;
+          }
+          const evento = toTurnEvent(mensaje, turnId);
+          if (!evento) return;
+
+          const escrito = emitir(evento);
+          // `agent_end` y `error` son terminales: se cierra DESPUÉS de
+          // que el evento haya salido de verdad.
+          if (evento.event === "turn-complete" || evento.event === "turn-error") {
+            void escrito.then(cerrar, cerrar);
+          }
+        });
+
+        ws.on("error", () => {
+          void emitir({
+            event: "turn-error",
+            data: {
+              turnId,
+              code: "RESOURCE_UNAVAILABLE",
+              message: "Runner unavailable",
+            },
+          }).then(cerrar, cerrar);
+        });
+
+        ws.on("close", cerrar);
+      });
+    });
   });
 
   return app;
