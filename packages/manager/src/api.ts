@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { z } from "zod";
 import {
+  AUTH_COOKIE,
   agentPaths,
   isAuthorized,
   isProtectedEnvKey,
@@ -27,6 +28,8 @@ import type { Supervisor } from "./supervisor.js";
 import type { OAuthService } from "./oauth.js";
 import { listModels } from "./models.js";
 import { panelDir } from "./paths.js";
+import { createApiV1Router, correlationIdOf } from "./api-v1/routes.js";
+import { apiError } from "./api-v1/errors.js";
 import path from "node:path";
 
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -88,11 +91,29 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
     return c.json({ ok: true });
   });
 
+  // La interfaz privada versionada se monta ANTES del guard del panel: el
+  // patrón `/api/*` de abajo casa también con `/api/v1/*`, y si se montara
+  // después, una petición a `/api/v1/health` sin credencial devolvería el
+  // envelope del panel en vez del vocabulario estable de H01.02. Hono
+  // resuelve en orden de registro, así que registrar el router primero deja
+  // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
+  // ruta `/api/*` del panel.
+  app.route("/api/v1", createApiV1Router(env, supervisor));
+
   app.use("/api/*", async (c, next) => {
-    if (!isAuthorized(env.apiToken, c.req.header("authorization"), c.req.header("cookie"))) {
-      return c.json({ error: "No autorizado" }, 401);
+    const authorization = c.req.header("authorization");
+    const cookie = c.req.header("cookie");
+    if (isAuthorized(env.apiToken, authorization, cookie)) {
+      await next();
+      return;
     }
-    await next();
+    // El panel no cambia: mismo 401 y sigue aceptando su cookie de sesión.
+    // Solo el CUERPO del error adopta el vocabulario estable de `/api/v1`
+    // (spec §3.3), que distingue "no mandé credencial" de "mi credencial ya
+    // no vale" — `panel.js` únicamente mira `res.status === 401`.
+    const presented = Boolean(authorization) || (cookie ?? "").includes(`${AUTH_COOKIE}=`);
+    const code = presented ? "INVALID_AUTH" : "MISSING_AUTH";
+    return c.json(apiError(code, "Service credential required", correlationIdOf(c)), 401);
   });
 
   app.get("/api/status", async (c) => {
