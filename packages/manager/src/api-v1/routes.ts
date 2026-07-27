@@ -67,6 +67,24 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     return c.json({ status: ok ? "ok" : "degraded", checks }, ok ? 200 : 503);
   });
 
+  // --- §3.1 Rotación de credencial ---
+
+  app.post("/auth/rotate", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      oldToken?: string;
+      newToken?: string;
+    };
+    // El formato de la credencial lo fija §3.1: al menos 32 caracteres.
+    if (!body.oldToken || !body.newToken || body.newToken.length < 32) {
+      return fail(c, "BAD_REQUEST", "oldToken and newToken (min 32 chars) are required");
+    }
+    if (body.oldToken !== env.apiToken) return fail(c, "INVALID_AUTH", "Old token does not match");
+    // La rotación efectiva exige reiniciar el Manager con el nuevo valor en
+    // el entorno: aceptar el cambio en memoria daría una falsa sensación de
+    // haber rotado y se perdería al reiniciar.
+    return fail(c, "RESOURCE_UNAVAILABLE", "Rotation requires a Manager restart with the new token");
+  });
+
   // --- §4.3 Agents ---
 
   app.get("/agents", async (c) => {
