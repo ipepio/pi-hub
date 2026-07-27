@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
@@ -23,6 +24,15 @@ import {
 
 export type ResolvedModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
 
+/**
+ * Convierte una identidad de Channel Session en un directorio estable que
+ * no puede escapar del workspace ni filtrar la clave original en el path.
+ */
+export function sessionStorageDirectory(sessionsDir: string, sessionKey: string): string {
+  const digest = createHash("sha256").update(sessionKey).digest("hex");
+  return path.join(sessionsDir, digest);
+}
+
 /** Crea AgentSessions del agente con system prompt (SYSTEM.md + memoria) y modelo configurados. */
 export class SessionFactory {
   readonly authStorage: AuthStorage;
@@ -30,14 +40,23 @@ export class SessionFactory {
   readonly paths: AgentPaths;
   private readonly globalDir: string;
 
-  constructor(
-    private env: PihubEnv,
-    public config: AgentConfig,
-  ) {
-    this.paths = agentPaths(env.dataDir, config.name);
+  private readonly env: PihubEnv;
+  public readonly config: AgentConfig;
+
+  constructor(env: PihubEnv, config: AgentConfig, sessionKey?: string) {
+    this.env = env;
+    this.config = config;
+    const agent = agentPaths(env.dataDir, config.name);
+    this.paths = sessionKey
+      ? { ...agent, sessionsDir: sessionStorageDirectory(agent.sessionsDir, sessionKey) }
+      : agent;
     this.globalDir = dataPaths(env.dataDir).globalDir;
     this.authStorage = AuthStorage.create(path.join(this.globalDir, "auth.json"));
     this.modelRegistry = ModelRegistry.create(this.authStorage, path.join(this.globalDir, "models.json"));
+  }
+
+  forSession(sessionKey: string): SessionFactory {
+    return new SessionFactory(this.env, this.config, sessionKey);
   }
 
   resolveModel(spec?: string): ReturnType<ModelRegistry["find"]> {

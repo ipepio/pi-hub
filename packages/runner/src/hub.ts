@@ -6,6 +6,7 @@ type Listener = (message: ServerWsMessage) => void;
 
 /** Sesión web compartida del agente: un AgentSession activo, N clientes suscritos. */
 export class ChatHub {
+  private readonly factory: SessionFactory;
   private session?: AgentSession;
   private creating?: Promise<AgentSession>;
   private unsubscribe?: () => void;
@@ -13,7 +14,9 @@ export class ChatHub {
   /** Modelo cambiado en vivo desde la UI; no persiste, muere con el proceso. */
   private modelOverride?: ResolvedModel;
 
-  constructor(private factory: SessionFactory) {}
+  constructor(factory: SessionFactory) {
+    this.factory = factory;
+  }
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -132,5 +135,34 @@ export class ChatHub {
 
   get isStreaming(): boolean {
     return this.session?.isStreaming ?? false;
+  }
+}
+
+/**
+ * Registry de sesiones de un Agent. Cada Channel Session obtiene un ChatHub
+ * y, por tanto, un AgentSession y un directorio de transcript propios.
+ */
+export class SessionHubRegistry {
+  private readonly hubs = new Map<string, ChatHub>();
+  private readonly factory: SessionFactory;
+
+  constructor(factory: SessionFactory, defaultHub?: ChatHub) {
+    this.factory = factory;
+    if (defaultHub) this.hubs.set("default", defaultHub);
+  }
+
+  forKey(sessionKey: string): ChatHub {
+    const key = sessionKey.trim() || "default";
+    const existing = this.hubs.get(key);
+    if (existing) return existing;
+
+    const hub = new ChatHub(this.factory.forSession(key));
+    this.hubs.set(key, hub);
+    return hub;
+  }
+
+  reset(): void {
+    for (const hub of this.hubs.values()) hub.reset();
+    this.hubs.clear();
   }
 }

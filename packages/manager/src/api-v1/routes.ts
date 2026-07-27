@@ -209,9 +209,10 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     // (`/ws`), y la spec §7 prohíbe exponer WebSockets al dashboard: el
     // Manager traduce. El puerto del Runner NUNCA sale de aquí.
     return streamSSE(c, async (stream) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${estado.port}/ws`, {
-        headers: { authorization: `Bearer ${env.apiToken}` },
-      });
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${estado.port}/ws?sessionKey=${encodeURIComponent(parsed.data.sessionKey)}`,
+        { headers: { authorization: `Bearer ${env.apiToken}` } },
+      );
 
       await new Promise<void>((resolve) => {
         let cerrado = false;

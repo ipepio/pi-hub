@@ -9,7 +9,7 @@
   "scripts": {
     "build": "npm run build --workspace @pihub/shared && npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "node --test --experimental-strip-types packages/shared/test/*.test.js packages/runner/test/*.test.js packages/manager/test/*.test.js packages/manager/test/api-v1-*.test.ts packages/memory-extension/test/*.test.js",
+    "test": "node --test --experimental-strip-types packages/shared/test/*.test.js packages/runner/test/*.test.js packages/runner/test/*.test.ts packages/manager/test/*.test.js packages/manager/test/api-v1-*.test.ts packages/memory-extension/test/*.test.js",
     "start": "node packages/manager/dist/index.js"
   },
   "engines": {

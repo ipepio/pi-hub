@@ -20,7 +20,7 @@ import {
   type PihubEnv,
   type ServerWsMessage,
 } from "@pihub/shared";
-import type { ChatHub } from "./hub.js";
+import { SessionHubRegistry, type ChatHub } from "./hub.js";
 import type { SessionFactory } from "./session.js";
 import { sttEnabled, transcribe, ttsEnabled } from "./speech.js";
 
@@ -42,6 +42,7 @@ async function cleanUploads(uploadsDir: string, retentionHours: number): Promise
 
 export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, factory: SessionFactory): Server {
   const paths = agentPaths(env.dataDir, config.name);
+  const sessions = new SessionHubRegistry(factory, hub);
   const app = new Hono();
 
   app.post("/auth/session", async (c) => {
@@ -213,11 +214,17 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
   );
   cleanupTimer.unref();
 
-  attachWebSocket(server, env, config, hub);
+  server.once("close", () => sessions.reset());
+  attachWebSocket(server, env, config, sessions);
   return server;
 }
 
-function attachWebSocket(server: Server, env: PihubEnv, config: AgentConfig, hub: ChatHub): void {
+function attachWebSocket(
+  server: Server,
+  env: PihubEnv,
+  config: AgentConfig,
+  sessions: SessionHubRegistry,
+): void {
   const wss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (request, socket, head) => {
@@ -234,7 +241,9 @@ function attachWebSocket(server: Server, env: PihubEnv, config: AgentConfig, hub
     wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
   });
 
-  wss.on("connection", (ws: WebSocket) => {
+  wss.on("connection", (ws: WebSocket, request: import("node:http").IncomingMessage) => {
+    const requestUrl = new URL(request.url ?? "/", "http://localhost");
+    const hub = sessions.forKey(requestUrl.searchParams.get("sessionKey") ?? "default");
     const send = (message: ServerWsMessage) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
     };

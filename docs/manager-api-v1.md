@@ -1,8 +1,9 @@
 # Especificación de la Interfaz Privada del Manager — `/api/v1`
 
-> **Estado:** propuesta — no implementada todavía
-> **Depende de:** T01.02 (Pi fijado), T01.03 (esta spec + suite Red)
-> **Referencias:** ADR 0002, 0025, 0030; arquitectura §5 (invariantes de `AgentExecutionPlatform`); roadmap §5 Fase 1
+> **Estado:** implementada en el source actual; el contrato base está verificado contra el Manager real
+> **Compatibilidad publicada:** dashboard `AgentExecutionPlatform` del repo `goguest-ai-dashboard-new` y Runtime Release fijada por digest
+> **Nota:** el aislamiento por `sessionKey` añadido en este source requiere publicar una nueva imagen para formar parte del digest de producción actual
+> **Referencias:** ADR 0002, 0025, 0030; arquitectura §5 (invariantes de `AgentExecutionPlatform`)
 
 ## 1. Propósito
 
@@ -22,7 +23,7 @@ Esta interfaz privada permite que el **control plane** (dashboard) gestione Agen
 
 ### 3.1 Credencial
 
-- **Nombre:** `PIHUB_SERVICE_TOKEN` (variable de entorno del container).
+- **Nombre en pihub:** `API_TOKEN` (el dashboard lo configura como `PIHUB_SERVICE_TOKEN`).
 - **Formato:** string alfanumérico de al menos 32 caracteres, generado de forma criptográficamente segura.
 - **Rotación:** el dashboard puede enviar un `POST /api/v1/auth/rotate` con la credencial antigua y la nueva. El Manager valida la antigua, persiste la nueva y rechaza la antigua en la siguiente petición.
 - **Regla:** la credencial **nunca** aparece en payloads de respuesta ni en logs.
@@ -175,6 +176,12 @@ Response `201`:
   "createdAt": "2026-07-14T12:00:00Z"
 }
 ```
+
+`sessionKey` es la identidad estable de la Channel Session. El Manager la
+selecciona al abrir el puente hacia el Runner y el Runner mantiene un
+`AgentSession` y un directorio de transcript independientes por clave. Repetir
+la misma clave reanuda esa sesión; dos claves distintas nunca comparten
+contexto, aunque pertenezcan al mismo Agent.
 
 ### 4.5 Turnos
 
