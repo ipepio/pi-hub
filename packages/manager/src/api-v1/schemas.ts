@@ -35,3 +35,15 @@ export const createTurnV1Schema = z.object({
   message: z.string(),
   abortSignal: z.boolean().optional(),
 });
+
+/**
+ * Spec §4.3, PATCH. Todos los campos opcionales: un PATCH toca lo que
+ * trae y deja el resto como estaba. `name` NO es actualizable — es la
+ * identidad del Agent y va en la ruta.
+ */
+export const updateAgentV1Schema = z.object({
+  model: z.string().min(1).optional(),
+  thinkingLevel: z.enum(["low", "medium", "high"]).optional(),
+  systemPrompt: z.string().optional(),
+  enabled: z.boolean().optional(),
+});

@@ -2,11 +2,16 @@ import { Hono, type Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import { listAgents, readAgent, type AgentStatus, type PihubEnv } from "@pihub/shared";
-import { createAgent, deleteAgent } from "../agents.js";
+import { createAgent, deleteAgent, updateAgent } from "../agents.js";
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyServiceAuth } from "./auth.js";
-import { createAgentV1Schema, createSessionV1Schema, createTurnV1Schema } from "./schemas.js";
+import {
+  createAgentV1Schema,
+  createSessionV1Schema,
+  createTurnV1Schema,
+  updateAgentV1Schema,
+} from "./schemas.js";
 
 const MANAGER_VERSION = "0.1.0";
 
@@ -112,6 +117,25 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     }
   });
 
+  // Spec §4.3. Faltaba: `contract-red` no lo cubre, asi que nadie lo
+  // echo en falta hasta que el adapter del dashboard intento su camino
+  // idempotente (POST -> 409 -> PATCH) y se comio un 404.
+  app.patch("/agents/:name", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const parsed = updateAgentV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
+
+    try {
+      const actualizado = await updateAgent(env, name, parsed.data);
+      return c.json(toAgentV1(await supervisor.statusOf(actualizado)));
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update agent");
+    }
+  });
+
   app.delete("/agents/:name", async (c) => {
     const name = c.req.param("name");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
@@ -177,9 +201,16 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
  * `assertNoInternalsLeaked`). Se filtran aquí, el único punto que
  * serializa un Agent hacia el dashboard.
  */
-function toAgentV1(status: AgentStatus): Omit<AgentStatus, "port" | "pid"> {
+function toAgentV1(status: AgentStatus): Omit<AgentStatus, "port" | "pid"> & {
+  status: string;
+} {
   const { port: _port, pid: _pid, ...safe } = status;
-  return safe;
+  // La spec §4.3 nombra el campo `status`; el modelo interno lo llama
+  // `state`. Se exponen los dos: `status` es el contrato con el
+  // dashboard, `state` se conserva para no romper a ningún consumidor
+  // que ya lo leyera. Encontrado con el test de integración del adapter,
+  // que recibía siempre `stopped` porque `status` no existía.
+  return { ...safe, status: safe.state };
 }
 
 /** Helper compartido por las rutas: traduce un código a su respuesta. */
