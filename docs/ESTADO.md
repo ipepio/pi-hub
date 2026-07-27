@@ -1,6 +1,6 @@
 # Estado de pihub
 
-> Última verificación: **2026-07-27**, versión **v0.2.0**. Comprobado ejecutando.
+> Última verificación: **2026-07-27**, versión **v0.3.0**. Comprobado ejecutando.
 
 ## Qué funciona
 
@@ -13,8 +13,8 @@
 | **Interfaz privada `/api/v1`** | Funciona — **contract-red 10/10** |
 | **Turno real por SSE** | Funciona end-to-end |
 
-`npm test` → **62/62**. `npm run test:contract-red` → **10/10** (requiere el Manager
-arrancado).
+`npm test` → **63/63**. `npm run typecheck` limpio. `npm run test:contract-red` → **10/10**
+(requiere el Manager arrancado).
 
 ## Los dos escenarios
 
@@ -42,6 +42,9 @@ El contrato completo está en [`manager-api-v1.md`](manager-api-v1.md). Lo esenc
   `INTERNAL_ERROR` nunca lleva el detalle real al caller.
 - **Turnos** con `turnId`, `idempotencyKey` y `correlationId` obligatorios. Repetir una
   `idempotencyKey` devuelve el turno original **sin re-ejecutar**.
+- **Channel Sessions aisladas** por `sessionKey`: cada clave tiene su `ChatHub`,
+  `AgentSession` y transcript; reabrir la misma clave reanuda contexto y dos claves
+  distintas no lo comparten.
 - **No se filtra nada interno**: ni paths (`/data`), ni puertos de Runner (4100-4199),
   ni el token de servicio.
 
@@ -65,7 +68,7 @@ desconocido se ignora en vez de cortar el turno.
 ## Imagen publicada
 
 ```
-ghcr.io/ipepio/pi-hub@sha256:e16344e38a547e5e713461370b531545db1e864e161c019015868985622ddd0c
+ghcr.io/ipepio/pi-hub@sha256:092ba455c1af4412c882187dbf4c8fe6ec9a6301adeaecb7cb0412e2318dc764
 ```
 
 Pública (verificado con `docker logout` + `docker pull` anónimo). Se publica sola al

@@ -2,7 +2,6 @@
 
 > **Estado:** implementada en el source actual; el contrato base está verificado contra el Manager real
 > **Compatibilidad publicada:** dashboard `AgentExecutionPlatform` del repo `goguest-ai-dashboard-new` y Runtime Release fijada por digest
-> **Nota:** el aislamiento por `sessionKey` añadido en este source requiere publicar una nueva imagen para formar parte del digest de producción actual
 > **Referencias:** ADR 0002, 0025, 0030; arquitectura §5 (invariantes de `AgentExecutionPlatform`)
 
 ## 1. Propósito
