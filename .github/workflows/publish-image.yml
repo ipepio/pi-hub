@@ -1,0 +1,48 @@
+name: Publicar imagen
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # github.repository == ipepio/pi-hub -> ghcr.io/ipepio/pi-hub
+          images: ghcr.io/${{ github.repository }}
+          # Sin `latest` movil a proposito: el dashboard fija por digest,
+          # y un tag que se mueve solo cambiaria el runtime sin decision.
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # Estas labels sobrescriben las del Dockerfile en tiempo de build:
+          # org.opencontainers.image.source pasa a apuntar a este repo real,
+          # que es lo que ghcr usa para enlazar el paquete.
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Digest publicado
+        run: |
+          echo "Fija este digest en el dashboard (PIHUB_IMAGE_DIGEST):"
+          echo "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
