@@ -124,7 +124,6 @@ Response `201`:
   "name": "mi-agente",
   "status": "running",
   "model": "anthropic/claude-sonnet-4-20250514",
-  "ports": { "runner": 4100 },
   "webAddress": "mi-agente.agents.miempresa.com"
 }
 ```
@@ -259,7 +258,11 @@ Response `202` (in-progress):
 
 ## 7. Prohibiciones explícitas
 
-- No exponer puertos de Runner en respuestas.
+- No exponer puertos de Runner en respuestas. *(2026-07-27: el ejemplo de
+  §4.3 llevaba `"ports": { "runner": 4100 }`, contradiciendo esta regla.
+  Se quitó del ejemplo, no de aquí: el dashboard nunca habla con el Runner
+  —el Manager es el único punto de entrada, H01.05— así que ese puerto no
+  le sirve de nada y solo filtra topología interna.)*
 - No exponer paths internos del filesystem.
 - No exponer WebSockets al caller del dashboard.
 - No exponer valores de `PIHUB_*` o `PI_CODING_AGENT_*` en respuestas.
