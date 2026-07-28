@@ -70,6 +70,18 @@ de egress**, porque no controla esta imagen.
 | La rotación de credencial no rota de verdad | Rotar exige reiniciar el Manager con el valor nuevo en el entorno | La ruta valida y responde `RESOURCE_UNAVAILABLE` con el motivo; aceptar el cambio en memoria daría una falsa sensación de haber rotado |
 | `contract-red` fuera de `npm test` | Necesita un Manager arrancado | Tiene su propio script; correrlo antes de cerrar cualquier cambio en `/api/v1` |
 
+### Un error del Provider debe terminar el turno como `turn-error`
+
+**Falta:** que un turno que muere por un error del Provider emita `turn-error` con su
+código, en vez de `turn-complete` sin contenido.
+
+**Por qué no está hecho:** requiere una task H con su release y digest compatibles; esta
+anotación deja fuera el cambio de código.
+
+**Qué se rompe si sigue así:** el dashboard no puede distinguir entre “el modelo no tenía
+nada que decir” y “la llamada al Provider falló”, y el smoke tampoco puede diagnosticar
+la causa.
+
 ---
 
 ## Decisiones que conviene no deshacer sin leer
