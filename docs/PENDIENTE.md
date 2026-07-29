@@ -50,7 +50,42 @@ de egress**, porque no controla esta imagen.
 
 ---
 
-## 3. Deuda menor, identificada
+## 3. H01.06 rompe los `models.json` que usan `$VAR`
+
+**Regresión real, encontrada el 2026-07-29 en una instalación de verdad.**
+
+`models.json` admite referenciar la credencial por variable de entorno, que es la
+forma de no escribir un secreto en un fichero:
+
+```json
+"providers": { "NaN": { "baseUrl": "…", "apiKey": "$NAN_API_KEY" } }
+```
+
+El Manager tiene esa variable; **el Runner ya no**. Antes de H01.06 la heredaba
+con el resto del entorno. Ahora la allowlist la corta, `auth.json` está vacío, y
+el turno muere con `INTERNAL_ERROR / "Runner error"` — sin nada en `runner.log`
+que explique por qué.
+
+**Qué se rompe si sigue así:** cualquier instalación autoalojada que configure
+sus providers con `$VAR` —que es la práctica recomendada— deja de responder al
+actualizar a v0.4.0 o superior, con un error genérico y sin pista.
+
+**El arreglo no es deshacer H01.06.** Cortar la herencia es correcto: el Runner no
+debe ver `API_TOKEN` ni los secretos de otros Agents. Lo que falta es que el
+Manager **derive de `models.json` qué variables hacen falta** y añada solo esas a
+la allowlist, o que resuelva los `$VAR` antes de arrancar el Runner.
+
+Así el Runner recibe exactamente las credenciales que su configuración
+referencia, y nada más — que es lo que H01.06 quería decir.
+
+**Mientras tanto**, el rodeo es mover esas variables al EnvStore global, que sí
+llega al Runner. El `CHANGELOG` debería decirlo con ese nivel de concreción: no
+"el entorno ya no se hereda", sino "si tu `models.json` usa `$VAR`, muévela al
+EnvStore o el agente dejará de responder".
+
+---
+
+## 4. Deuda menor, identificada
 
 | Qué | Por qué se dejó | Impacto |
 |---|---|---|

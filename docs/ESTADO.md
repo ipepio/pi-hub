@@ -1,6 +1,6 @@
 # Estado de pihub
 
-> Última verificación: **2026-07-27**, versión **v0.4.0**. Comprobado ejecutando.
+> Última verificación: **2026-07-27**, versión **v0.5.0**. Comprobado ejecutando.
 
 ## Qué funciona
 
@@ -68,7 +68,7 @@ desconocido se ignora en vez de cortar el turno.
 ## Imagen publicada
 
 ```
-ghcr.io/ipepio/pi-hub@sha256:6d62e9b984edc6b62c32955a7669d3261ea069b167211df9b2c96c1dbce4f3cb
+ghcr.io/ipepio/pi-hub@sha256:f6851b50b5b629f233f4444b759b758955ff617d380e244d4386f58e99ef9a3b
 ```
 
 Pública (verificado con `docker logout` + `docker pull` anónimo). Se publica sola al
