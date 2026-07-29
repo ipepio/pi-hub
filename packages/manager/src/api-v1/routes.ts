@@ -3,11 +3,19 @@ import { streamSSE } from "hono/streaming";
 import WebSocket from "ws";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
-import { listAgents, readAgent, type AgentStatus, type PihubEnv } from "@pihub/shared";
-import { createAgent, deleteAgent, updateAgent } from "../agents.js";
+import {
+  listAgents,
+  readAgent,
+  readEnvStore,
+  type AgentConfig,
+  type AgentStatus,
+  type PihubEnv,
+} from "@pihub/shared";
+import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyServiceAuth } from "./auth.js";
+import { agentRuntimeFingerprint, decideRuntimeAction, type RuntimeAction } from "./restart-policy.js";
 import { isDuplicateTurn, rememberTurn, toTurnEvent } from "./turns.js";
 import {
   createAgentV1Schema,
@@ -125,6 +133,13 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
   // Spec §4.3. Faltaba: `contract-red` no lo cubre, asi que nadie lo
   // echo en falta hasta que el adapter del dashboard intento su camino
   // idempotente (POST -> 409 -> PATCH) y se comio un 404.
+  //
+  // El reinicio se decide por HUELLA (restart-policy.ts), no por qué campo
+  // vino en el body: el dashboard reconcilia mandando el estado COMPLETO en
+  // cada llamada (model + systemPrompt en cada reconcile), así que decidir
+  // por presencia de campo reiniciaría el Runner en cada reconciliación aun
+  // sin cambios reales. Antes esto SOLO miraba telegramToken — cambiar el
+  // Model o la Persona se persistía y el Runner en marcha nunca se enteraba.
   app.patch("/agents/:name", async (c) => {
     const name = c.req.param("name");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
@@ -134,18 +149,19 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
 
     try {
-      // El Runner crea el long-polling de Telegram al arrancar; un cambio de
-      // credencial solo es efectivo después de recrearlo. Si el Agent estaba
-      // parado no se arranca por sorpresa: el siguiente start leerá el nuevo
-      // config.
       const wasRunning = supervisor.state(name).state === "running";
-      const telegramTokenChanged =
-        "telegramToken" in parsed.data && config.telegramToken !== (parsed.data.telegramToken ?? undefined);
+      const antes = await snapshotRuntimeInput(env, config);
       const actualizado = await updateAgent(env, name, parsed.data);
-      if (telegramTokenChanged && wasRunning) {
-        if (actualizado.enabled) await supervisor.restart(name);
-        else await supervisor.stop(name);
-      }
+      const despues = await snapshotRuntimeInput(env, actualizado);
+
+      const action = decideRuntimeAction({
+        wasRunning,
+        wasEnabled: config.enabled,
+        isEnabled: actualizado.enabled,
+        fingerprintChanged: agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despues),
+      });
+      await aplicarRuntimeAction(supervisor, name, action);
+
       return c.json(toAgentV1(await supervisor.statusOf(actualizado)));
     } catch {
       return fail(c, "BAD_REQUEST", "Could not update agent");
@@ -377,6 +393,44 @@ function isWorkspaceRelativeUploadPath(value: unknown): value is string {
     .split("/")
     .slice(1)
     .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+/**
+ * Snapshot de todo lo que el Runner de `config.name` lee al arrancar, para
+ * calcular su huella (`restart-policy.ts`). `env`/`packages` se leen del
+ * disco en cada llamada a propósito: no cachear evita decidir sobre un
+ * valor obsoleto si algo los cambió por otra vía entre medias.
+ */
+async function snapshotRuntimeInput(
+  env: PihubEnv,
+  config: Pick<AgentConfig, "name" | "model" | "thinkingLevel" | "telegramToken" | "ttsVoice" | "memory">,
+) {
+  const [systemPrompt, envStore, packages] = await Promise.all([
+    readSystemPrompt(env, config.name),
+    readEnvStore(env.dataDir, config.name),
+    listPackages(env, config.name),
+  ]);
+  return {
+    model: config.model,
+    thinkingLevel: config.thinkingLevel,
+    telegramToken: config.telegramToken,
+    ttsVoice: config.ttsVoice,
+    memory: config.memory,
+    systemPrompt,
+    env: envStore,
+    packages,
+  };
+}
+
+/** Aplica la decisión de `decideRuntimeAction` sobre el proceso del Runner. */
+async function aplicarRuntimeAction(
+  supervisor: Supervisor,
+  name: string,
+  action: RuntimeAction,
+): Promise<void> {
+  if (action === "start") await supervisor.start(name);
+  else if (action === "stop") await supervisor.stop(name);
+  else if (action === "restart") await supervisor.restart(name);
 }
 
 /**

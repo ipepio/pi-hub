@@ -137,13 +137,19 @@ test("PATCH /agents/:name sin telegramToken no reinicia el Runner", async () => 
       runningSupervisor(restarts),
     );
 
+    // Cuerpo vacío a propósito, no `{model: "new-model"}` como antes: con la
+    // huella de arranque (restart-policy.ts) un cambio de MODEL sí reinicia
+    // —es el bug 1 que se acaba de arreglar—, así que usarlo como "campo
+    // irrelevante" haría que este test afirmara justo lo contrario de lo que
+    // ahora es correcto. Lo que este test verifica es que un PATCH sin
+    // ningún campo no reinicia por sí solo.
     const response = await app.request("http://pihub.test/agents/agent", {
       method: "PATCH",
       headers: {
         authorization: "Bearer service-token",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ model: "new-model" }),
+      body: JSON.stringify({}),
     });
 
     assert.equal(response.status, 200);

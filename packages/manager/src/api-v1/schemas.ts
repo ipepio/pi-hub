@@ -8,7 +8,7 @@ export const createAgentV1Schema = z.object({
     .max(64)
     .regex(/^[a-z0-9][a-z0-9-]*$/),
   model: z.string().min(1),
-  thinkingLevel: z.enum(["low", "medium", "high"]).optional(),
+  thinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]).optional(),
   systemPrompt: z.string().optional(),
   telegramToken: z.string().optional(),
   ttsVoice: z.string().optional(),
@@ -43,8 +43,12 @@ export const createTurnV1Schema = z.object({
  */
 export const updateAgentV1Schema = z.object({
   model: z.string().min(1).optional(),
-  thinkingLevel: z.enum(["low", "medium", "high"]).optional(),
+  thinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]).optional(),
   systemPrompt: z.string().optional(),
   telegramToken: z.string().nullable().optional(),
+  /** `null` vuelve a la voz global (`PIHUB_TTS_VOICE`). */
+  ttsVoice: z.string().nullable().optional(),
+  /** `null` vuelve al default de Shared Memory del Runtime. */
+  memory: z.object({ sharedAccess: z.enum(["none", "read", "read-write"]) }).nullable().optional(),
   enabled: z.boolean().optional(),
 });
