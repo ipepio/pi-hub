@@ -9,6 +9,7 @@ import {
   listEnvKeys,
   piInstall,
   piRemove,
+  piVersion,
   readAgent,
   readEnvStore,
   replaceEnvStore,
@@ -17,6 +18,7 @@ import {
   type PihubEnv,
 } from "@pihub/shared";
 import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
+import { listModels } from "../models.js";
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyServiceAuth } from "./auth.js";
@@ -126,6 +128,31 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     // el entorno: aceptar el cambio en memoria daría una falsa sensación de
     // haber rotado y se perdería al reiniciar.
     return fail(c, "RESOURCE_UNAVAILABLE", "Rotation requires a Manager restart with the new token");
+  });
+
+  // --- §4.7 Modelos disponibles (solo lectura, Fase 1 §1.3 del plan) ---
+
+  app.get("/models", (c) => {
+    try {
+      return c.json({ models: listModels(env) });
+    } catch {
+      return c.json({ models: [] });
+    }
+  });
+
+  // --- §4.8 Estado global (Fase 1 §1.3 del plan) ---
+  //
+  // Sin `portRange`: la spec §7 prohíbe exponer topología interna de
+  // puertos al dashboard (el puerto del Runner nunca sale de aquí, igual
+  // que en `toAgentV1`).
+  app.get("/status", async (c) => {
+    const agents = await listAgents(env.dataDir);
+    return c.json({
+      version: MANAGER_VERSION,
+      pi: await piVersion(env.dataDir),
+      agents: agents.length,
+      panel: env.panelEnabled,
+    });
   });
 
   // --- §4.3 Agents ---
