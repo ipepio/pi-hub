@@ -282,7 +282,8 @@ Errores específicos:
 | Caso | Respuesta |
 |---|---|
 | Agent inexistente | `404` con `AGENT_NOT_FOUND`, antes de leer el body |
-| Fichero ausente, inválido o mayor de 50 MB | `400` con `BAD_REQUEST` |
+| Fichero ausente o inválido | `400` con `BAD_REQUEST` |
+| Fichero mayor de 50 MB | `413` con `PAYLOAD_TOO_LARGE` |
 | Runner parado o inaccesible | `503` con `RESOURCE_UNAVAILABLE` |
 
 ## 5. Campos obligatorios en cada comando
@@ -331,5 +332,6 @@ Errores específicos:
 | `INVALID_AUTH` | 401 | Credencial de servicio inválida |
 | `ROTATED_AUTH` | 401 | Credencial de servicio rotada |
 | `BAD_REQUEST` | 400 | Payload no válido |
+| `PAYLOAD_TOO_LARGE` | 413 | El fichero supera el límite del Runner. Código propio, y no `BAD_REQUEST`, porque el caller necesita distinguir "pasa del límite" de "la petición es inválida" para decírselo al usuario — y el mensaje no es contrato, el catálogo sí |
 | `CONFLICT` | 409 | Conflicto de estado |
 | `GONE` | 410 | Recurso eliminado permanentemente |

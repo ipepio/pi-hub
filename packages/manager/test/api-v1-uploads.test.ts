@@ -93,7 +93,7 @@ test("POST /agents/:name/uploads reenvía el multipart y conserva un path relati
   }
 });
 
-test("un 413 del Runner se traduce a BAD_REQUEST sin filtrar su body", async () => {
+test("un 413 del Runner se traduce a PAYLOAD_TOO_LARGE sin filtrar su body", async () => {
   const runner = createServer((_request, response) => {
     response.statusCode = 413;
     response.setHeader("content-type", "application/json");
@@ -113,10 +113,10 @@ test("un 413 del Runner se traduce a BAD_REQUEST sin filtrar su body", async () 
       body: form,
     });
     const rawText = await response.text();
-    assert.equal(response.status, 400, `el error no se tradujo: ${rawText}`);
+    assert.equal(response.status, 413, `el error no se tradujo: ${rawText}`);
     const body = JSON.parse(rawText) as { code?: string; message?: string };
 
-    assert.equal(body.code, "BAD_REQUEST");
+    assert.equal(body.code, "PAYLOAD_TOO_LARGE");
     assert.equal(body.message, "File too large");
     assert.doesNotMatch(rawText, /Archivo demasiado grande|\/data\/runner/);
   } finally {

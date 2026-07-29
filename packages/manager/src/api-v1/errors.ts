@@ -11,10 +11,12 @@ export type ApiErrorCode =
   | "MISSING_AUTH"
   | "INVALID_AUTH"
   | "ROTATED_AUTH"
-  | "BAD_REQUEST";
+  | "BAD_REQUEST"
+  | "PAYLOAD_TOO_LARGE";
 
 export const HTTP_STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   BAD_REQUEST: 400,
+  PAYLOAD_TOO_LARGE: 413,
   MISSING_AUTH: 401,
   INVALID_AUTH: 401,
   ROTATED_AUTH: 401,

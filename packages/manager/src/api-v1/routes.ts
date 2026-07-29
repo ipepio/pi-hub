@@ -211,7 +211,10 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
         duplex: "half",
       } as RequestInit);
 
-      if (response.status === 413) return fail(c, "BAD_REQUEST", "File too large");
+      // Codigo propio: el caller necesita distinguir "pasa del limite" de
+      // "la peticion es invalida" para poder decirselo al usuario, y el
+      // mensaje no es contrato — el catalogo cerrado si.
+      if (response.status === 413) return fail(c, "PAYLOAD_TOO_LARGE", "File too large");
       if (response.status === 400) return fail(c, "BAD_REQUEST", "Invalid upload");
       if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
 
