@@ -62,3 +62,8 @@ export const updateAgentV1Schema = z.object({
 export const replaceEnvV1Schema = z.object({
   env: z.record(z.string(), z.string()),
 });
+
+/** Spec §4.3b, `PUT /agents/:name/packages`. Conjunto COMPLETO, converge con install/remove. */
+export const replacePackagesV1Schema = z.object({
+  packages: z.array(z.string().min(1)),
+});

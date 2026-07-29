@@ -4,8 +4,11 @@ import WebSocket from "ws";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import {
+  agentPaths,
   listAgents,
   listEnvKeys,
+  piInstall,
+  piRemove,
   readAgent,
   readEnvStore,
   replaceEnvStore,
@@ -26,11 +29,13 @@ import {
   type RuntimeAction,
 } from "./restart-policy.js";
 import { isDuplicateTurn, rememberTurn, toTurnEvent } from "./turns.js";
+import { diffPackages } from "./package-sync.js";
 import {
   createAgentV1Schema,
   createSessionV1Schema,
   createTurnV1Schema,
   replaceEnvV1Schema,
+  replacePackagesV1Schema,
   updateAgentV1Schema,
 } from "./schemas.js";
 
@@ -288,6 +293,58 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     } catch {
       return fail(c, "BAD_REQUEST", "Could not update env");
     }
+  });
+
+  // --- §4.3c Paquetes del Agent (Fase 1, §1.3 del plan) ---
+  //
+  // Conjunto COMPLETO, converge con `pi install`/`pi remove` reales — eso
+  // no se prueba con unitarios (necesita el binario `pi` y red), se
+  // verifica con contract-red contra el Manager real (§1.5).
+
+  app.get("/agents/:name/packages", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    return c.json({ packages: await listPackages(env, name) });
+  });
+
+  app.put("/agents/:name/packages", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const parsed = replacePackagesV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid packages payload");
+
+    const actuales = await listPackages(env, name);
+    const { toInstall, toRemove } = diffPackages(actuales, parsed.data.packages);
+
+    // Sin diferencia: no hay nada que instalar/quitar ni Runner que
+    // reiniciar. Responde ya, sin tocar pi ni el registro de turnos.
+    if (toInstall.length === 0 && toRemove.length === 0) {
+      return c.json({ packages: actuales }, 202);
+    }
+
+    const wasRunning = supervisor.state(name).state === "running";
+    // Instalar/quitar un paquete solo tiene efecto si el Runner se reinicia
+    // para recogerlo — mismo riesgo que el PATCH: no tumbar un turno vivo.
+    if (wasRunning && hayTurnoVivo(name)) {
+      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+    }
+
+    const workspaceDir = agentPaths(env.dataDir, name).workspaceDir;
+    for (const source of toInstall) {
+      const result = await piInstall(env.dataDir, source, workspaceDir);
+      if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${source}`);
+    }
+    for (const source of toRemove) {
+      const result = await piRemove(env.dataDir, source, workspaceDir);
+      if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${source}`);
+    }
+
+    if (wasRunning) await supervisor.restart(name);
+
+    return c.json({ packages: await listPackages(env, name) }, 202);
   });
 
   // --- §4.4 Sesiones ---
