@@ -44,6 +44,71 @@ export function agentRuntimeFingerprint(input: AgentRuntimeInputSnapshot): strin
   });
 }
 
+/** Subconjunto de `UpdateAgentInput` (agents.ts) relevante para la huella de arranque. */
+export interface UpdateAgentRuntimeFields {
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  telegramToken?: string | null;
+  ttsVoice?: string | null;
+  memory?: AgentMemoryConfig | null;
+  enabled?: boolean;
+}
+
+/** Config actual, en la forma mínima que `projectUpdatedAgent` necesita leer. */
+export interface CurrentAgentRuntimeFields {
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  telegramToken?: string;
+  ttsVoice?: string;
+  memory?: AgentMemoryConfig;
+  enabled: boolean;
+}
+
+/**
+ * Proyecta el config que resultaría de aplicar `input` sobre `config`, SIN
+ * escribir a disco. Espeja campo a campo el merge real de `updateAgent`
+ * (`packages/manager/src/agents.ts`): un campo ausente de `input` conserva
+ * el valor actual, y `null` explícito limpia el campo (vuelve a `undefined`).
+ *
+ * Duplicado a propósito: el PATCH necesita saber SI haría falta reiniciar
+ * antes de persistir, para poder rechazar con `409 TURN_IN_PROGRESS` sin
+ * dejar el config a medio actualizar mientras el Runner viejo sigue vivo.
+ * Si `updateAgent` cambia su semántica de merge, esta función tiene que
+ * actualizarse junto a ella.
+ */
+export function projectUpdatedAgent(
+  config: CurrentAgentRuntimeFields,
+  input: UpdateAgentRuntimeFields,
+): CurrentAgentRuntimeFields {
+  return {
+    model: input.model !== undefined ? input.model : config.model,
+    thinkingLevel: input.thinkingLevel !== undefined ? input.thinkingLevel : config.thinkingLevel,
+    telegramToken:
+      "telegramToken" in input ? (input.telegramToken ?? undefined) : config.telegramToken,
+    ttsVoice: "ttsVoice" in input ? (input.ttsVoice ?? undefined) : config.ttsVoice,
+    memory: "memory" in input ? (input.memory ?? undefined) : config.memory,
+    enabled: input.enabled !== undefined ? input.enabled : config.enabled,
+  };
+}
+
+/** Igual que `projectUpdatedAgent`, para el `systemPrompt` (fichero aparte, no en `agent.json`). */
+export function projectSystemPrompt(current: string, input: { systemPrompt?: string }): string {
+  return input.systemPrompt !== undefined ? input.systemPrompt : current;
+}
+
+/**
+ * ¿Hay algún turno vivo del Agent `agentName` entre las claves registradas
+ * (`agent:turnId`, ver `claveTurno` en `routes.ts`)? Pura y sin WS a
+ * propósito: la ruta la usa contra el registro real (`Map<string, WebSocket>`
+ * de sockets abiertos), pero la decisión en sí — "hay coincidencia de
+ * prefijo" — no necesita un socket para poder probarse.
+ */
+export function hasLiveTurnForAgent(liveTurnKeys: Iterable<string>, agentName: string): boolean {
+  const prefix = `${agentName}:`;
+  for (const key of liveTurnKeys) if (key.startsWith(prefix)) return true;
+  return false;
+}
+
 export type RuntimeAction = "none" | "start" | "stop" | "restart";
 
 /**

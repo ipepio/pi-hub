@@ -15,7 +15,14 @@ import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent }
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyServiceAuth } from "./auth.js";
-import { agentRuntimeFingerprint, decideRuntimeAction, type RuntimeAction } from "./restart-policy.js";
+import {
+  agentRuntimeFingerprint,
+  decideRuntimeAction,
+  hasLiveTurnForAgent,
+  projectSystemPrompt,
+  projectUpdatedAgent,
+  type RuntimeAction,
+} from "./restart-policy.js";
 import { isDuplicateTurn, rememberTurn, toTurnEvent } from "./turns.js";
 import {
   createAgentV1Schema,
@@ -53,6 +60,16 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
   const app = new Hono<ApiV1Env>();
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
   const turnosVistos = new Map<string, string>();
+  /**
+   * Turnos con WS abierto contra el Runner, por instancia del Manager.
+   * Clave `agent:turnId` — el turnId lo genera el caller, pero se
+   * cualifica por Agent para no depender de que sea único a nivel global.
+   * Es lo que permite `POST .../turns/:turnId/abort` (bug 3) y que el
+   * PATCH rechace con `TURN_IN_PROGRESS` en vez de reiniciar un turno vivo.
+   */
+  const turnosVivos = new Map<string, WebSocket>();
+  const claveTurno = (name: string, turnId: string) => `${name}:${turnId}`;
+  const hayTurnoVivo = (name: string) => hasLiveTurnForAgent(turnosVivos.keys(), name);
 
   app.use("*", async (c, next) => {
     c.set("correlationId", correlationIdOf(c));
@@ -151,15 +168,39 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     try {
       const wasRunning = supervisor.state(name).state === "running";
       const antes = await snapshotRuntimeInput(env, config);
-      const actualizado = await updateAgent(env, name, parsed.data);
-      const despues = await snapshotRuntimeInput(env, actualizado);
+
+      // Proyección SIN escribir a disco: hace falta saber si este PATCH
+      // reiniciaría el Runner ANTES de persistir nada, para poder rechazar
+      // con 409 TURN_IN_PROGRESS sin dejar el config a medias mientras el
+      // Runner viejo (con el turno vivo) sigue corriendo.
+      const proyectado = projectUpdatedAgent(config, parsed.data);
+      const despuesProyectado = {
+        ...antes,
+        model: proyectado.model,
+        thinkingLevel: proyectado.thinkingLevel,
+        telegramToken: proyectado.telegramToken,
+        ttsVoice: proyectado.ttsVoice,
+        memory: proyectado.memory,
+        systemPrompt: projectSystemPrompt(antes.systemPrompt, parsed.data),
+      };
 
       const action = decideRuntimeAction({
         wasRunning,
         wasEnabled: config.enabled,
-        isEnabled: actualizado.enabled,
-        fingerprintChanged: agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despues),
+        isEnabled: proyectado.enabled,
+        fingerprintChanged:
+          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
       });
+
+      // Reiniciar o parar tumbaría el WS del turno en curso (spec de bug 1:
+      // "reiniciar mata turnos vivos"). Se rechaza ANTES de escribir nada:
+      // el caller puede reintentar cuando el turno termine, o abortarlo
+      // primero con POST .../turns/:turnId/abort si de verdad quiere forzarlo.
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      }
+
+      const actualizado = await updateAgent(env, name, parsed.data);
       await aplicarRuntimeAction(supervisor, name, action);
 
       return c.json(toAgentV1(await supervisor.statusOf(actualizado)));
@@ -285,11 +326,13 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
         { headers: { authorization: `Bearer ${env.apiToken}` } },
       );
 
+      const clave = claveTurno(name, turnId);
       await new Promise<void>((resolve) => {
         let cerrado = false;
         const cerrar = () => {
           if (cerrado) return;
           cerrado = true;
+          turnosVivos.delete(clave);
           try {
             ws.close();
           } catch {
@@ -303,6 +346,9 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
         stream.onAbort(cerrar);
 
         ws.on("open", () => {
+          // Registrado solo tras `open`: mandar `{type:"abort"}` antes de
+          // que el WS esté realmente conectado no es seguro.
+          turnosVivos.set(clave, ws);
           ws.send(JSON.stringify({ type: "prompt", text: message }));
         });
 
@@ -351,6 +397,27 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
         ws.on("close", cerrar);
       });
     });
+  });
+
+  /**
+   * Aborta un turno en curso (bug 3). `abortSignal`/`X-Abort` de la spec
+   * §6 se quedan sin implementar a propósito: piden abortar en la MISMA
+   * llamada que crea un turno, y no hay forma coherente de abortar algo
+   * que aún no existe — la ruta dedicada, con el `turnId` que el caller ya
+   * conoce por ser suyo, es la única forma real. Documentado en la spec
+   * como deprecado.
+   */
+  app.post("/agents/:name/turns/:turnId/abort", async (c) => {
+    const name = c.req.param("name");
+    const turnId = c.req.param("turnId");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const ws = turnosVivos.get(claveTurno(name, turnId));
+    if (!ws) return fail(c, "TURN_NOT_FOUND", "Turn not found or already finished");
+
+    ws.send(JSON.stringify({ type: "abort" }));
+    return c.body(null, 202);
   });
 
   return app;

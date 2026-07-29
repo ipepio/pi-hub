@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   agentRuntimeFingerprint,
   decideRuntimeAction,
+  hasLiveTurnForAgent,
+  projectSystemPrompt,
+  projectUpdatedAgent,
 } from "../dist/api-v1/restart-policy.js";
 
 // H-parity: el PATCH de /api/v1 solo reiniciaba el Runner si cambiaba el
@@ -126,4 +129,79 @@ test("decideRuntimeAction: Runner corriendo y huella distinta reinicia", () => {
     decideRuntimeAction({ wasRunning: true, wasEnabled: true, isEnabled: true, fingerprintChanged: true }),
     "restart",
   );
+});
+
+// --- projectUpdatedAgent / projectSystemPrompt: el merge SIN escribir a
+// disco, para que el PATCH pueda saber si haría falta reiniciar antes de
+// persistir (y así poder rechazar con 409 sin dejar el config a medias).
+// Debe espejar exactamente el merge real de `updateAgent` en agents.ts.
+
+function baseConfig() {
+  return {
+    model: "anthropic/claude-sonnet-5",
+    thinkingLevel: "medium" as const,
+    telegramToken: "tg-token",
+    ttsVoice: "af_heart",
+    memory: { sharedAccess: "read" as const },
+    enabled: true,
+  };
+}
+
+test("projectUpdatedAgent: input vacío conserva el config actual tal cual", () => {
+  assert.deepEqual(projectUpdatedAgent(baseConfig(), {}), baseConfig());
+});
+
+test("projectUpdatedAgent: un campo presente en input lo sobreescribe, el resto queda intacto", () => {
+  const proyectado = projectUpdatedAgent(baseConfig(), { model: "openai/gpt-5" });
+  assert.equal(proyectado.model, "openai/gpt-5");
+  assert.equal(proyectado.thinkingLevel, "medium");
+  assert.equal(proyectado.telegramToken, "tg-token");
+});
+
+test("projectUpdatedAgent: null explícito limpia telegramToken/ttsVoice/memory", () => {
+  const proyectado = projectUpdatedAgent(baseConfig(), {
+    telegramToken: null,
+    ttsVoice: null,
+    memory: null,
+  });
+  assert.equal(proyectado.telegramToken, undefined);
+  assert.equal(proyectado.ttsVoice, undefined);
+  assert.equal(proyectado.memory, undefined);
+});
+
+test("projectUpdatedAgent: enabled se proyecta igual que cualquier otro campo", () => {
+  assert.equal(projectUpdatedAgent(baseConfig(), { enabled: false }).enabled, false);
+  assert.equal(projectUpdatedAgent(baseConfig(), {}).enabled, true);
+});
+
+test("projectSystemPrompt: sin systemPrompt en el input conserva el actual", () => {
+  assert.equal(projectSystemPrompt("Persona actual.", {}), "Persona actual.");
+});
+
+test("projectSystemPrompt: con systemPrompt en el input, ese es el proyectado", () => {
+  assert.equal(
+    projectSystemPrompt("Persona actual.", { systemPrompt: "Persona nueva." }),
+    "Persona nueva.",
+  );
+});
+
+// --- hasLiveTurnForAgent: usada por el PATCH para rechazar con 409
+// TURN_IN_PROGRESS un reinicio/parada que mataría un turno en curso.
+
+test("hasLiveTurnForAgent: sin claves registradas da false", () => {
+  assert.equal(hasLiveTurnForAgent([], "agent"), false);
+});
+
+test("hasLiveTurnForAgent: hay coincidencia exacta de Agent:turnId", () => {
+  assert.equal(hasLiveTurnForAgent(["agent:turn-1"], "agent"), true);
+});
+
+test("hasLiveTurnForAgent: un turno de OTRO Agent no cuenta", () => {
+  assert.equal(hasLiveTurnForAgent(["otro-agent:turn-1"], "agent"), false);
+});
+
+test("hasLiveTurnForAgent: un nombre que es prefijo de otro no da falso positivo", () => {
+  // "agent-2:turn-1" empieza por "agent" pero NO por "agent:" — el guion
+  // rompe el prefijo con dos puntos, así que no debe contar como el mismo Agent.
+  assert.equal(hasLiveTurnForAgent(["agent-2:turn-1"], "agent"), false);
 });
