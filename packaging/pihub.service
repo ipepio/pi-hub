@@ -1,0 +1,71 @@
+[Unit]
+Description=pihub — orquestador de agentes de IA
+Documentation=https://github.com/ipepio/pi-hub
+After=network-online.target
+Wants=network-online.target
+# Va en [Unit], no en [Service]: systemd lo ignora si se pone abajo y el
+# servicio se rinde tras 5 reintentos. Sin límite, un fallo transitorio de red
+# no deja pihub parado hasta que alguien lo mire.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------------------
+# POSTURA DE SEGURIDAD — LÉELO ANTES DE CAMBIAR NADA
+#
+# Esta unidad NO aísla al agente, y es deliberado.
+#
+# pihub tiene dos despliegues con posturas opuestas:
+#
+#   · En contenedor (el que usa el dashboard): ReadonlyRootfs, CapDrop=ALL,
+#     usuario no-root, límites de memoria/CPU y Network Policy por iptables.
+#     Ahí el agente NO puede salir de su caja, y esa es la promesa.
+#
+#   · Instalado como servicio (esta unidad): el agente es dueño de la máquina.
+#     Puede administrar el sistema, abrir conexiones de red, entrar por SSH a
+#     otros equipos y ejecutar cualquier binario instalado. Eso NO es un
+#     descuido: es para lo que se instala pihub en un servidor propio.
+#
+# Si quieres las garantías del primer modo, usa el contenedor — no intentes
+# reproducirlo a medias aquí. Y si quieres acotar ESTA instalación, systemd
+# tiene las primitivas (ProtectSystem=strict, NoNewPrivileges=yes,
+# CapabilityBoundingSet=, MemoryMax=, PrivateTmp=yes, IPAddressDeny=): añádelas
+# tú, sabiendo que cada una recorta lo que tus agentes pueden hacer.
+#
+# `install.sh --user <nombre>` instala con un usuario dedicado en vez de root,
+# que es el punto intermedio razonable: el agente deja de ser dueño del sistema
+# pero conserva su red y su HOME.
+# ---------------------------------------------------------------------------
+User=__PIHUB_USER__
+Group=__PIHUB_GROUP__
+
+WorkingDirectory=__PIHUB_PREFIX__
+ExecStart=__NODE_BIN__ __PIHUB_PREFIX__/packages/manager/dist/index.js
+
+EnvironmentFile=__PIHUB_CONFIG__
+# Fijadas por la unidad, no por el fichero de config: son la topología de la
+# instalación, no preferencias del operador. HOME cuelga de PIHUB_DATA_DIR
+# igual que en la imagen Docker — npx/uvx/git/ssh necesitan un HOME escribible
+# y estable, y ahí sobrevive a reinicios y actualizaciones (ver `homeDir` en
+# packages/shared/src/registry.ts).
+Environment=PIHUB_DATA_DIR=__PIHUB_DATA__
+Environment=HOME=__PIHUB_DATA__/home
+Environment=NODE_ENV=production
+
+# 24/7: si el Manager cae, se levanta solo (el límite de reintentos está
+# desactivado arriba, en [Unit]).
+Restart=always
+RestartSec=5
+
+# Los Runners son procesos hijos del Manager: al parar el servicio, se paran
+# con él. Sin esto, systemd mata solo al Manager y deja agentes huérfanos.
+KillMode=control-group
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pihub
+
+[Install]
+WantedBy=multi-user.target

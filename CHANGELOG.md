@@ -5,6 +5,26 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+### Added
+
+- **Instalación como servicio**: `sudo ./scripts/install.sh` instala pihub como
+  unidad de systemd en Debian/Ubuntu — arranca con la máquina, se reinicia si
+  cae, y deja el código en `/opt/pihub`, los datos en `/var/lib/pihub` y la
+  configuración en `/etc/pihub/pihub.env` (con un `API_TOKEN` generado). Es
+  idempotente: reinstalar actualiza el código sin tocar datos ni token.
+  `./scripts/uninstall.sh` lo retira conservando los agentes, o con `--purge`
+  borra también sus datos.
+
+  **Los agentes instalados así son dueños de la máquina**: administran el
+  sistema, instalan paquetes y abren conexiones. Es la contrapartida deliberada
+  del contenedor, donde no pueden salir de su caja. `--user <nombre>` instala con
+  un usuario dedicado sin privilegios de sistema.
+
+- **MCPs ejecutables en el contenedor**: `uv`/`uvx` en la imagen y `$HOME` dentro
+  del volumen persistente. Antes `npx`/`uvx` morían con `ENOENT` porque `$HOME`
+  caía en el filesystem de solo lectura, así que un MCP se instalaba pero no se
+  podía ejecutar. El aislamiento no cambia.
+
 ### Changed
 
 - **Aislamiento del Runner**: los Runners arrancados por el Manager ya no heredan

@@ -107,40 +107,27 @@ La pregunta previa es si hacen falta: con la Network Policy activa —bloquea
 hay ruta" sin explicar por qué. Si se añaden, conviene que el Agent sepa **que
 existe una política de red**, no solo que el comando falla.
 
-## 5. pihub solo se instala con Docker
+## 5. El servicio nativo no acota al agente, y es deliberado
 
-**Estado:** `docker compose up --build -d` es la única vía. No hay unidad de
-`systemd` ni instalador nativo.
+**Estado:** `scripts/install.sh` instala pihub como servicio de systemd. Por
+defecto el agente corre como **root y es dueño de la máquina**: administra el
+sistema, instala paquetes, abre conexiones y entra por SSH a otros equipos.
 
-**Por qué importa para el proyecto:** pihub es un runtime que quiere correr 24/7
-en el servidor de quien lo instala. Exigir Docker deja fuera a quien tiene un VPS
-Ubuntu y no quiere una capa de contenedores, que es una parte grande del público
-de un proyecto autoalojado.
+**Por qué no es un defecto:** es el producto. Quien instala pihub en su servidor
+quiere un agente que administre ese servidor — la promesa de aislamiento es la
+del contenedor, no la de esta vía. `--user <nombre>` da el punto intermedio: sin
+privilegios de sistema, conservando red y `HOME`.
 
-**La trampa que hay que evitar:** un instalable nativo **no es el mismo producto
-con otro empaquetado**. Hoy el aislamiento lo da Docker —`ReadonlyRootfs`,
-`CapDrop: ALL`, usuario no-root, límites de memoria y CPU, Network Policy por
-`iptables`— y nada de eso existe por defecto en un servicio de systemd.
+**Lo que queda pendiente de verdad**, si algún día se quiere un tercer perfil:
+`systemd` tiene primitivas equivalentes a las de Docker —`ProtectSystem=strict`,
+`NoNewPrivileges=yes`, `CapabilityBoundingSet=`, `MemoryMax=`, `PrivateTmp=yes`,
+`IPAddressDeny=`— así que un modo "nativo pero acotado" es alcanzable sin
+contenedor. No se hace ahora porque cada una de esas primitivas recorta lo que
+los agentes pueden hacer, y este modo existe justamente para no recortarlo.
 
-Un Agent con `bash` corriendo como el usuario del servicio alcanza **todo lo que
-ese usuario alcance**: el código de pihub, los ficheros de los demás Agents y
-`auth.json` con las credenciales. Si corre como root, la máquina entera.
-
-**Qué lo desbloquea:** decidir cuál de estos es el producto, porque son tres:
-
-1. **Nativo con hardening equivalente.** systemd tiene las primitivas —
-   `ProtectSystem=strict`, `NoNewPrivileges`, `CapabilityBoundingSet`,
-   `MemoryMax`, `PrivateTmp`, `IPAddressDeny`— así que las mismas garantías son
-   alcanzables sin contenedor. Es trabajo, pero mantiene la promesa.
-2. **Nativo sin aislamiento, como decisión declarada.** "Tu Agent tiene acceso a
-   la máquina" puede ser una característica, no un defecto — pero entonces hay
-   que decirlo en la primera pantalla, no descubrirlo.
-3. **Instalador que gestiona Docker por debajo.** Da 24/7 sin renunciar a nada;
-   el usuario no escribe `docker compose`, pero Docker sigue ahí.
-
-Lo que **no** puede pasar es que las dos vías digan lo mismo y solo una lo cumpla.
-
----
+**Lo que sí hay que vigilar:** que una decisión de aislamiento pensada para el
+contenedor no se aplique en silencio a esta vía. Ya pasó una vez — ver §3, donde
+`H01.06` rompió los `models.json` con `$VAR` de las instalaciones autoalojadas.
 
 ## 6. Deuda menor, identificada
 

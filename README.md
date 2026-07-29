@@ -34,17 +34,64 @@ agentes de IA. Cada agente tiene:
 
 Un **manager** central (API REST + panel web + CLI `pihub`) orquesta todo.
 
-## Arranque rápido
+## Cómo instalarlo
+
+Hay dos formas, y **no dan lo mismo**. Elige sabiendo qué pueden hacer tus
+agentes en cada una.
+
+### Docker — el agente vive en una caja
 
 ```bash
-# Clonar y configurar
 git clone git@github.com:ipepio/pi-hub.git
 cd goguest_agent_pi
 cp .env.example .env          # edita API_TOKEN y tus API keys
-
-# Levantar con Docker
 docker compose up --build -d
 ```
+
+Es el modo por defecto para probar, y el que usa el dashboard para dar un
+runtime por usuario. Ahí el agente **no puede salir del contenedor**: sistema de
+ficheros de solo lectura, sin capabilities, usuario sin privilegios y salida de
+red acotada. Puede leer, escribir y ejecutar en su workspace — y nada más.
+
+### Servicio en tu servidor — el agente es dueño de la máquina
+
+```bash
+git clone git@github.com:ipepio/pi-hub.git
+cd goguest_agent_pi
+sudo ./scripts/install.sh
+```
+
+Instala Node 22, `uv`, el código en `/opt/pihub` y una unidad de systemd que
+arranca sola con la máquina y se reinicia si cae. Genera un `API_TOKEN` y te
+dice dónde está.
+
+**Aquí tus agentes administran el servidor de verdad**: instalan paquetes,
+tocan la configuración del sistema, abren conexiones y entran por SSH a otros
+equipos. Eso es para lo que se instala pihub en una máquina propia — pero
+conviene saberlo antes, no después.
+
+Si quieres 24/7 sin ceder la máquina:
+
+```bash
+sudo ./scripts/install.sh --user pihub    # usuario dedicado, sin privilegios de sistema
+```
+
+| | Docker | Servicio (`root`) | Servicio (`--user`) |
+|---|---|---|---|
+| Arranca con la máquina | con `restart: unless-stopped` | sí | sí |
+| Administrar el sistema | no | **sí** | no |
+| Instalar paquetes del SO | no | **sí** | no |
+| SSH a otros equipos | no | **sí** | sí |
+| Aislamiento entre agentes | sí | no | no |
+
+```bash
+systemctl status pihub        # estado
+journalctl -u pihub -f        # logs en vivo
+sudo ./scripts/uninstall.sh   # quitar (conserva agentes y datos)
+```
+
+Rutas del servicio: código en `/opt/pihub`, datos en `/var/lib/pihub`,
+configuración en `/etc/pihub/pihub.env`.
 
 - **Panel del manager**: `http://localhost:4000` (introduce tu `API_TOKEN`)
 - **Cada agente**: `http://localhost:<puerto>` (4100-4199)
