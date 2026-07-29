@@ -254,6 +254,37 @@ Response `202` (in-progress):
 }
 ```
 
+### 4.6 Subida de ficheros
+
+```
+POST /api/v1/agents/:name/uploads — Dejar un fichero en el workspace del Agent
+```
+
+Request: `multipart/form-data` con un campo `file`.
+
+Response `200`:
+```json
+{
+  "path": "uploads/1234-informe.csv",
+  "name": "informe.csv",
+  "size": 1234,
+  "type": "text/csv"
+}
+```
+
+`path` siempre es relativo al workspace del Agent. El Manager reenvía el
+multipart al Runner y devuelve solo este cuerpo; no expone el puerto ni el path
+interno del Runner. El nombre se sanea y el límite de 50 MB se aplica en el
+Runner.
+
+Errores específicos:
+
+| Caso | Respuesta |
+|---|---|
+| Agent inexistente | `404` con `AGENT_NOT_FOUND`, antes de leer el body |
+| Fichero ausente, inválido o mayor de 50 MB | `400` con `BAD_REQUEST` |
+| Runner parado o inaccesible | `503` con `RESOURCE_UNAVAILABLE` |
+
 ## 5. Campos obligatorios en cada comando
 
 | Campo | Tipo | Descripción |

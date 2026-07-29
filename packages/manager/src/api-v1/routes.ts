@@ -184,6 +184,47 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     );
   });
 
+  // --- §4.6 Subida de ficheros ---
+
+  app.post("/agents/:name/uploads", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    // Igual que sesiones: resolver el Agent antes de consumir el multipart.
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    let estado: AgentStatus;
+    try {
+      estado = await supervisor.statusOf(config);
+    } catch {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
+    if (estado.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${estado.port}/api/upload`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.apiToken}`,
+          ...(c.req.header("content-type") ? { "content-type": c.req.header("content-type")! } : {}),
+        },
+        body: c.req.raw.body,
+        duplex: "half",
+      } as RequestInit);
+
+      if (response.status === 413) return fail(c, "BAD_REQUEST", "File too large");
+      if (response.status === 400) return fail(c, "BAD_REQUEST", "Invalid upload");
+      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+
+      const upload = toUploadV1(await response.json().catch(() => undefined));
+      if (!upload) return fail(c, "INTERNAL_ERROR", "Invalid upload response");
+      return c.json(upload);
+    } catch {
+      // El detalle de fetch puede incluir la topología del Runner; el caller
+      // solo recibe el código estable del catálogo.
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
+  });
+
   // --- §4.5 Turnos ---
 
   app.post("/agents/:name/turns", async (c) => {
@@ -294,6 +335,45 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
   });
 
   return app;
+}
+
+interface UploadV1Response {
+  path: string;
+  name: string;
+  size: number;
+  type: string;
+}
+
+/** Solo se permite el path que el Runner devuelve relativo al workspace. */
+function toUploadV1(value: unknown): UploadV1Response | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const body = value as Record<string, unknown>;
+  if (
+    !isWorkspaceRelativeUploadPath(body.path) ||
+    typeof body.name !== "string" ||
+    typeof body.size !== "number" ||
+    !Number.isSafeInteger(body.size) ||
+    body.size < 0 ||
+    typeof body.type !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    path: body.path,
+    name: body.name,
+    size: body.size,
+    type: body.type,
+  };
+}
+
+function isWorkspaceRelativeUploadPath(value: unknown): value is string {
+  if (typeof value !== "string" || !value.startsWith("uploads/") || value.includes("\\") || value.includes("\0")) {
+    return false;
+  }
+  return value
+    .split("/")
+    .slice(1)
+    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 /**

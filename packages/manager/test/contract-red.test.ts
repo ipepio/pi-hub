@@ -15,7 +15,7 @@
 //
 // Ejecutar con: npm run test:contract-red
 
-import { describe, it, before } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -41,10 +41,47 @@ function loadApiToken(): string {
 }
 
 let VALID_TOKEN: string;
+let UPLOAD_AGENT: string;
 
-before(() => {
+before(async () => {
   VALID_TOKEN = loadApiToken();
+  UPLOAD_AGENT = `h09-upload-${Date.now()}`;
+  const created = await request("/api/v1/agents", {
+    method: "POST",
+    body: { name: UPLOAD_AGENT, model: "anthropic/claude-sonnet-5" },
+  });
+  assert.strictEqual(created.status, 201, `no se pudo crear el Agent de H09: ${created.rawText}`);
 });
+
+after(async () => {
+  if (UPLOAD_AGENT) await request(`/api/v1/agents/${UPLOAD_AGENT}`, { method: "DELETE" });
+});
+
+async function uploadRequest(
+  path: string,
+  options: { auth?: "valid" | "invalid" | "none" } = {},
+): Promise<{ status: number; body: unknown; rawText: string }> {
+  const headers: Record<string, string> = {};
+  const auth = options.auth ?? "valid";
+  if (auth === "valid") headers.Authorization = `Bearer ${VALID_TOKEN}`;
+  if (auth === "invalid") headers.Authorization = "Bearer this-token-is-not-valid";
+
+  const form = new FormData();
+  form.append("file", new File(["informe"], "informe.csv", { type: "text/csv" }));
+  const res = await fetch(new URL(path, MANAGER_URL), {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  const rawText = await res.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(rawText);
+  } catch {
+    body = rawText;
+  }
+  return { status: res.status, body, rawText };
+}
 
 async function request(
   path: string,
@@ -161,6 +198,32 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       );
 
       assert.strictEqual(status, 404, `todavía no existe /api/v1/.../sessions: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "AGENT_NOT_FOUND");
+    });
+  });
+
+  describe("§4.6 — Subida de ficheros", () => {
+    it("POST /api/v1/agents/:name/uploads devuelve el fichero con path relativo al workspace", async () => {
+      let result = await uploadRequest(`/api/v1/agents/${UPLOAD_AGENT}/uploads`);
+      for (let attempt = 0; attempt < 30 && result.status === 503; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        result = await uploadRequest(`/api/v1/agents/${UPLOAD_AGENT}/uploads`);
+      }
+
+      assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
+      const body = result.body as { path?: string; name?: string; size?: number; type?: string };
+      assert.equal(body.name, "informe.csv");
+      assert.equal(body.size, 7);
+      assert.equal(body.type, "text/csv");
+      assert.match(body.path ?? "", /^uploads\/[0-9]+-informe\.csv$/);
+      assert.doesNotMatch(body.path ?? "", /^\//);
+      assertNoInternalsLeaked(result.rawText);
+    });
+
+    it("un Agent inexistente responde AGENT_NOT_FOUND antes de leer el multipart", async () => {
+      const { status, body, rawText } = await uploadRequest("/api/v1/agents/does-not-exist-xyz/uploads");
+
+      assert.strictEqual(status, 404, `respuesta actual: ${rawText}`);
       assert.strictEqual((body as { code?: string }).code, "AGENT_NOT_FOUND");
     });
   });
