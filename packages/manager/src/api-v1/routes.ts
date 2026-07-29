@@ -139,8 +139,10 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
       // parado no se arranca por sorpresa: el siguiente start leerá el nuevo
       // config.
       const wasRunning = supervisor.state(name).state === "running";
+      const telegramTokenChanged =
+        "telegramToken" in parsed.data && config.telegramToken !== (parsed.data.telegramToken ?? undefined);
       const actualizado = await updateAgent(env, name, parsed.data);
-      if ("telegramToken" in parsed.data && wasRunning) {
+      if (telegramTokenChanged && wasRunning) {
         if (actualizado.enabled) await supervisor.restart(name);
         else await supervisor.stop(name);
       }

@@ -144,7 +144,8 @@ Request:
 reemplaza y `null` quita el bot. El token nunca aparece en la respuesta. Si el
 Agent estaba `running`, cambiar o quitar el token detiene y vuelve a arrancar su
 Runner antes de responder, porque el Runner crea el long-polling de Telegram al
-arrancar y no puede cambiar de credencial en caliente. Si el Agent estaba
+arrancar y no puede cambiar de credencial en caliente. Reenviar el mismo valor,
+incluso al reconciliar otros campos, no reinicia el Runner. Si el Agent estaba
 parado, solo se persiste el cambio y el siguiente arranque usará el nuevo valor.
 
 Response `200`:

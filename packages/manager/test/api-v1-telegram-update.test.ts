@@ -42,6 +42,30 @@ function runningSupervisor(restarts: string[]): Supervisor {
   } as unknown as Supervisor;
 }
 
+function stoppedSupervisor(actions: string[]): Supervisor {
+  return {
+    state: () => ({ state: "stopped" }),
+    start: async () => {
+      actions.push("start");
+    },
+    restart: async () => {
+      actions.push("restart");
+    },
+    stop: async () => {
+      actions.push("stop");
+    },
+    statusOf: async (config: { name: string; telegramToken?: string }) => {
+      const { telegramToken: _telegramToken, ...safe } = config;
+      return {
+        ...safe,
+        state: "stopped",
+        port: 4100,
+        telegram: Boolean(config.telegramToken),
+      };
+    },
+  } as unknown as Supervisor;
+}
+
 test("statusOf nunca proyecta el token de Telegram y conserva el booleano", async () => {
   const status = await new RealSupervisor({ dataDir: "/data" }).statusOf({
     name: "agent",
@@ -53,6 +77,30 @@ test("statusOf nunca proyecta el token de Telegram y conserva el booleano", asyn
 
   assert.equal("telegramToken" in status, false);
   assert.equal(status.telegram, true);
+});
+
+test("PATCH /agents/:name con el mismo telegramToken no reinicia el Runner", async () => {
+  const dataDir = await setup();
+  try {
+    const restarts: string[] = [];
+    const supervisor = runningSupervisor(restarts);
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, supervisor);
+
+    const response = await app.request("http://pihub.test/agents/agent", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ telegramToken: "old-token" }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, "old-token");
+    assert.deepEqual(restarts, []);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("PATCH /agents/:name acepta telegramToken para un Agent existente", async () => {
@@ -77,6 +125,66 @@ test("PATCH /agents/:name acepta telegramToken para un Agent existente", async (
     assert.doesNotMatch(await response.text(), /new-token/);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("PATCH /agents/:name sin telegramToken no reinicia el Runner", async () => {
+  const dataDir = await setup();
+  try {
+    const restarts: string[] = [];
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      runningSupervisor(restarts),
+    );
+
+    const response = await app.request("http://pihub.test/agents/agent", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "new-model" }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, "old-token");
+    assert.deepEqual(restarts, []);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("PATCH /agents/:name de un Agent parado nunca lo arranca", async () => {
+  const cases = [
+    { name: "mismo token", payload: { telegramToken: "old-token" } },
+    { name: "token distinto", payload: { telegramToken: "new-token" } },
+    { name: "token quitado", payload: { telegramToken: null } },
+    { name: "campo omitido", payload: { model: "new-model" } },
+  ] as const;
+
+  for (const currentCase of cases) {
+    const dataDir = await setup();
+    try {
+      const actions: string[] = [];
+      const app = createApiV1Router(
+        { dataDir, apiToken: "service-token" },
+        stoppedSupervisor(actions),
+      );
+
+      const response = await app.request("http://pihub.test/agents/agent", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer service-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(currentCase.payload),
+      });
+
+      assert.equal(response.status, 200, currentCase.name);
+      assert.deepEqual(actions, [], currentCase.name);
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
   }
 });
 
