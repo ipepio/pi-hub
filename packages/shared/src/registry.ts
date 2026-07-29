@@ -17,6 +17,16 @@ export interface DataPaths {
   globalDir: string;
   globalMemoryDir: string;
   agentsDir: string;
+  /**
+   * `$HOME` de los procesos Runner (H10). El `Dockerfile` fija `ENV HOME` aquí:
+   * el filesystem del User Runtime gestionado es de solo lectura salvo este
+   * volumen, así que herramientas como `npx`/`uvx` —que necesitan escribir su
+   * caché en `$HOME/.npm`/`$HOME/.cache`— morían con ENOENT al ejecutarse,
+   * aunque instalar el paquete (que sí escribe en el workspace) funcionara.
+   * Compartido entre todos los Agents del Runtime a propósito: la caché de
+   * paquetes no lleva secretos, y una por Agent solo duplicaría descargas.
+   */
+  homeDir: string;
 }
 
 export function dataPaths(dataDir: string): DataPaths {
@@ -25,6 +35,7 @@ export function dataPaths(dataDir: string): DataPaths {
     globalDir: path.join(dataDir, "global"),
     globalMemoryDir: path.join(dataDir, "global", "memory"),
     agentsDir: path.join(dataDir, "agents"),
+    homeDir: path.join(dataDir, "home"),
   };
 }
 
@@ -96,6 +107,12 @@ export async function scaffoldGlobalDirs(dataDir: string): Promise<DataPaths> {
     await fs.mkdir(path.join(paths.globalDir, sub), { recursive: true });
   }
   await fs.mkdir(paths.agentsDir, { recursive: true });
+  // H10: creado en el bootstrap del Manager, ANTES de que provisionAgents o
+  // el Supervisor arranquen ningún Runner — así el proceso que lo crea es
+  // siempre el mismo usuario que después lo necesita escribible (root en
+  // standalone, 1000:1000 en gestionado, donde /data ya llegó chowned por
+  // el Provisioner), sin depender de un chown externo dentro de pihub.
+  await fs.mkdir(paths.homeDir, { recursive: true });
   return paths;
 }
 
