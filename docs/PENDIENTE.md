@@ -26,7 +26,7 @@ el diseño no hay que rehacerlo. Es trabajo de implementación, no de decisión.
 
 ---
 
-## 2. Hardening del runtime (H01.05, H01.06, H01.07)
+## 2. Hardening del runtime (H01.05, H01.07)
 
 Un Agent corre y responde, pero **el aislamiento no es el de producción**.
 
@@ -40,15 +40,6 @@ pero eso es distinto de que estén cerrados a nivel de red.
 
 **Qué se rompe si sigue así:** alguien con acceso a la red del contenedor puede hablar
 con un Runner saltándose al Manager, y con él toda la autorización.
-
-### H01.06 — Env del Runner por allowlist
-
-**Falta:** que el Runner reciba solo las variables que necesita, en vez de heredar el
-entorno del Manager.
-
-**Qué se rompe si sigue así:** un Channel Secret (p. ej. el token de Telegram de otro
-Agent) podría estar visible en el proceso del Runner. El dashboard cifra esos secretos y
-no los expone, pero **no puede verificar** que el Runner tampoco los recibe.
 
 ### H01.07 — Imagen non-root, capabilities eliminadas, filesystem read-only
 

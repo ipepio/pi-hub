@@ -3,6 +3,16 @@
 Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- **Aislamiento del Runner**: los Runners arrancados por el Manager ya no heredan
+  el entorno completo del contenedor. Solo reciben variables de sistema necesarias,
+  los Env Stores global y del Agent (con precedencia Agent > global) y las variables
+  internas de pihub. Para pasar una variable propia hay que fijarla explícitamente
+  en el store; el modo standalone y sus Env Stores no cambian.
+
 ## [0.1.0] — 2025-07-16
 
 ### Added

@@ -32,6 +32,26 @@ export function memoryEnvFor(env: PihubEnv, config: AgentConfig): Record<string,
   return memoryEnv;
 }
 
+/** Compone el entorno final del Runner a partir del entorno ya filtrado. */
+export function runnerEnvFor(
+  storeEnv: NodeJS.ProcessEnv,
+  env: PihubEnv,
+  config: AgentConfig,
+): NodeJS.ProcessEnv {
+  const paths = agentPaths(env.dataDir, config.name);
+  const globalDir = dataPaths(env.dataDir).globalDir;
+  const runnerEnv: NodeJS.ProcessEnv = {
+    ...storeEnv,
+    PIHUB_DATA_DIR: env.dataDir,
+    PIHUB_AGENT_NAME: config.name,
+    PI_CODING_AGENT_DIR: globalDir,
+    PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
+    ...memoryEnvFor(env, config),
+  };
+  if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none") delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
+  return runnerEnv;
+}
+
 interface Managed {
   proc: ChildProcess;
   intentionalStop: boolean;
@@ -76,23 +96,12 @@ export class Supervisor {
 
   private async spawnRunner(config: AgentConfig): Promise<void> {
     const paths = agentPaths(this.env.dataDir, config.name);
-    const globalDir = dataPaths(this.env.dataDir).globalDir;
     const log = createWriteStream(path.join(paths.root, "runner.log"), { flags: "a" });
 
-    // Env del contenedor + stores de env (global + agente), y encima las vars
-    // internas de pihub, que son protegidas y siempre mandan.
+    // Solo el entorno del sistema permitido y los stores explícitos llegan al
+    // Runner; las vars internas de pihub se añaden en la composición final.
     const storeEnv = await resolveRunnerEnv(this.env.dataDir, config.name, process.env);
-    const runnerEnv: NodeJS.ProcessEnv = {
-      ...storeEnv,
-      PIHUB_DATA_DIR: this.env.dataDir,
-      PIHUB_AGENT_NAME: config.name,
-      PI_CODING_AGENT_DIR: globalDir,
-      PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
-      ...memoryEnvFor(this.env, config),
-    };
-    // storeEnv arrastra process.env del manager: sin acceso compartido, la ruta
-    // no debe llegar al runner ni aunque viniera del entorno del contenedor.
-    if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none") delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
+    const runnerEnv = runnerEnvFor(storeEnv, this.env, config);
     const proc = spawn(process.execPath, [runnerEntry], {
       env: runnerEnv,
       cwd: paths.workspaceDir,

@@ -17,6 +17,35 @@ export function isProtectedEnvKey(key: string): boolean {
 
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * Variables del entorno del sistema que un Runner necesita para comportarse
+ * como un proceso normal. Todo lo demás debe entrar por un EnvStore explícito.
+ */
+const RUNNER_SYSTEM_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NUMERIC",
+  "LC_TIME",
+  "TZ",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TERM",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+] as const;
+
 export function isValidEnvKey(key: string): boolean {
   return KEY_RE.test(key);
 }
@@ -73,9 +102,11 @@ export async function unsetEnv(dataDir: string, key: string, agentName?: string)
 }
 
 /**
- * Env efectivo de un runner: base del contenedor + store global + store del agente.
- * Precedencia: agente > global > contenedor. Las claves protegidas del store se
- * ignoran por seguridad (no deberían existir, pero se filtran por si acaso).
+ * Env efectivo de un runner: allowlist del sistema + store global + store del
+ * agente. Precedencia: agente > global > sistema. Las claves protegidas del
+ * store se ignoran por seguridad (no deberían existir, pero se filtran por si
+ * acaso). Las variables internas de pihub se inyectan después, en el
+ * Supervisor, cuando ya se conoce el Agent concreto.
  */
 export async function resolveRunnerEnv(
   dataDir: string,
@@ -84,7 +115,11 @@ export async function resolveRunnerEnv(
 ): Promise<NodeJS.ProcessEnv> {
   const globalStore = await readEnvStore(dataDir);
   const agentStore = await readEnvStore(dataDir, agentName);
-  const merged: NodeJS.ProcessEnv = { ...base };
+  const merged: NodeJS.ProcessEnv = {};
+  for (const key of RUNNER_SYSTEM_ENV_KEYS) {
+    const value = base[key];
+    if (value !== undefined) merged[key] = value;
+  }
   for (const store of [globalStore, agentStore]) {
     for (const [key, value] of Object.entries(store)) {
       if (isProtectedEnvKey(key)) continue;
