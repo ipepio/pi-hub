@@ -347,6 +347,37 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
 
+  // --- §4.3d Ciclo de vida explícito (Fase 1, §1.3 del plan) ---
+  //
+  // Operación imperativa, distinta del estado declarativo del PATCH.
+  // start/stop mantienen `enabled` en sync con la acción — igual que ya
+  // hace el panel (`api.ts`) — para que un reconcile posterior no lo
+  // deshaga sin querer.
+  for (const action of ["start", "stop", "restart"] as const) {
+    app.post(`/agents/:name/${action}`, async (c) => {
+      const name = c.req.param("name");
+      const config = await readAgent(env.dataDir, name).catch(() => undefined);
+      if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      }
+
+      let actualizado = config;
+      if (action === "start") {
+        actualizado = await updateAgent(env, name, { enabled: true });
+        await supervisor.start(name);
+      } else if (action === "stop") {
+        actualizado = await updateAgent(env, name, { enabled: false });
+        await supervisor.stop(name);
+      } else {
+        await supervisor.restart(name);
+      }
+
+      return c.json(toAgentV1(await supervisor.statusOf(actualizado)));
+    });
+  }
+
   // --- §4.4 Sesiones ---
 
   app.post("/agents/:name/sessions", async (c) => {
