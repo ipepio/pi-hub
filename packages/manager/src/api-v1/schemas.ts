@@ -52,3 +52,13 @@ export const updateAgentV1Schema = z.object({
   memory: z.object({ sharedAccess: z.enum(["none", "read", "read-write"]) }).nullable().optional(),
   enabled: z.boolean().optional(),
 });
+
+/**
+ * Spec §4.3b, `PUT /agents/:name/env`. Conjunto COMPLETO — no variables
+ * sueltas. La validación fina de cada clave (formato, prefijos protegidos)
+ * la hace `replaceEnvStore` (`@pihub/shared`), que es la única fuente de
+ * verdad de esa regla; aquí solo se exige la forma "objeto de strings".
+ */
+export const replaceEnvV1Schema = z.object({
+  env: z.record(z.string(), z.string()),
+});

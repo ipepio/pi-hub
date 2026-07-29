@@ -133,3 +133,22 @@ export async function resolveRunnerEnv(
 export async function listEnvKeys(dataDir: string, agentName?: string): Promise<string[]> {
   return Object.keys(await readEnvStore(dataDir, agentName)).sort();
 }
+
+/**
+ * Reemplaza el store COMPLETO por `entries` — no un merge como `setEnv`.
+ * Valida TODAS las claves antes de escribir nada: si una es inválida o
+ * protegida, no se persiste ninguna, para no dejar el store a medias.
+ */
+export async function replaceEnvStore(
+  dataDir: string,
+  entries: EnvStore,
+  agentName?: string,
+): Promise<void> {
+  for (const key of Object.keys(entries)) {
+    if (!isValidEnvKey(key)) throw new Error(`Nombre de variable inválido: ${key}`);
+    if (isProtectedEnvKey(key)) {
+      throw new Error(`La variable "${key}" está protegida y no se puede fijar`);
+    }
+  }
+  await writeEnvStore(dataDir, { ...entries }, agentName);
+}

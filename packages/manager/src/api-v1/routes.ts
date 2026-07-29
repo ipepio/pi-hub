@@ -8,6 +8,7 @@ import {
   listEnvKeys,
   readAgent,
   readEnvStore,
+  replaceEnvStore,
   type AgentConfig,
   type AgentStatus,
   type PihubEnv,
@@ -29,6 +30,7 @@ import {
   createAgentV1Schema,
   createSessionV1Schema,
   createTurnV1Schema,
+  replaceEnvV1Schema,
   updateAgentV1Schema,
 } from "./schemas.js";
 
@@ -236,6 +238,56 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     await supervisor.stop(name);
     await deleteAgent(env, name);
     return c.body(null, 204);
+  });
+
+  // --- §4.3b Env del Agent (Fase 1, §1.3 del plan) ---
+  //
+  // Conjunto COMPLETO, no variables sueltas. El store GLOBAL queda fuera de
+  // /api/v1 a propósito: un store compartido filtraría config entre Agents
+  // hermanos; lo Runtime-wide ya viaja por UserRuntimeSecrets.
+
+  app.get("/agents/:name/env", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    return c.json({ keys: await listEnvKeys(env.dataDir, name) });
+  });
+
+  app.put("/agents/:name/env", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const parsed = replaceEnvV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
+
+    try {
+      const wasRunning = supervisor.state(name).state === "running";
+      const antes = await snapshotRuntimeInput(env, config);
+      const despuesProyectado = { ...antes, env: parsed.data.env };
+
+      // enabled no cambia por esta ruta: solo las ramas 3 y 4 de
+      // decideRuntimeAction pueden aplicar (ninguna arranca ni para el
+      // proceso por sorpresa, solo reinicia si el env realmente cambió).
+      const action = decideRuntimeAction({
+        wasRunning,
+        wasEnabled: config.enabled,
+        isEnabled: config.enabled,
+        fingerprintChanged:
+          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
+      });
+
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      }
+
+      await replaceEnvStore(env.dataDir, parsed.data.env, name);
+      await aplicarRuntimeAction(supervisor, name, action);
+
+      return c.json({ keys: await listEnvKeys(env.dataDir, name) });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update env");
+    }
   });
 
   // --- §4.4 Sesiones ---
