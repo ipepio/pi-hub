@@ -14,9 +14,25 @@ Esta interfaz privada permite que el **control plane** (dashboard) gestione Agen
 |---|---|
 | CRUD de Agents (crear, leer, actualizar, pausar/reactivar, eliminar) | Panel web de pihub (`/*`) |
 | Sesiones por Channel (web, Telegram) | OAuth de usuarios humanos |
-| Turnos de chat con streaming de eventos | Variables de entorno arbitrarias |
-| Health y readiness | Paquetes/extensiones (`pi install/remove`) |
-| Service auth (creencial de servicio) | Modelos disponibles (`/api/models`) |
+| Turnos de chat con streaming de eventos | Store de env **global** (multi-agente) |
+| Ciclo de vida explícito (`start`/`stop`/`restart`) | OAuth de proveedores de modelo |
+| Variables de entorno del Agent (`GET`/`PUT /agents/:name/env`) | |
+| Paquetes/extensiones del Agent (`GET`/`PUT /agents/:name/packages`) | |
+| Modelos disponibles (`GET /models`) | |
+| Estado global del Manager (`GET /status`, sin topología de puertos) | |
+| Health y readiness | |
+| Service auth (creencial de servicio) | |
+
+*(2026-07-29, Fase 1 de paridad panel↔`/api/v1`): env, paquetes y modelos
+estaban aquí como "fuera de alcance" — una decisión escrita, no un olvido.
+Se revierte a propósito: el panel (`/api/*`) ya podía hacer las cuatro cosas
+que `/api/v1` no podía (ver bugs 1-4 más abajo), y esa asimetría es la razón
+de que existieran. Con una sola superficie real, ningún bug de estos vuelve
+a poder existir. Dos exclusiones se mantienen y con otra razón: el store de
+env **global** (compartiría config entre Agents hermanos — lo Runtime-wide ya
+viaja por `UserRuntimeSecrets`) y el OAuth de proveedores de modelo
+(crearía un segundo escritor sobre el `auth.json` que el dashboard ya posee
+vía `providerCredentials`).*
 
 ## 3. Autenticación — Service Auth
 
@@ -64,7 +80,8 @@ Códigos de error definidos:
 | `AGENT_ALREADY_EXISTS` | Ya existe un agente con ese nombre |
 | `SESSION_NOT_FOUND` | La sesión no existe o no está activa |
 | `SESSION_EXPIRED` | La sesión expiró |
-| `TURN_IN_PROGRESS` | Ya hay un turno en curso para esta sesión |
+| `TURN_NOT_FOUND` | El turno no existe o ya terminó (p. ej. al intentar abortarlo) |
+| `TURN_IN_PROGRESS` | Hay un turno en curso que la operación pedida tumbaría (reinicio/parada) |
 | `MODEL_FORBIDDEN` | El modelo no está permitido para el dueño del agente |
 | `RESOURCE_UNAVAILABLE` | El servicio está temporalmente no disponible |
 | `INTERNAL_ERROR` | Error interno del Manager (nunca se expone al caller) |
@@ -128,6 +145,29 @@ Response `201`:
 }
 ```
 
+#### GET /api/v1/agents/:name
+
+*(2026-07-29, bug 4: la spec ya prometía esta ruta desde antes de esa fecha —
+está en la tabla de arriba desde el principio — y nunca se implementó.)*
+
+Response `200`:
+```json
+{
+  "name": "mi-agente",
+  "status": "running",
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "telegram": false,
+  "systemPrompt": "Eres un asistente útil.",
+  "envKeys": ["OPENWEATHER_API_KEY"],
+  "packages": ["@goguest/knowledge-search"]
+}
+```
+
+`systemPrompt`, `envKeys` y `packages` viven **solo aquí** — nunca en
+`GET /api/v1/agents` (el listado), que si los llevara volcaría todos los
+prompts del Runtime en una sola respuesta. `envKeys` son solo las claves
+(nunca los valores: ver §4.3b).
+
 #### PATCH /api/v1/agents/:name
 
 Request:
@@ -140,13 +180,30 @@ Request:
 }
 ```
 
-`telegramToken` es opcional: si se omite, conserva el valor actual; un string lo
-reemplaza y `null` quita el bot. El token nunca aparece en la respuesta. Si el
-Agent estaba `running`, cambiar o quitar el token detiene y vuelve a arrancar su
-Runner antes de responder, porque el Runner crea el long-polling de Telegram al
-arrancar y no puede cambiar de credencial en caliente. Reenviar el mismo valor,
-incluso al reconciliar otros campos, no reinicia el Runner. Si el Agent estaba
-parado, solo se persiste el cambio y el siguiente arranque usará el nuevo valor.
+Todos los campos son opcionales: uno omitido conserva el valor actual; `null`
+en `telegramToken`, `ttsVoice` o `memory` los limpia (vuelven al default de
+plataforma). El token de Telegram nunca aparece en la respuesta.
+
+**Cuándo reinicia el Runner** *(2026-07-29, bug 1: antes esto solo miraba si
+cambiaba `telegramToken` — cambiar el Model o editar la Persona se persistía
+y el Runner en marcha nunca se enteraba)*: el Manager compara una **huella**
+de todo lo que el Runner lee al arrancar — `model`, `thinkingLevel`,
+`telegramToken`, `ttsVoice`, `memory`, `systemPrompt`, el env del Agent
+(§4.3b) y sus paquetes (§4.3c) — antes y después del PATCH. Si la huella no
+cambió (p. ej. el dashboard reconcilia mandando el mismo estado), **no
+reinicia**, aunque el campo viniera en el body. Si cambió y el Agent estaba
+`running`, el Runner se para y se vuelve a arrancar antes de responder. Si
+estaba parado y sigue habilitado, el PATCH solo persiste — **nunca arranca
+por sorpresa** — y el siguiente arranque explícito (§4.3d) usa el valor
+nuevo. `{"enabled": false}` para el proceso de verdad *(bug 2: antes solo lo
+marcaba en el config y el proceso seguía vivo)*; `{"enabled": true}` en un
+Agent deshabilitado lo arranca.
+
+Si haría falta reiniciar o parar y el Agent tiene un turno vivo (una
+petición `POST .../turns` con su WebSocket aún abierto), el PATCH se
+rechaza **antes de persistir nada** con `409 TURN_IN_PROGRESS` — reiniciar
+tumbaría ese turno. El caller puede reintentar cuando termine, o abortarlo
+primero (§4.5).
 
 Response `200`:
 ```json
@@ -157,6 +214,54 @@ Response `200`:
   "telegram": false
 }
 ```
+
+### 4.3b Variables de entorno del Agent
+
+```
+GET /api/v1/agents/:name/env  — Leer las claves (nunca los valores)
+PUT /api/v1/agents/:name/env  — Reemplazar el conjunto COMPLETO
+```
+
+`GET` responde `{"keys": ["OPENWEATHER_API_KEY", "OTRA_VAR"]}` — nunca los
+valores, son secretos. `PUT` recibe `{"env": {"CLAVE": "valor", ...}}` y
+**reemplaza todo el store del Agent**, no añade/quita variables sueltas: lo
+que no venga en el body deja de existir. Rechaza con `400 BAD_REQUEST` una
+clave con formato inválido o protegida (`API_TOKEN`, prefijos `PIHUB_*` /
+`PI_CODING_AGENT_*`) — y si la rechaza, **no persiste nada**, ni siquiera las
+claves válidas del mismo payload. El store **global** (multi-agente) queda
+fuera de `/api/v1`: filtraría configuración entre Agents hermanos.
+
+Reinicia el Runner con la misma huella y el mismo guard `TURN_IN_PROGRESS`
+que el PATCH (§4.3), y solo si el Agent estaba `running` y el conjunto
+realmente cambió.
+
+### 4.3c Paquetes del Agent
+
+```
+GET /api/v1/agents/:name/packages  — Leer el conjunto instalado
+PUT /api/v1/agents/:name/packages  — Reemplazar el conjunto COMPLETO
+```
+
+`PUT` recibe `{"packages": ["@goguest/knowledge-search", ...]}`: el conjunto
+COMPLETO deseado, no altas/bajas sueltas. El Manager calcula la diferencia
+con lo instalado y converge llamando a `pi install`/`pi remove` real por
+cada paquete que sobra o falta. Responde `202` (la convergencia puede tardar:
+instala paquetes de verdad). Mismo guard `TURN_IN_PROGRESS` que el PATCH si
+hay diferencia y el Agent está `running`.
+
+### 4.3d Ciclo de vida explícito
+
+```
+POST /api/v1/agents/:name/start    — Arrancar
+POST /api/v1/agents/:name/stop     — Parar
+POST /api/v1/agents/:name/restart  — Reiniciar
+```
+
+Operación imperativa, distinta del estado declarativo del PATCH. `start` y
+`stop` fijan `enabled` en sync con la acción (`true`/`false`), para que un
+reconcile posterior no la deshaga sin querer. `stop` y `restart` respetan el
+mismo guard `TURN_IN_PROGRESS` que el PATCH. Responde `200` con el mismo
+cuerpo que `GET /agents/:name` (sin `systemPrompt`/`envKeys`/`packages`).
 
 ### 4.4 Sesiones
 
@@ -195,8 +300,9 @@ contexto, aunque pertenezcan al mismo Agent.
 ### 4.5 Turnos
 
 ```
-POST   /api/v1/agents/:name/turns     — Ejecutar turno
-GET    /api/v1/agents/:name/turns/:id — Leer estado del turno
+POST   /api/v1/agents/:name/turns             — Ejecutar turno
+GET    /api/v1/agents/:name/turns/:id         — Leer estado del turno
+POST   /api/v1/agents/:name/turns/:id/abort   — Abortar un turno en curso
 ```
 
 #### POST /api/v1/agents/:name/turns
@@ -208,10 +314,16 @@ Request:
   "turnId": "turn-001",
   "idempotencyKey": "idem-001",
   "correlationId": "req-xyz789",
-  "message": "¿Qué sabes sobre X?",
-  "abortSignal": false
+  "message": "¿Qué sabes sobre X?"
 }
 ```
+
+`abortSignal` en el body y el header `X-Abort: true` son un **alias
+deprecado, sin efecto** *(bug 3: nunca se leyeron; el schema los sigue
+aceptando por compatibilidad, pero no hacen nada)*. Pedían abortar en la
+MISMA llamada que crea el turno, y no hay forma coherente de abortar algo
+que aún no existe. Para cancelar un turno en curso, usa la ruta dedicada de
+abajo con el `turnId` que el caller ya conoce por ser suyo.
 
 Response `200` (streaming SSE):
 ```
@@ -254,6 +366,14 @@ Response `202` (in-progress):
 }
 ```
 
+#### POST /api/v1/agents/:name/turns/:id/abort
+
+Manda `{"type": "abort"}` por el WebSocket del turno hacia el Runner (que ya
+lo acepta). Response `202`, sin cuerpo. `404 TURN_NOT_FOUND` si el turno no
+existe o ya terminó — el registro de turnos vivos es en memoria por
+instancia del Manager, no persistido (mismo tradeoff que `turnosVistos`,
+la idempotencia de §5).
+
 ### 4.6 Subida de ficheros
 
 ```
@@ -286,6 +406,42 @@ Errores específicos:
 | Fichero mayor de 50 MB | `413` con `PAYLOAD_TOO_LARGE` |
 | Runner parado o inaccesible | `503` con `RESOURCE_UNAVAILABLE` |
 
+### 4.7 Modelos disponibles
+
+```
+GET /api/v1/models — Catálogo de modelos (solo lectura)
+```
+
+Response `200`:
+```json
+{
+  "models": [
+    { "provider": "anthropic", "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "configured": true },
+    { "provider": "openai", "id": "gpt-5", "name": "GPT-5", "configured": false }
+  ]
+}
+```
+
+`configured` es `true` si el Manager tiene credenciales (API key u OAuth)
+para ese modelo. Los providers se gestionan por env/archivos/CLI en el
+propio Runtime, nunca desde aquí (ver §2 — fuera de alcance).
+
+### 4.8 Estado global
+
+```
+GET /api/v1/status — Estado del Manager
+```
+
+Response `200`:
+```json
+{ "version": "0.1.0", "pi": "0.80.3", "agents": 3, "panel": true }
+```
+
+`panel` refleja el eje de control (`PIHUB_PANEL_ENABLED`): `true` en modo
+gobernador, `false` en gobernado. **Nunca** lleva el rango de puertos de los
+Runners ni ningún otro dato de topología interna — §7 lo prohíbe
+explícitamente.
+
 ## 5. Campos obligatorios en cada comando
 
 | Campo | Tipo | Descripción |
@@ -299,7 +455,7 @@ Errores específicos:
 
 1. **Ningún caller conoce tokens, pid, puertos, paths o WebSockets de Runner.** El Manager es el único punto de entrada.
 2. **`turnId`, `sessionKey`, `idempotencyKey` y `correlationId` son obligatorios** en cada comando de turno.
-3. **La cancelación cruza toda la cadena** mediante `AbortSignal` (campo booleano en request o header `X-Abort: true`).
+3. **La cancelación cruza toda la cadena** mediante `POST /agents/:name/turns/:id/abort` (§4.5), que manda `{"type":"abort"}` al Runner por su WebSocket. *(2026-07-29: `abortSignal`/`X-Abort` en la creación del turno nunca se implementaron y quedan deprecados — no se puede abortar algo que aún no existe.)*
 4. **Cada stream termina con un evento final o error terminal tipado** (`turn-complete` o `turn-error`). Nunca queda colgando.
 5. **Los errores externos se traducen a un vocabulario estable.** El caller nunca ve stack traces, paths, puertos ni tokens.
 6. **El adapter pihub real y el fake de tests satisfacen la misma Interface.**
@@ -324,7 +480,8 @@ Errores específicos:
 | `AGENT_ALREADY_EXISTS` | 409 | Ya existe un agente con ese nombre |
 | `SESSION_NOT_FOUND` | 404 | La sesión no existe o no está activa |
 | `SESSION_EXPIRED` | 410 | La sesión expiró |
-| `TURN_IN_PROGRESS` | 409 | Ya hay un turno en curso para esta sesión |
+| `TURN_NOT_FOUND` | 404 | El turno no existe o ya terminó |
+| `TURN_IN_PROGRESS` | 409 | Hay un turno en curso que la operación pedida tumbaría |
 | `MODEL_FORBIDDEN` | 403 | El modelo no está permitido para el dueño del agente |
 | `RESOURCE_UNAVAILABLE` | 503 | El servicio está temporalmente no disponible |
 | `INTERNAL_ERROR` | 500 | Error interno del Manager |

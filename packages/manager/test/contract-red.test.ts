@@ -250,4 +250,139 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       assert.notStrictEqual(status, 404, `la ruta de rotación todavía no existe: ${rawText}`);
     });
   });
+
+  // --- Fase 1 (2026-07-29): paridad panel↔/api/v1. Los 4 bugs originales
+  // eran invisibles para los tests unitarios porque los fakes registran la
+  // llamada, no reinician nada de verdad — solo un Manager real lo prueba.
+
+  describe("§4.3 — GET /api/v1/agents/:name (bug 4)", () => {
+    it("existe y trae systemPrompt/envKeys/packages; el listado NO los lleva", async () => {
+      const { status, body, rawText } = await request(`/api/v1/agents/${UPLOAD_AGENT}`);
+
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      const parsed = body as { systemPrompt?: unknown; envKeys?: unknown; packages?: unknown };
+      assert.ok("systemPrompt" in parsed, "falta systemPrompt en GET de un Agent");
+      assert.ok(Array.isArray(parsed.envKeys), "envKeys debe ser un array");
+      assert.ok(Array.isArray(parsed.packages), "packages debe ser un array");
+      assertNoInternalsLeaked(rawText);
+
+      const list = await request("/api/v1/agents");
+      assert.doesNotMatch(list.rawText, /systemPrompt/, "el listado no debe llevar systemPrompt");
+    });
+
+    it("de un Agent inexistente responde 404 AGENT_NOT_FOUND", async () => {
+      const { status, body } = await request("/api/v1/agents/does-not-exist-xyz");
+      assert.strictEqual(status, 404);
+      assert.strictEqual((body as { code?: string }).code, "AGENT_NOT_FOUND");
+    });
+  });
+
+  describe("§4.3 — PATCH /api/v1/agents/:name (bugs 1 y 2, huella de arranque)", () => {
+    it("reconciliar el MISMO estado dos veces no rompe nada y el Agent sigue running", async () => {
+      const first = await request(`/api/v1/agents/${UPLOAD_AGENT}`, {
+        method: "PATCH",
+        body: { model: "anthropic/claude-sonnet-5" },
+      });
+      assert.strictEqual(first.status, 200, `respuesta actual: ${first.rawText}`);
+
+      // Mismo body otra vez: la huella no cambió, no debería reiniciar —
+      // si reiniciara en bucle, el Agent no llegaría nunca a "running"
+      // (bug 1 generalizado: reconciliar en cada llamada no debe tumbar
+      // el Runner una y otra vez).
+      const second = await request(`/api/v1/agents/${UPLOAD_AGENT}`, {
+        method: "PATCH",
+        body: { model: "anthropic/claude-sonnet-5" },
+      });
+      assert.strictEqual(second.status, 200, `respuesta actual: ${second.rawText}`);
+      const parsed = second.body as { status?: string };
+      assert.strictEqual(parsed.status, "running", `el Agent no volvió a running: ${second.rawText}`);
+    });
+
+    it("{enabled:false} para el proceso de verdad (bug 2)", async () => {
+      const stopAgent = `h-lifecycle-${Date.now()}`;
+      const created = await request("/api/v1/agents", {
+        method: "POST",
+        body: { name: stopAgent, model: "anthropic/claude-sonnet-5" },
+      });
+      assert.strictEqual(created.status, 201, `no se pudo crear el Agent: ${created.rawText}`);
+
+      try {
+        const patched = await request(`/api/v1/agents/${stopAgent}`, {
+          method: "PATCH",
+          body: { enabled: false },
+        });
+        assert.strictEqual(patched.status, 200, `respuesta actual: ${patched.rawText}`);
+        assert.strictEqual(
+          (patched.body as { status?: string }).status,
+          "stopped",
+          `el proceso debía parar de verdad: ${patched.rawText}`,
+        );
+      } finally {
+        await request(`/api/v1/agents/${stopAgent}`, { method: "DELETE" });
+      }
+    });
+  });
+
+  describe("§4.3b — Env del Agent", () => {
+    it("PUT reemplaza el conjunto y GET devuelve solo las claves", async () => {
+      const put = await request(`/api/v1/agents/${UPLOAD_AGENT}/env`, {
+        method: "PUT",
+        body: { env: { CONTRACT_RED_VAR: "valor-secreto" } },
+      });
+      assert.strictEqual(put.status, 200, `respuesta actual: ${put.rawText}`);
+      assert.doesNotMatch(put.rawText, /valor-secreto/, "no debe exponer el valor");
+
+      const get = await request(`/api/v1/agents/${UPLOAD_AGENT}/env`);
+      assert.deepStrictEqual((get.body as { keys?: string[] }).keys, ["CONTRACT_RED_VAR"]);
+      assert.doesNotMatch(get.rawText, /valor-secreto/);
+    });
+  });
+
+  describe("§4.3c — Paquetes del Agent", () => {
+    it("GET responde 200 con un array (la instalación real se prueba en smoke:t12)", async () => {
+      const { status, body, rawText } = await request(`/api/v1/agents/${UPLOAD_AGENT}/packages`);
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      assert.ok(Array.isArray((body as { packages?: unknown }).packages));
+    });
+  });
+
+  describe("§4.3d — Ciclo de vida explícito", () => {
+    it("stop para el proceso y start lo vuelve a arrancar", async () => {
+      const stopped = await request(`/api/v1/agents/${UPLOAD_AGENT}/stop`, { method: "POST" });
+      assert.strictEqual(stopped.status, 200, `respuesta actual: ${stopped.rawText}`);
+      assert.strictEqual((stopped.body as { status?: string }).status, "stopped");
+
+      const started = await request(`/api/v1/agents/${UPLOAD_AGENT}/start`, { method: "POST" });
+      assert.strictEqual(started.status, 200, `respuesta actual: ${started.rawText}`);
+      assert.strictEqual((started.body as { status?: string }).status, "running");
+    });
+  });
+
+  describe("§4.5 — Abortar un turno", () => {
+    it("un turno que no existe responde 404 TURN_NOT_FOUND", async () => {
+      const { status, body, rawText } = await request(
+        `/api/v1/agents/${UPLOAD_AGENT}/turns/no-existe/abort`,
+        { method: "POST" },
+      );
+      assert.strictEqual(status, 404, `respuesta actual: ${rawText}`);
+      assert.strictEqual((body as { code?: string }).code, "TURN_NOT_FOUND");
+    });
+  });
+
+  describe("§4.7 — Modelos disponibles", () => {
+    it("GET /api/v1/models responde 200 con {models: []}", async () => {
+      const { status, body, rawText } = await request("/api/v1/models");
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      assert.ok(Array.isArray((body as { models?: unknown }).models));
+    });
+  });
+
+  describe("§4.8 — Estado global", () => {
+    it("GET /api/v1/status responde 200 sin portRange (spec §7)", async () => {
+      const { status, body, rawText } = await request("/api/v1/status");
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      assert.ok(!("portRange" in (body as object)), "no debe exponer portRange");
+      assertNoInternalsLeaked(rawText);
+    });
+  });
 });
