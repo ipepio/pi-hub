@@ -78,9 +78,22 @@ código, en vez de `turn-complete` sin contenido.
 **Por qué no está hecho:** requiere una task H con su release y digest compatibles; esta
 anotación deja fuera el cambio de código.
 
+**Caso real verificado en T12:** el Provider respondió `HTTP 402` con el mensaje claro
+`You've reached the monthly token limit for deepseek-v4-flash. The counter resets on the
+1st.` (`type: monthly_cap_reached`). El dashboard tenía credencial válida y otros Models
+(`gemma4`, `mimo-v2.5` y `qwen3.6`) respondían correctamente; el límite es mensual y por
+Model, no falta de saldo general.
+
+Pero ese error no deja rastro en la cadena: los logs del contenedor no lo mencionan, el
+`runner.log` persistido queda vacío y el Manager emite `agent_end` sin texto. El dashboard
+solo recibe “el runtime terminó el turno sin devolver contenido”. El Runner también debe
+registrar el error del Provider, además de propagarlo como `turn-error`.
+
 **Qué se rompe si sigue así:** el dashboard no puede distinguir entre “el modelo no tenía
 nada que decir” y “la llamada al Provider falló”, y el smoke tampoco puede diagnosticar
-la causa.
+la causa. Mientras el error se pierda en origen, ningún diagnóstico basado en logs puede
+funcionar: reordenar el clasificador del smoke no arregla este caso porque el `402` nunca
+se escribe.
 
 ---
 
