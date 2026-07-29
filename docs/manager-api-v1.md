@@ -135,16 +135,25 @@ Request:
 {
   "model": "anthropic/claude-haiku-3-20250320",
   "systemPrompt": null,
+  "telegramToken": "123456:ABC",
   "enabled": false
 }
 ```
+
+`telegramToken` es opcional: si se omite, conserva el valor actual; un string lo
+reemplaza y `null` quita el bot. El token nunca aparece en la respuesta. Si el
+Agent estaba `running`, cambiar o quitar el token detiene y vuelve a arrancar su
+Runner antes de responder, porque el Runner crea el long-polling de Telegram al
+arrancar y no puede cambiar de credencial en caliente. Si el Agent estaba
+parado, solo se persiste el cambio y el siguiente arranque usará el nuevo valor.
 
 Response `200`:
 ```json
 {
   "name": "mi-agente",
   "status": "stopped",
-  "model": "anthropic/claude-haiku-3-20250320"
+  "model": "anthropic/claude-haiku-3-20250320",
+  "telegram": false
 }
 ```
 

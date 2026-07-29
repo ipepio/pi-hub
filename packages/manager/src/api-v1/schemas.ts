@@ -45,5 +45,6 @@ export const updateAgentV1Schema = z.object({
   model: z.string().min(1).optional(),
   thinkingLevel: z.enum(["low", "medium", "high"]).optional(),
   systemPrompt: z.string().optional(),
+  telegramToken: z.string().nullable().optional(),
   enabled: z.boolean().optional(),
 });
