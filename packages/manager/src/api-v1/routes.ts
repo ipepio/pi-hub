@@ -5,6 +5,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import {
   listAgents,
+  listEnvKeys,
   readAgent,
   readEnvStore,
   type AgentConfig,
@@ -145,6 +146,25 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
       }
       return fail(c, "BAD_REQUEST", "Could not create agent");
     }
+  });
+
+  // Bug 4: la spec §4.3 promete GET /agents/:name (línea 100) y nunca
+  // existió. `systemPrompt`/`packages`/`envKeys` SOLO aquí — nunca en el
+  // listado (`GET /agents`), que volcaría todos los prompts del Runtime en
+  // una sola respuesta.
+  app.get("/agents/:name", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const [status, systemPrompt, envKeys, packages] = await Promise.all([
+      supervisor.statusOf(config),
+      readSystemPrompt(env, name),
+      listEnvKeys(env.dataDir, name),
+      listPackages(env, name),
+    ]);
+
+    return c.json({ ...toAgentV1(status), systemPrompt, envKeys, packages });
   });
 
   // Spec §4.3. Faltaba: `contract-red` no lo cubre, asi que nadie lo
