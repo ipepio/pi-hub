@@ -42,6 +42,8 @@ function loadApiToken(): string {
 
 let VALID_TOKEN: string;
 let UPLOAD_AGENT: string;
+let TURN_AGENT: string;
+let TURN_AGENT_CREATION: Promise<void> | undefined;
 let DEFAULT_AGENT: string;
 let PANEL_COOKIE: string;
 let PANEL_CSRF: string;
@@ -138,6 +140,7 @@ before(async () => {
 
 after(async () => {
   if (DEFAULT_AGENT) await request(`/api/v1/agents/${DEFAULT_AGENT}`, { method: "DELETE" });
+  if (TURN_AGENT) await request(`/api/v1/agents/${TURN_AGENT}`, { method: "DELETE" });
   if (UPLOAD_AGENT) await request(`/api/v1/agents/${UPLOAD_AGENT}`, { method: "DELETE" });
 });
 
@@ -191,6 +194,119 @@ async function request(
   }
 
   return { status: res.status, body, rawText };
+}
+
+interface ContractSseEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+async function ensureTurnAgent(): Promise<void> {
+  if (TURN_AGENT_CREATION) return TURN_AGENT_CREATION;
+  TURN_AGENT_CREATION = (async () => {
+    if (!TURN_AGENT) {
+      TURN_AGENT = `h09-turn-${Date.now()}`;
+      const created = await request("/api/v1/agents", {
+        method: "POST",
+        body: {
+          name: TURN_AGENT,
+          model: "anthropic/claude-sonnet-5",
+          thinkingLevel: "low",
+        },
+      });
+      assert.strictEqual(created.status, 201, `no se pudo crear el Agent de turnos: ${created.rawText}`);
+    }
+    await waitForAgentRunning(TURN_AGENT);
+  })();
+  return TURN_AGENT_CREATION;
+}
+
+async function waitForAgentRunning(agent: string): Promise<void> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const result = await request(`/api/v1/agents/${agent}`);
+    if (result.status === 200 && (result.body as { status?: string }).status === "running") {
+      const commands = await request(`/api/v1/agents/${agent}/commands`);
+      if (commands.status === 200) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Agent ${agent} no llegó a running antes del turno`);
+}
+
+async function streamTurn(
+  agent: string,
+  options: {
+    turnId: string;
+    idempotencyKey: string;
+    message: string;
+    eventProfile?: "basic" | "verbose";
+    abort?: boolean;
+  },
+): Promise<ContractSseEvent[]> {
+  await waitForAgentRunning(agent);
+  const suffix = options.eventProfile ? `?eventProfile=${options.eventProfile}` : "";
+  const response = await fetch(new URL(`/api/v1/agents/${agent}/turns${suffix}`, MANAGER_URL), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${VALID_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionKey: "contract-red-session",
+      turnId: options.turnId,
+      idempotencyKey: options.idempotencyKey,
+      correlationId: `contract-red-${options.turnId}`,
+      message: options.message,
+    }),
+  });
+  if (response.status !== 200) {
+    throw new Error(`turno no abrió SSE: ${await response.text()}`);
+  }
+  if (!response.body) throw new Error("Manager devolvió un turno sin body SSE");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const events: ContractSseEvent[] = [];
+  let pending = "";
+  let abortSent = false;
+
+  const consumeBlock = async (block: string): Promise<void> => {
+    const eventName = block.match(/^event: (.+)$/m)?.[1];
+    const dataLines = [...block.matchAll(/^data: (.*)$/gm)].map((match) => match[1]);
+    if (!eventName || dataLines.length === 0) return;
+
+    const event: ContractSseEvent = {
+      event: eventName,
+      data: JSON.parse(dataLines.join("\n")) as Record<string, unknown>,
+    };
+    events.push(event);
+
+    if (options.abort && !abortSent && event.event === "turn-start") {
+      const result = await request(`/api/v1/agents/${agent}/turns/${options.turnId}/abort`, {
+        method: "POST",
+      });
+      assert.strictEqual(result.status, 202, `abort no aceptado: ${result.rawText}`);
+      abortSent = true;
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) pending += decoder.decode(value, { stream: !done });
+    pending = pending.replace(/\r\n/g, "\n");
+    let separator = pending.indexOf("\n\n");
+    while (separator >= 0) {
+      const block = pending.slice(0, separator);
+      pending = pending.slice(separator + 2);
+      await consumeBlock(block);
+      separator = pending.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+
+  assert.ok(events.length > 0, "el SSE del turno no publicó eventos");
+  if (options.abort) assert.equal(abortSent, true, "el abort no llegó a un turno vivo");
+  return events;
 }
 
 /** Spec §7: ningún response debe filtrar paths, puertos de Runner o el token. */
@@ -604,6 +720,104 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       const result = await request(`/api/v1/agents/${DEFAULT_AGENT}`);
       assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
       assert.ok((result.body as { model?: string }).model);
+    });
+  });
+
+  describe("Red 3 — eventos y streaming contra Manager y Runner reales", { concurrency: false }, () => {
+    it("eventProfile inválido responde 400 BAD_REQUEST sin abrir un turno", async () => {
+      await ensureTurnAgent();
+      const result = await request(`/api/v1/agents/${TURN_AGENT}/turns?eventProfile=diagnostic`, {
+        method: "POST",
+        body: {
+          sessionKey: "contract-red-session",
+          turnId: `invalid-profile-${Date.now()}-${TURN_AGENT}`,
+          idempotencyKey: `invalid-profile-${Date.now()}`,
+          correlationId: `invalid-profile-${Date.now()}`,
+          message: "no ejecutar",
+        },
+      });
+      assert.strictEqual(result.status, 400, `respuesta actual: ${result.rawText}`);
+      assert.strictEqual((result.body as { code?: string }).code, "BAD_REQUEST");
+    });
+
+    it("basic conserva el vocabulario normal del turno y termina en turn-complete", async () => {
+      await ensureTurnAgent();
+      const events = await streamTurn(TURN_AGENT, {
+        turnId: `basic-${Date.now()}`,
+        idempotencyKey: `basic-${Date.now()}`,
+        message: "Responde exactamente OK y nada más.",
+      });
+      assert.equal(events[0]?.event, "turn-start");
+      assert.equal(events.at(-1)?.event, "turn-complete");
+      assert.ok(events.some((event) => event.event === "chunk"), "faltó chunk en el turno basic");
+      assert.ok(
+        events.every((event) =>
+          ["turn-start", "chunk", "turn-complete", "turn-error"].includes(event.event),
+        ),
+        "basic no debe publicar thinking/tools",
+      );
+      assert.deepStrictEqual(events.at(-1)?.data, {
+        turnId: events.at(-1)?.data.turnId,
+        totalTokens: 0,
+      });
+    });
+
+    it("verbose conserva el turno y valida los shapes de thinking/tools si el Runner los produce", async () => {
+      await ensureTurnAgent();
+      const events = await streamTurn(TURN_AGENT, {
+        turnId: `verbose-${Date.now()}`,
+        idempotencyKey: `verbose-${Date.now()}`,
+        eventProfile: "verbose",
+        message: "Usa la herramienta read para leer package.json y después responde exactamente DONE.",
+      });
+      assert.equal(events[0]?.event, "turn-start");
+      assert.equal(events.at(-1)?.event, "turn-complete");
+
+      for (const event of events) {
+        if (event.event === "thinking-delta") {
+          assert.equal(typeof event.data.turnId, "string");
+          assert.equal(typeof event.data.delta, "string");
+        }
+        if (event.event === "tool-start") {
+          assert.equal(typeof event.data.turnId, "string");
+          assert.equal(typeof event.data.toolName, "string");
+          assert.doesNotMatch(String(event.data.toolName), /[\\/\\s]/);
+        }
+        if (event.event === "tool-end") {
+          assert.equal(typeof event.data.turnId, "string");
+          assert.equal(typeof event.data.toolName, "string");
+          assert.equal(typeof event.data.isError, "boolean");
+          assert.doesNotMatch(String(event.data.toolName), /[\\/\\s]/);
+        }
+      }
+      assert.ok(
+        events.every((event) =>
+          [
+            "turn-start",
+            "chunk",
+            "thinking-delta",
+            "tool-start",
+            "tool-end",
+            "turn-complete",
+            "turn-error",
+          ].includes(event.event),
+        ),
+        "verbose publicó un evento fuera del contrato",
+      );
+    });
+
+    it("abort real termina el SSE con turn-aborted y nunca con turn-complete", async () => {
+      await ensureTurnAgent();
+      const events = await streamTurn(TURN_AGENT, {
+        turnId: `abort-${Date.now()}`,
+        idempotencyKey: `abort-${Date.now()}`,
+        abort: true,
+        message:
+          "Escribe una respuesta muy larga de al menos 2000 palabras sobre la historia de la computación y continúa hasta que te cancele.",
+      });
+      assert.equal(events.at(-1)?.event, "turn-aborted");
+      assert.deepStrictEqual(events.at(-1)?.data, { turnId: events.at(-1)?.data.turnId });
+      assert.equal(events.some((event) => event.event === "turn-complete"), false);
     });
   });
 });

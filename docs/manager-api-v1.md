@@ -356,6 +356,17 @@ GET    /api/v1/agents/:name/turns/:id         — Leer estado del turno
 POST   /api/v1/agents/:name/turns/:id/abort   — Abortar un turno en curso
 ```
 
+`POST /api/v1/agents/:name/turns` acepta el query param opcional
+`eventProfile`:
+
+- ausencia equivale a `basic`;
+- `basic` conserva solo los eventos de ciclo de vida y respuesta;
+- `verbose` añade los eventos de diagnóstico de thinking y tools;
+- cualquier valor distinto de `basic` o `verbose` responde `400 BAD_REQUEST`.
+
+El perfil solo selecciona eventos SSE de diagnóstico: no cambia la
+idempotencia, la sesión ni el registro efímero de turnos vivos.
+
 #### POST /api/v1/agents/:name/turns
 
 Request:
@@ -396,6 +407,33 @@ O bien:
 event: turn-error
 data: {"turnId": "turn-001", "code": "RESOURCE_UNAVAILABLE", "message": "Service unavailable"}
 ```
+
+Los perfiles `basic` y `verbose` comparten estos cinco eventos de ciclo de
+vida: `turn-start`, `chunk`, `turn-complete`, `turn-aborted` y `turn-error`.
+Una cancelación no se publica como error: tras aceptar
+`POST .../turns/:id/abort`, el próximo final del Runner produce:
+
+```
+event: turn-aborted
+data: {"turnId": "turn-001"}
+```
+
+Si el WebSocket del Runner se cierra después del abort sin enviar `agent_end`,
+el Manager emite el mismo `turn-aborted` antes de cerrar el SSE.
+
+Con `eventProfile=verbose`, además se publican estos eventos traducidos del
+protocolo interno del Runner:
+
+| Evento SSE | Payload |
+|---|---|
+| `thinking-delta` | `{ "turnId": "turn-001", "delta": "..." }` |
+| `tool-start` | `{ "turnId": "turn-001", "toolName": "read" }` |
+| `tool-end` | `{ "turnId": "turn-001", "toolName": "read", "isError": false }` |
+
+`thinking_delta`, `tool_start` y `tool_end` son nombres internos del Runner;
+no forman parte del contrato SSE. `toolName` se limita a un identificador
+seguro y corto: no se publican paths ni argumentos que vengan en ese campo.
+En `basic` estos tres eventos se omiten.
 
 #### GET /api/v1/agents/:name/turns/:id
 
@@ -544,7 +582,7 @@ panel actual; se retirarán en la sub-fase de migración del cliente.
 1. **Ningún caller conoce tokens, pid, puertos, paths o WebSockets de Runner.** El Manager es el único punto de entrada.
 2. **`turnId`, `sessionKey`, `idempotencyKey` y `correlationId` son obligatorios** en cada comando de turno.
 3. **La cancelación cruza toda la cadena** mediante `POST /agents/:name/turns/:id/abort` (§4.5), que manda `{"type":"abort"}` al Runner por su WebSocket. *(2026-07-29: `abortSignal`/`X-Abort` en la creación del turno nunca se implementaron y quedan deprecados — no se puede abortar algo que aún no existe.)*
-4. **Cada stream termina con un evento final o error terminal tipado** (`turn-complete` o `turn-error`). Nunca queda colgando.
+4. **Cada stream termina con un evento final o error terminal tipado** (`turn-complete`, `turn-aborted` o `turn-error`). Nunca queda colgando.
 5. **Los errores externos se traducen a un vocabulario estable.** El caller nunca ve stack traces, paths, puertos ni tokens.
 6. **El adapter pihub real y el fake de tests satisfacen la misma Interface.**
 
