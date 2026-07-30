@@ -21,7 +21,7 @@ import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent }
 import { listModels } from "../models.js";
 import type { Supervisor } from "../supervisor.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
-import { classifyServiceAuth } from "./auth.js";
+import { classifyApiV1Auth, cookieValue, CSRF_COOKIE } from "./auth.js";
 import {
   agentRuntimeFingerprint,
   decideRuntimeAction,
@@ -86,12 +86,33 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     await next();
   });
 
-  // Auth de servicio: `/api/v1` es servicio-a-servicio y la cookie del
-  // panel NO vale aquí (ver api-v1/auth.ts).
+  // Auth dual: Bearer para callers servicio-a-servicio y cookie estricta
+  // para el panel. Este guard vive dentro de `/api/v1`, antes de cualquier
+  // ruta, para no alterar el guard legacy de `/api/*`.
   app.use("*", async (c, next) => {
-    const verdict = classifyServiceAuth(c.req.header("authorization"), env.apiToken);
-    if (verdict !== "ok") {
-      return fail(c, verdict, "Service credential required");
+    const cookie = c.req.header("cookie");
+    const csrfCookie = cookieValue(cookie, CSRF_COOKIE);
+    const verdict = classifyApiV1Auth(
+      {
+        authorizationHeader: c.req.header("authorization"),
+        cookieHeader: cookie,
+        method: c.req.method,
+        csrfHeader: c.req.header("x-csrf-token"),
+        csrfCookie,
+        origin: c.req.header("origin"),
+        requestOrigin: new URL(c.req.url).origin,
+      },
+      env.apiToken,
+    );
+    if (verdict.kind === "missing") {
+      return fail(c, "MISSING_AUTH", "Service credential required");
+    }
+    if (verdict.kind === "invalid") {
+      return fail(c, "INVALID_AUTH", "Service credential required");
+    }
+    if (verdict.kind === "csrf_invalid") {
+      const code = c.req.header("x-csrf-token") && csrfCookie ? "CSRF_INVALID" : "CSRF_REQUIRED";
+      return fail(c, code, code === "CSRF_REQUIRED" ? "CSRF token required" : "CSRF token invalid");
     }
     await next();
   });

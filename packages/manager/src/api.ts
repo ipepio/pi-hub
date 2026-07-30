@@ -28,7 +28,11 @@ import type { Supervisor } from "./supervisor.js";
 import type { OAuthService } from "./oauth.js";
 import { listModels } from "./models.js";
 import { panelDir } from "./paths.js";
-import { createApiV1Router, correlationIdOf } from "./api-v1/routes.js";
+import {
+  createApiV1Router,
+  correlationIdOf,
+} from "./api-v1/routes.js";
+import { csrfCookie, generateCsrfToken } from "./api-v1/auth.js";
 import { apiError } from "./api-v1/errors.js";
 import path from "node:path";
 
@@ -87,8 +91,10 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
     if (env.apiToken && body.token !== env.apiToken) {
       return c.json({ error: "Token incorrecto" }, 401);
     }
+    const csrfToken = generateCsrfToken();
     c.header("Set-Cookie", sessionCookie(env.apiToken));
-    return c.json({ ok: true });
+    c.header("Set-Cookie", csrfCookie(csrfToken), { append: true });
+    return c.json({ ok: true, csrfToken });
   });
 
   // La interfaz privada versionada se monta ANTES del guard del panel: el

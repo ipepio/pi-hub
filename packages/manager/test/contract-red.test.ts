@@ -42,9 +42,67 @@ function loadApiToken(): string {
 
 let VALID_TOKEN: string;
 let UPLOAD_AGENT: string;
+let PANEL_COOKIE: string;
+let PANEL_CSRF: string;
+
+function headerCookies(response: Response): string[] {
+  const headers = response.headers as Headers & { getSetCookie?: () => string[] };
+  return headers.getSetCookie?.() ?? [headers.get("set-cookie") ?? ""];
+}
+
+async function loginPanel(): Promise<void> {
+  const response = await fetch(new URL("/auth/session", MANAGER_URL), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: VALID_TOKEN }),
+  });
+  const rawText = await response.text();
+  assert.strictEqual(response.status, 200, `login de panel falló: ${rawText}`);
+  const body = JSON.parse(rawText) as { ok?: boolean; csrfToken?: string };
+  assert.strictEqual(body.ok, true);
+  assert.ok(body.csrfToken);
+
+  const cookies = headerCookies(response);
+  const session = cookies.find((cookie) => cookie.startsWith("pihub_token="));
+  const csrf = cookies.find((cookie) => cookie.startsWith("pihub_csrf="));
+  assert.ok(session, "login no emitió pihub_token");
+  assert.ok(csrf, "login no emitió pihub_csrf");
+  PANEL_COOKIE = `${session!.split(";", 1)[0]}; ${csrf!.split(";", 1)[0]}`;
+  PANEL_CSRF = body.csrfToken;
+}
+
+async function panelRequest(
+  path: string,
+  options: { method?: string; body?: unknown; origin?: string } = {},
+): Promise<{ status: number; body: unknown; rawText: string }> {
+  const method = options.method ?? "GET";
+  const headers: Record<string, string> = {
+    Cookie: PANEL_COOKIE,
+    "Content-Type": "application/json",
+  };
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    headers["X-CSRF-Token"] = PANEL_CSRF;
+  }
+  if (options.origin) headers.Origin = options.origin;
+
+  const response = await fetch(new URL(path, MANAGER_URL), {
+    method,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  const rawText = await response.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(rawText);
+  } catch {
+    body = rawText;
+  }
+  return { status: response.status, body, rawText };
+}
 
 before(async () => {
   VALID_TOKEN = loadApiToken();
+  await loginPanel();
   UPLOAD_AGENT = `h09-upload-${Date.now()}`;
   const created = await request("/api/v1/agents", {
     method: "POST",
@@ -383,6 +441,39 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
       assert.ok(!("portRange" in (body as object)), "no debe exponer portRange");
       assertNoInternalsLeaked(rawText);
+    });
+  });
+
+  describe("Release A — auth de cookie + CSRF contra Manager real", () => {
+    it("login emite la cookie de sesión y el token CSRF", () => {
+      assert.match(PANEL_COOKIE, /pihub_token=[^;]+/);
+      assert.match(PANEL_COOKIE, /pihub_csrf=[^;]+/);
+      assert.match(PANEL_CSRF, /^[0-9a-f]{64}$/);
+    });
+
+    it("GET /api/v1/status acepta la cookie sin CSRF", async () => {
+      const { status, body, rawText } = await panelRequest("/api/v1/status");
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      assert.ok(!("portRange" in (body as object)));
+    });
+
+    it("PATCH autenticado con cookie y CSRF llega al Manager", async () => {
+      const result = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}`, {
+        method: "PATCH",
+        body: {},
+      });
+      assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
+    });
+
+    it("POST de turno autenticado con cookie y CSRF llega a validar el payload", async () => {
+      // El body deliberadamente incompleto evita arrancar una inferencia real:
+      // este contrato prueba la puerta de auth, no el transporte de turnos.
+      const result = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/turns`, {
+        method: "POST",
+        body: { message: "auth contract" },
+      });
+      assert.strictEqual(result.status, 400, `respuesta actual: ${result.rawText}`);
+      assert.strictEqual((result.body as { code?: string }).code, "BAD_REQUEST");
     });
   });
 });

@@ -27,9 +27,16 @@ describe("api-v1 error envelope", () => {
       "INVALID_AUTH",
       "ROTATED_AUTH",
       "BAD_REQUEST",
+      "CSRF_REQUIRED",
+      "CSRF_INVALID",
     ] as const) {
       assert.ok(HTTP_STATUS_BY_CODE[code], `falta status para ${code}`);
     }
+  });
+
+  it("CSRF_REQUIRED y CSRF_INVALID son errores 403", () => {
+    assert.strictEqual(HTTP_STATUS_BY_CODE.CSRF_REQUIRED, 403);
+    assert.strictEqual(HTTP_STATUS_BY_CODE.CSRF_INVALID, 403);
   });
 
   it("INTERNAL_ERROR nunca lleva el detalle real al caller", () => {
