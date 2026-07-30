@@ -42,6 +42,7 @@ function loadApiToken(): string {
 
 let VALID_TOKEN: string;
 let UPLOAD_AGENT: string;
+let DEFAULT_AGENT: string;
 let PANEL_COOKIE: string;
 let PANEL_CSRF: string;
 
@@ -100,6 +101,24 @@ async function panelRequest(
   return { status: response.status, body, rawText };
 }
 
+async function panelUploadRequest(path: string): Promise<{ status: number; body: unknown; rawText: string }> {
+  const form = new FormData();
+  form.append("file", new File(["audio"], "voice.webm", { type: "audio/webm" }));
+  const response = await fetch(new URL(path, MANAGER_URL), {
+    method: "POST",
+    headers: { Cookie: PANEL_COOKIE, "X-CSRF-Token": PANEL_CSRF },
+    body: form,
+  });
+  const rawText = await response.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(rawText);
+  } catch {
+    body = rawText;
+  }
+  return { status: response.status, body, rawText };
+}
+
 before(async () => {
   VALID_TOKEN = loadApiToken();
   await loginPanel();
@@ -109,9 +128,16 @@ before(async () => {
     body: { name: UPLOAD_AGENT, model: "anthropic/claude-sonnet-5" },
   });
   assert.strictEqual(created.status, 201, `no se pudo crear el Agent de H09: ${created.rawText}`);
+  DEFAULT_AGENT = `h09-default-${Date.now()}`;
+  const defaultCreated = await request("/api/v1/agents", {
+    method: "POST",
+    body: { name: DEFAULT_AGENT },
+  });
+  assert.strictEqual(defaultCreated.status, 201, `no se pudo crear Agent sin model: ${defaultCreated.rawText}`);
 });
 
 after(async () => {
+  if (DEFAULT_AGENT) await request(`/api/v1/agents/${DEFAULT_AGENT}`, { method: "DELETE" });
   if (UPLOAD_AGENT) await request(`/api/v1/agents/${UPLOAD_AGENT}`, { method: "DELETE" });
 });
 
@@ -474,6 +500,110 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       });
       assert.strictEqual(result.status, 400, `respuesta actual: ${result.rawText}`);
       assert.strictEqual((result.body as { code?: string }).code, "BAD_REQUEST");
+    });
+  });
+
+  describe("Red 2 — superficie panel en /api/v1 contra Manager real", () => {
+    const packageSource = "npm:@earendil-works/pi-coding-agent@0.80.3";
+
+    it("GET commands devuelve skills y prompts del Runner", async () => {
+      const result = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/commands`);
+      assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
+      assert.ok(Array.isArray((result.body as { skills?: unknown }).skills));
+      assert.ok(Array.isArray((result.body as { prompts?: unknown }).prompts));
+    });
+
+    it("POST transcribe conserva 501 cuando el Runtime no tiene STT", async () => {
+      const result = await panelUploadRequest(`/api/v1/agents/${UPLOAD_AGENT}/transcribe`);
+      assert.strictEqual(result.status, 501, `respuesta actual: ${result.rawText}`);
+    });
+
+    it("env del Agent permite PUT/GET/DELETE por clave sin devolver valores", async () => {
+      const put = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/env/RED2_AGENT_KEY`, {
+        method: "PUT",
+        body: { value: "red2-secret" },
+      });
+      assert.strictEqual(put.status, 200, `respuesta actual: ${put.rawText}`);
+      assert.doesNotMatch(put.rawText, /red2-secret/);
+
+      const get = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/env`);
+      assert.strictEqual(get.status, 200);
+      assert.deepStrictEqual((get.body as { keys?: string[] }).keys, ["CONTRACT_RED_VAR", "RED2_AGENT_KEY"]);
+      assert.doesNotMatch(get.rawText, /red2-secret/);
+
+      const remove = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/env/RED2_AGENT_KEY`, {
+        method: "DELETE",
+      });
+      assert.strictEqual(remove.status, 200, `respuesta actual: ${remove.rawText}`);
+      assert.doesNotMatch(remove.rawText, /red2-secret/);
+    });
+
+    it("env global permite GET/PUT/DELETE por clave y queda separado del Agent", async () => {
+      const put = await panelRequest("/api/v1/env/RED2_GLOBAL_KEY", {
+        method: "PUT",
+        body: { value: "global-secret" },
+      });
+      assert.strictEqual(put.status, 200, `respuesta actual: ${put.rawText}`);
+      assert.doesNotMatch(put.rawText, /global-secret/);
+
+      const get = await panelRequest("/api/v1/env");
+      assert.strictEqual(get.status, 200);
+      const globalKeys = (get.body as { keys?: string[] }).keys ?? [];
+      assert.ok(globalKeys.includes("RED2_GLOBAL_KEY"));
+      assert.ok(!globalKeys.includes("CONTRACT_RED_VAR"));
+      assert.doesNotMatch(get.rawText, /global-secret|agent-secret/);
+
+      const remove = await panelRequest("/api/v1/env/RED2_GLOBAL_KEY", { method: "DELETE" });
+      assert.strictEqual(remove.status, 200, `respuesta actual: ${remove.rawText}`);
+      assert.ok(!((remove.body as { keys?: string[] }).keys ?? []).includes("RED2_GLOBAL_KEY"));
+    });
+
+    it("packages GET/POST/DELETE por item del Agent funcionan con el pi real", async () => {
+      const list = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/packages`);
+      assert.strictEqual(list.status, 200);
+      assert.ok(Array.isArray((list.body as { packages?: unknown }).packages));
+
+      const added = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/packages`, {
+        method: "POST",
+        body: { source: packageSource },
+      });
+      assert.strictEqual(added.status, 202, `respuesta actual: ${added.rawText}`);
+
+      const removed = await panelRequest(`/api/v1/agents/${UPLOAD_AGENT}/packages`, {
+        method: "DELETE",
+        body: { source: packageSource },
+      });
+      assert.strictEqual(removed.status, 202, `respuesta actual: ${removed.rawText}`);
+    });
+
+    it("packages global GET/POST/DELETE por item funcionan con el pi real", async () => {
+      const list = await panelRequest("/api/v1/packages");
+      assert.strictEqual(list.status, 200);
+      assert.ok(Array.isArray((list.body as { packages?: unknown }).packages));
+
+      const added = await panelRequest("/api/v1/packages", {
+        method: "POST",
+        body: { source: packageSource },
+      });
+      assert.strictEqual(added.status, 202, `respuesta actual: ${added.rawText}`);
+
+      const removed = await panelRequest("/api/v1/packages", {
+        method: "DELETE",
+        body: { source: packageSource },
+      });
+      assert.strictEqual(removed.status, 202, `respuesta actual: ${removed.rawText}`);
+    });
+
+    it("OAuth providers está disponible como extensión panel/operator", async () => {
+      const result = await panelRequest("/api/v1/auth/providers");
+      assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
+      assert.ok(Array.isArray((result.body as { providers?: unknown }).providers));
+    });
+
+    it("crear un Agent sin model explícito aplica el default de pihub", async () => {
+      const result = await request(`/api/v1/agents/${DEFAULT_AGENT}`);
+      assert.strictEqual(result.status, 200, `respuesta actual: ${result.rawText}`);
+      assert.ok((result.body as { model?: string }).model);
     });
   });
 });

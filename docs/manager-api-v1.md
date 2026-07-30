@@ -14,25 +14,25 @@ Esta interfaz privada permite que el **control plane** (dashboard) gestione Agen
 |---|---|
 | CRUD de Agents (crear, leer, actualizar, pausar/reactivar, eliminar) | Panel web de pihub (`/*`) |
 | Sesiones por Channel (web, Telegram) | OAuth de usuarios humanos |
-| Turnos de chat con streaming de eventos | Store de env **global** (multi-agente) |
-| Ciclo de vida explícito (`start`/`stop`/`restart`) | OAuth de proveedores de modelo |
-| Variables de entorno del Agent (`GET`/`PUT /agents/:name/env`) | |
-| Paquetes/extensiones del Agent (`GET`/`PUT /agents/:name/packages`) | |
+| Turnos de chat con streaming de eventos | |
+| Ciclo de vida explícito (`start`/`stop`/`restart`) | |
+| Variables de entorno del Agent (conjunto y operaciones por clave) | |
+| Variables de entorno globales (solo claves y operaciones por clave) | |
+| Paquetes/extensiones del Agent (conjunto y operaciones por item) | |
+| Paquetes globales (operaciones por item) | |
+| Commands y transcribe del Agent (extensión panel/operator) | |
+| OAuth de providers (extensión panel/operator) | |
 | Modelos disponibles (`GET /models`) | |
 | Estado global del Manager (`GET /status`, sin topología de puertos) | |
 | Health y readiness | |
 | Service auth (creencial de servicio) | |
 
-*(2026-07-29, Fase 1 de paridad panel↔`/api/v1`): env, paquetes y modelos
-estaban aquí como "fuera de alcance" — una decisión escrita, no un olvido.
-Se revierte a propósito: el panel (`/api/*`) ya podía hacer las cuatro cosas
-que `/api/v1` no podía (ver bugs 1-4 más abajo), y esa asimetría es la razón
-de que existieran. Con una sola superficie real, ningún bug de estos vuelve
-a poder existir. Dos exclusiones se mantienen y con otra razón: el store de
-env **global** (compartiría config entre Agents hermanos — lo Runtime-wide ya
-viaja por `UserRuntimeSecrets`) y el OAuth de proveedores de modelo
-(crearía un segundo escritor sobre el `auth.json` que el dashboard ya posee
-vía `providerCredentials`).*
+*(2026-08, Fase 4 Release A): las operaciones por clave de env, los paquetes
+por item, commands, transcribe y OAuth se añaden de forma aditiva para cerrar
+la paridad funcional con el panel. El dashboard mantiene sus rutas de conjunto
+completo y su Bearer; las extensiones panel/operator usan la cookie de panel
+con CSRF para no exponer la credencial de servicio. OAuth de providers no es
+parte de la Interface de ejecución del dashboard aunque viva en `/api/v1`.*
 
 ## 3. Autenticación — Service Auth
 
@@ -57,6 +57,20 @@ Authorization: Bearer <service-token>
 | Token incorrecto | `401 Unauthorized` con `{"code": "INVALID_AUTH", "message": "Credencial inválida"}` |
 | Token rotado (usando el valor antiguo) | `401 Unauthorized` con `{"code": "ROTATED_AUTH", "message": "Credencial rotada, usa la nueva"}` |
 | Token válido | `200/201/204` según la operación |
+
+### 3.4 Cookie de panel y CSRF
+
+`POST /auth/session` sigue siendo el login del panel: emite `pihub_token` y
+rota `pihub_csrf`, una cookie legible por JavaScript, y devuelve
+`{ "ok": true, "csrfToken": "..." }`. El token de servicio nunca aparece en
+la respuesta.
+
+En `/api/v1`, una cookie `pihub_token` válida autoriza lecturas. Las
+mutaciones (`POST`, `PUT`, `PATCH`, `DELETE`) exigen además
+`X-CSRF-Token` igual a la cookie `pihub_csrf`; si llega `Origin`, debe coincidir
+con el origen de la petición. Bearer válido sigue siendo autenticación de
+servicio y no necesita CSRF. Los errores son `403 CSRF_REQUIRED` o
+`403 CSRF_INVALID`.
 
 ## 4. Contrato HTTP
 
@@ -84,9 +98,12 @@ Códigos de error definidos:
 | `TURN_IN_PROGRESS` | Hay un turno en curso que la operación pedida tumbaría (reinicio/parada) |
 | `MODEL_FORBIDDEN` | El modelo no está permitido para el dueño del agente |
 | `RESOURCE_UNAVAILABLE` | El servicio está temporalmente no disponible |
+| `VOICE_PROVIDER_ERROR` | El proveedor de voz devolvió un error (`502`) |
 | `INTERNAL_ERROR` | Error interno del Manager (nunca se expone al caller) |
 | `MISSING_AUTH` | Credencial de servicio ausente |
 | `INVALID_AUTH` | Credencial de servicio inválida |
+| `CSRF_REQUIRED` | Falta el token CSRF de una mutación de panel |
+| `CSRF_INVALID` | El token CSRF u Origin no es válido |
 | `ROTATED_AUTH` | Credencial de servicio rotada |
 
 ### 4.2 Health y Readiness
@@ -134,6 +151,10 @@ Request:
   "packages": ["@goguest/knowledge-search"]
 }
 ```
+
+`model` es opcional. Si se omite, `createAgent` aplica
+`PIHUB_DEFAULT_MODEL`; el dashboard control plane sigue enviándolo de forma
+explícita.
 
 Response `201`:
 ```json
@@ -228,8 +249,24 @@ valores, son secretos. `PUT` recibe `{"env": {"CLAVE": "valor", ...}}` y
 que no venga en el body deja de existir. Rechaza con `400 BAD_REQUEST` una
 clave con formato inválido o protegida (`API_TOKEN`, prefijos `PIHUB_*` /
 `PI_CODING_AGENT_*`) — y si la rechaza, **no persiste nada**, ni siquiera las
-claves válidas del mismo payload. El store **global** (multi-agente) queda
-fuera de `/api/v1`: filtraría configuración entre Agents hermanos.
+claves válidas del mismo payload. El reemplazo de conjunto global queda fuera de `/api/v1`: filtraría
+configuración entre Agents hermanos. El panel usa las operaciones atómicas
+`/api/v1/env` descritas abajo.
+
+Para el panel existen además operaciones atómicas que no exponen valores:
+
+```
+PUT    /api/v1/agents/:name/env/:key  — body {"value": "..."}
+DELETE /api/v1/agents/:name/env/:key
+GET    /api/v1/env                    — solo el store global, solo claves
+PUT    /api/v1/env/:key               — body {"value": "..."}
+DELETE /api/v1/env/:key
+```
+
+Todas responden únicamente `{"keys": [...]}`. Usan el mismo `setEnv` y
+`unsetEnv` del store existente. Las rutas por Agent aplican la misma huella y
+guard `TURN_IN_PROGRESS` que el PUT completo; las globales quedan separadas
+del Agent y recargan los Runners activos de forma diferida.
 
 Reinicia el Runner con la misma huella y el mismo guard `TURN_IN_PROGRESS`
 que el PATCH (§4.3), y solo si el Agent estaba `running` y el conjunto
@@ -248,6 +285,20 @@ con lo instalado y converge llamando a `pi install`/`pi remove` real por
 cada paquete que sobra o falta. Responde `202` (la convergencia puede tardar:
 instala paquetes de verdad). Mismo guard `TURN_IN_PROGRESS` que el PATCH si
 hay diferencia y el Agent está `running`.
+
+El panel usa operaciones atómicas por item:
+
+```
+POST   /api/v1/agents/:name/packages  — body {"source": "..."}
+DELETE /api/v1/agents/:name/packages  — body {"source": "..."}
+GET    /api/v1/packages              — lista global
+POST   /api/v1/packages              — body {"source": "..."}
+DELETE /api/v1/packages              — body {"source": "..."}
+```
+
+POST y DELETE reutilizan `piInstall`/`piRemove`, traducen stderr a
+`BAD_REQUEST`, no devuelven paths y responden `202` mientras se agenda el
+reload. El store global no se mezcla con el del Agent.
 
 ### 4.3d Ciclo de vida explícito
 
@@ -406,6 +457,25 @@ Errores específicos:
 | Fichero mayor de 50 MB | `413` con `PAYLOAD_TOO_LARGE` |
 | Runner parado o inaccesible | `503` con `RESOURCE_UNAVAILABLE` |
 
+### 4.6a Commands y transcribe (panel/operator)
+
+Estas rutas son extensiones humanas del Manager; no forman parte de la
+Interface de ejecución del dashboard:
+
+```
+GET  /api/v1/agents/:name/commands
+POST /api/v1/agents/:name/transcribe  — multipart/form-data, campo file
+```
+
+`commands` devuelve `{ "skills": [...], "prompts": [...] }`. Un Runner
+parado, inaccesible o con una respuesta inválida se traduce a
+`503 RESOURCE_UNAVAILABLE`; nunca se devuelve el error crudo ni el puerto.
+
+`transcribe` reenvía el multipart al Runner. Conserva `501` con
+`{"error":"STT no configurado"}` cuando falta STT, traduce audio demasiado
+grande a `413 PAYLOAD_TOO_LARGE` y los fallos del proveedor a
+`502 VOICE_PROVIDER_ERROR`.
+
 ### 4.7 Modelos disponibles
 
 ```
@@ -423,8 +493,8 @@ Response `200`:
 ```
 
 `configured` es `true` si el Manager tiene credenciales (API key u OAuth)
-para ese modelo. Los providers se gestionan por env/archivos/CLI en el
-propio Runtime, nunca desde aquí (ver §2 — fuera de alcance).
+para ese modelo. La Interface del dashboard no gestiona providers; el panel
+operator puede usar las rutas OAuth de §4.9.
 
 ### 4.8 Estado global
 
@@ -441,6 +511,24 @@ Response `200`:
 gobernador, `false` en gobernado. **Nunca** lleva el rango de puertos de los
 Runners ni ningún otro dato de topología interna — §7 lo prohíbe
 explícitamente.
+
+### 4.9 OAuth de providers (panel/operator)
+
+Estas rutas usan el `OAuthService` único del Manager y conservan su máquina de
+estados. Son una extensión para el panel/operator, no una capacidad que deba
+consumir el dashboard control plane:
+
+```
+GET  /api/v1/auth/providers
+POST /api/v1/auth/login/:provider
+GET  /api/v1/auth/flows/:id
+POST /api/v1/auth/flows/:id/input
+POST /api/v1/auth/logout/:provider
+```
+
+Se autentican por Bearer o por la cookie de panel con CSRF en mutaciones. Las
+rutas legacy `/api/auth/*` permanecen durante esta release para no romper el
+panel actual; se retirarán en la sub-fase de migración del cliente.
 
 ## 5. Campos obligatorios en cada comando
 
@@ -484,9 +572,12 @@ explícitamente.
 | `TURN_IN_PROGRESS` | 409 | Hay un turno en curso que la operación pedida tumbaría |
 | `MODEL_FORBIDDEN` | 403 | El modelo no está permitido para el dueño del agente |
 | `RESOURCE_UNAVAILABLE` | 503 | El servicio está temporalmente no disponible |
+| `VOICE_PROVIDER_ERROR` | 502 | Fallo del proveedor de voz |
 | `INTERNAL_ERROR` | 500 | Error interno del Manager |
 | `MISSING_AUTH` | 401 | Credencial de servicio ausente |
 | `INVALID_AUTH` | 401 | Credencial de servicio inválida |
+| `CSRF_REQUIRED` | 403 | Falta CSRF en una mutación de panel |
+| `CSRF_INVALID` | 403 | CSRF u Origin inválido |
 | `ROTATED_AUTH` | 401 | Credencial de servicio rotada |
 | `BAD_REQUEST` | 400 | Payload no válido |
 | `PAYLOAD_TOO_LARGE` | 413 | El fichero supera el límite del Runner. Código propio, y no `BAD_REQUEST`, porque el caller necesita distinguir "pasa del límite" de "la petición es inválida" para decírselo al usuario — y el mensaje no es contrato, el catálogo sí |
