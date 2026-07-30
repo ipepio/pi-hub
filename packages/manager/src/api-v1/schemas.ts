@@ -7,7 +7,7 @@ export const createAgentV1Schema = z.object({
     .min(1)
     .max(64)
     .regex(/^[a-z0-9][a-z0-9-]*$/),
-  model: z.string().min(1),
+  model: z.string().min(1).optional(),
   thinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]).optional(),
   systemPrompt: z.string().optional(),
   telegramToken: z.string().optional(),

@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { scaffoldGlobalDirs } from "@pihub/shared";
 import { createAgent, updateAgent } from "../dist/agents.js";
-import { createAgentSchema, updateAgentSchema } from "../dist/api.js";
+import { updateAgentSchema } from "../dist/api.js";
+import { createAgentV1Schema } from "../dist/api-v1/schemas.js";
 
 async function testEnv() {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-agents-"));
@@ -47,11 +48,11 @@ test("updateAgent cambia y elimina el override sin tocar otros campos", async ()
 
 test("schema create: acepta los 3 niveles y rechaza valores inválidos", () => {
   for (const sharedAccess of ["none", "read", "read-write"]) {
-    const result = createAgentSchema.safeParse({ name: "a", memory: { sharedAccess } });
+    const result = createAgentV1Schema.safeParse({ name: "a", memory: { sharedAccess } });
     assert.ok(result.success, `create debe aceptar ${sharedAccess}`);
   }
-  assert.ok(!createAgentSchema.safeParse({ name: "a", memory: { sharedAccess: "all" } }).success);
-  assert.ok(!createAgentSchema.safeParse({ name: "a", memory: null }).success, "create no admite memory: null");
+  assert.ok(!createAgentV1Schema.safeParse({ name: "a", memory: { sharedAccess: "all" } }).success);
+  assert.ok(!createAgentV1Schema.safeParse({ name: "a", memory: null }).success, "create no admite memory: null");
 });
 
 test("schema update: admite memory: null para quitar el override", () => {
