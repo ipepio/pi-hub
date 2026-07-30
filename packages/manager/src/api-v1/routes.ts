@@ -24,6 +24,7 @@ import {
 import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
 import { listModels } from "../models.js";
 import type { Supervisor } from "../supervisor.js";
+import type { OAuthService } from "../oauth.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyApiV1Auth, cookieValue, CSRF_COOKIE } from "./auth.js";
 import {
@@ -72,7 +73,11 @@ export function correlationIdOf(c: {
  * publicada, nunca importando código. Convive con las rutas `/api/*`
  * del panel, que no se tocan.
  */
-export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<ApiV1Env> {
+export function createApiV1Router(
+  env: PihubEnv,
+  supervisor: Supervisor,
+  oauth: OAuthService,
+): Hono<ApiV1Env> {
   const app = new Hono<ApiV1Env>();
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
   const turnosVistos = new Map<string, string>();
@@ -121,6 +126,38 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
       return fail(c, code, code === "CSRF_REQUIRED" ? "CSRF token required" : "CSRF token invalid");
     }
     await next();
+  });
+
+  // Panel/operator extension: OAuth de providers. Estas rutas comparten el
+  // OAuthService del Manager, pero no forman parte de la Interface del
+  // dashboard/control plane.
+  app.get("/auth/providers", (c) => c.json({ providers: oauth.providers() }));
+
+  app.post("/auth/login/:provider", (c) => {
+    try {
+      return c.json(oauth.startLogin(c.req.param("provider")));
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 400);
+    }
+  });
+
+  app.get("/auth/flows/:id", (c) => {
+    const flow = oauth.getFlow(c.req.param("id"));
+    return flow ? c.json(flow) : c.json({ error: "No existe" }, 404);
+  });
+
+  app.post("/auth/flows/:id/input", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { value?: string };
+    try {
+      return c.json(oauth.submitInput(c.req.param("id"), body.value ?? ""));
+    } catch (error) {
+      return c.json({ error: (error as Error).message }, 400);
+    }
+  });
+
+  app.post("/auth/logout/:provider", (c) => {
+    oauth.logout(c.req.param("provider"));
+    return c.json({ ok: true });
   });
 
   app.get("/health", (c) =>

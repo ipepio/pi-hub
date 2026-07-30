@@ -104,7 +104,7 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
   // resuelve en orden de registro, así que registrar el router primero deja
   // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
   // ruta `/api/*` del panel.
-  app.route("/api/v1", createApiV1Router(env, supervisor));
+  app.route("/api/v1", createApiV1Router(env, supervisor, oauth));
 
   app.use("/api/*", async (c, next) => {
     const authorization = c.req.header("authorization");
