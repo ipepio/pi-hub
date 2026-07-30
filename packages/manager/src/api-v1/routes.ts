@@ -9,8 +9,13 @@ import {
   isValidEnvKey,
   listAgents,
   listEnvKeys,
+  filesFromSkillZip,
+  isValidSkillId,
+  listMaterializedSkillIds,
   piInstall,
+  piInstallFromContent,
   piRemove,
+  piRemoveContentSkill,
   piVersion,
   readAgent,
   readEnvStore,
@@ -49,6 +54,7 @@ import {
   createTurnV1Schema,
   packageItemV1Schema,
   replaceEnvV1Schema,
+  skillContentV1Schema,
   replacePackagesV1Schema,
   setEnvValueV1Schema,
   updateAgentV1Schema,
@@ -102,6 +108,7 @@ export function createApiV1Router(
   const turnosVivos = new Map<string, TurnoVivo>();
   const claveTurno = (name: string, turnId: string) => `${name}:${turnId}`;
   const hayTurnoVivo = (name: string) => hasLiveTurnForAgent(turnosVivos.keys(), name);
+  const hayAlgunTurnoVivo = () => turnosVivos.size > 0;
 
   app.use("*", async (c, next) => {
     c.set("correlationId", correlationIdOf(c));
@@ -626,6 +633,79 @@ export function createApiV1Router(
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
 
+  // --- Skills desde contenido del dashboard ---
+  // No reutilizan /packages: pi registra un source local como path interno.
+  // Estas rutas exponen exclusivamente el skillId UUID que el dashboard
+  // aportó, y mantienen ese source persistente mientras siga instalado.
+  app.get("/agents/:name/skills", async (c) => {
+    const name = c.req.param("name");
+    if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
+      return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    }
+    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) });
+  });
+
+  app.post("/agents/:name/skills", async (c) => {
+    const name = c.req.param("name");
+    if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
+      return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    }
+    const content = await skillContentOf(c);
+    if (!content) return fail(c, "BAD_REQUEST", "Invalid skill content payload");
+
+    const wasRunning = supervisor.state(name).state === "running";
+    if (wasRunning && hayTurnoVivo(name)) {
+      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+    }
+    const result = await piInstallFromContent(env.dataDir, content.skillId, content.files, agentPaths(env.dataDir, name).workspaceDir);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install skill content");
+    if (wasRunning) scheduleAgentReload(supervisor, name);
+    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) }, 202);
+  });
+
+  app.delete("/agents/:name/skills/:skillId", async (c) => {
+    const { name, skillId } = c.req.param();
+    if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
+      return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    }
+    if (!isValidSkillId(skillId)) return fail(c, "BAD_REQUEST", "Invalid skillId");
+
+    const wasRunning = supervisor.state(name).state === "running";
+    if (wasRunning && hayTurnoVivo(name)) {
+      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+    }
+    const result = await piRemoveContentSkill(env.dataDir, skillId, agentPaths(env.dataDir, name).workspaceDir);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove skill content");
+    if (wasRunning) scheduleAgentReload(supervisor, name);
+    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) }, 202);
+  });
+
+  app.get("/skills", async (c) => c.json({ skills: await listMaterializedSkillIds(env.dataDir) }));
+
+  app.post("/skills", async (c) => {
+    const content = await skillContentOf(c);
+    if (!content) return fail(c, "BAD_REQUEST", "Invalid skill content payload");
+    // Una recarga global reinicia todos los Runners; no puede cortar el
+    // turno vivo de ningún Agent, igual que la variante local.
+    if (hayAlgunTurnoVivo()) return fail(c, "TURN_IN_PROGRESS", "An Agent has a turn in progress; retry after it finishes");
+
+    const result = await piInstallFromContent(env.dataDir, content.skillId, content.files);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install skill content");
+    scheduleGlobalReload(supervisor);
+    return c.json({ skills: await listMaterializedSkillIds(env.dataDir) }, 202);
+  });
+
+  app.delete("/skills/:skillId", async (c) => {
+    const skillId = c.req.param("skillId");
+    if (!isValidSkillId(skillId)) return fail(c, "BAD_REQUEST", "Invalid skillId");
+    if (hayAlgunTurnoVivo()) return fail(c, "TURN_IN_PROGRESS", "An Agent has a turn in progress; retry after it finishes");
+
+    const result = await piRemoveContentSkill(env.dataDir, skillId);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove skill content");
+    scheduleGlobalReload(supervisor);
+    return c.json({ skills: await listMaterializedSkillIds(env.dataDir) }, 202);
+  });
+
   app.get("/packages", async (c) => c.json({ packages: await listPackages(env) }));
 
   app.post("/packages", async (c) => {
@@ -982,6 +1062,33 @@ export function createApiV1Router(
   });
 
   return app;
+}
+
+/**
+ * JSON sirve Markdown y ficheros de texto; multipart transporta un ZIP con
+ * `skillId` y `archive`. Ambos convergen en ficheros relativos a la raíz de
+ * la Skill. Nunca se acepta un source/path que el caller pueda reutilizar.
+ */
+async function skillContentOf(c: Context<ApiV1Env>): Promise<
+  { skillId: string; files: Array<{ path: string; content: string | Buffer }> } | undefined
+> {
+  try {
+    if (c.req.header("content-type")?.toLowerCase().startsWith("multipart/form-data")) {
+      const form = await c.req.formData();
+      const skillId = form.get("skillId");
+      const archive = form.get("archive");
+      if (typeof skillId !== "string" || !isValidSkillId(skillId) || !(archive instanceof File)) return undefined;
+      // El límite comprimido evita aceptar un body arbitrario; filesFromSkillZip
+      // verifica además cada tamaño *descomprimido* antes de extraerlo.
+      if (archive.size > 20 * 1024 * 1024) return undefined;
+      return { skillId, files: filesFromSkillZip(Buffer.from(await archive.arrayBuffer())) };
+    }
+
+    const parsed = skillContentV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface UploadV1Response {

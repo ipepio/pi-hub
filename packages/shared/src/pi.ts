@@ -2,6 +2,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
 import { dataPaths } from "./registry.js";
+import {
+  materializeSkillContent,
+  removeMaterializedSkillContent,
+  skillContentSourceDir,
+  type SkillContentFile,
+} from "./skill-content.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +64,54 @@ export async function piRemove(
 ): Promise<PiCommandResult> {
   const args = agentWorkspace ? ["remove", "-l", source] : ["remove", source];
   return runPi(args, dataDir, agentWorkspace);
+}
+
+/**
+ * Instala contenido de Skill aportado por el dashboard como package local
+ * persistente. pi 0.80.3 registra rutas locales por referencia, no las copia;
+ * el source se conserva hasta DELETE y solo se llama `pi install` la primera
+ * vez. Una actualización reescribe ese source y el restart del Runner carga
+ * el contenido fresco sin duplicar la entrada de settings.
+ */
+export async function piInstallFromContent(
+  dataDir: string,
+  skillId: string,
+  files: readonly SkillContentFile[],
+  agentWorkspace?: string,
+): Promise<PiCommandResult> {
+  const source = await materializeSkillContent(dataDir, skillId, files, agentWorkspace);
+  if (await isLocalSourceInstalled(dataDir, source, agentWorkspace)) {
+    return { ok: true, stdout: "Skill content updated", stderr: "" };
+  }
+
+  const result = await piInstall(dataDir, source, agentWorkspace);
+  if (!result.ok) await removeMaterializedSkillContent(dataDir, skillId, agentWorkspace);
+  return result;
+}
+
+/** Quita primero la referencia de pi y solo después borra el source persistente. */
+export async function piRemoveContentSkill(
+  dataDir: string,
+  skillId: string,
+  agentWorkspace?: string,
+): Promise<PiCommandResult> {
+  const source = skillContentSourceDir(dataDir, skillId, agentWorkspace);
+  if (await isLocalSourceInstalled(dataDir, source, agentWorkspace)) {
+    const result = await piRemove(dataDir, source, agentWorkspace);
+    if (!result.ok) return result;
+  }
+  await removeMaterializedSkillContent(dataDir, skillId, agentWorkspace);
+  return { ok: true, stdout: "Skill content removed", stderr: "" };
+}
+
+async function isLocalSourceInstalled(dataDir: string, source: string, agentWorkspace?: string): Promise<boolean> {
+  const settingsFile = agentWorkspace
+    ? path.join(agentWorkspace, ".pi", "settings.json")
+    : path.join(dataPaths(dataDir).globalDir, "settings.json");
+  const sources = await readPackageSources(settingsFile);
+  const settingsDir = path.dirname(settingsFile);
+  const expected = path.resolve(source);
+  return sources.some((candidate) => path.resolve(settingsDir, candidate) === expected);
 }
 
 export async function piList(dataDir: string, agentWorkspace?: string): Promise<PiCommandResult> {

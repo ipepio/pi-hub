@@ -13,12 +13,12 @@
 | Panel migrado a `/api/v1` | Funciona: cookie + CSRF, sin token Bearer en browser |
 | Chat del panel por HTTP/SSE | Funciona: Manager → WS interno del Runner |
 | Eventos `basic` y `verbose`, incluida cancelación | Funciona |
-| CRUD, ciclo de vida, env, paquetes, uploads, transcribe y OAuth v1 | Funciona |
+| CRUD, ciclo de vida, env, paquetes, Skills por contenido, uploads, transcribe y OAuth v1 | Funciona |
 | Instalación Docker y servicio systemd | Funciona |
 
 ```text
 npm run typecheck  # limpio
-npm test           # 197 tests passed
+npm test           # 207 tests passed
 ```
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
@@ -48,7 +48,9 @@ editando `PIHUB_PANEL_ENABLED` y reiniciando el Manager.
 - `turnId`, `sessionKey`, `idempotencyKey` y `correlationId` son obligatorios
   para un turno. La idempotencia y turnos vivos son por instancia de Manager.
 - Ninguna respuesta v1 contiene tokens, valores de env, PID, puertos de Runner,
-  paths internos ni el texto crudo de un Runner.
+  paths internos ni el texto crudo de un Runner. Las Skills por contenido usan
+  el `skillId` UUID que aporta el dashboard; el source local de pi no sale por
+  `/skills`, `/packages` ni detalle de Agent.
 - Las rutas legacy `/api/*` permanecen para compatibilidad con el CLI actual,
   pero el panel ya no las llama y no son el destino de nuevas integraciones.
 

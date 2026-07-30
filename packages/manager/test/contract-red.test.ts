@@ -18,6 +18,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const MANAGER_URL = process.env.MANAGER_URL ?? "http://127.0.0.1:4000";
@@ -168,6 +169,21 @@ async function uploadRequest(
     body = rawText;
   }
   return { status: res.status, body, rawText };
+}
+
+async function eventually(assertion: () => Promise<void>, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  throw lastError;
 }
 
 async function request(
@@ -708,6 +724,54 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
         body: { source: packageSource },
       });
       assert.strictEqual(removed.status, 202, `respuesta actual: ${removed.rawText}`);
+    });
+
+    it("Skills por contenido local persisten por skillId, recargan el Runner y no filtran paths", async () => {
+      const skillId = randomUUID();
+      const v1 = `content-skill-v1-${skillId.slice(0, 8)}`;
+      const v2 = `content-skill-v2-${skillId.slice(0, 8)}`;
+      const skill = (name: string, description: string) => ({
+        skillId,
+        files: [
+          {
+            path: "SKILL.md",
+            content: `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n`,
+          },
+          { path: "references/guide.md", content: `# ${name}\n` },
+        ],
+      });
+
+      const installed = await request(`/api/v1/agents/${UPLOAD_AGENT}/skills`, {
+        method: "POST",
+        body: skill(v1, "primera versión"),
+      });
+      assert.strictEqual(installed.status, 202, `instalación de Skill: ${installed.rawText}`);
+      assert.deepStrictEqual((installed.body as { skills?: unknown }).skills, [skillId]);
+      assert.doesNotMatch(installed.rawText, /imported-skills|\/data\//);
+
+      await eventually(async () => {
+        const commands = await request(`/api/v1/agents/${UPLOAD_AGENT}/commands`);
+        const skills = (commands.body as { skills?: Array<{ name?: string }> }).skills ?? [];
+        assert.ok(skills.some((entry) => entry.name === v1), `commands actual: ${commands.rawText}`);
+      });
+
+      const updated = await request(`/api/v1/agents/${UPLOAD_AGENT}/skills`, {
+        method: "POST",
+        body: skill(v2, "segunda versión"),
+      });
+      assert.strictEqual(updated.status, 202, `actualización de Skill: ${updated.rawText}`);
+      assert.deepStrictEqual((updated.body as { skills?: unknown }).skills, [skillId]);
+
+      await eventually(async () => {
+        const commands = await request(`/api/v1/agents/${UPLOAD_AGENT}/commands`);
+        const skills = (commands.body as { skills?: Array<{ name?: string }> }).skills ?? [];
+        assert.ok(skills.some((entry) => entry.name === v2), `commands actual: ${commands.rawText}`);
+        assert.ok(!skills.some((entry) => entry.name === v1), `Skill previa aún cargada: ${commands.rawText}`);
+      });
+
+      const removed = await request(`/api/v1/agents/${UPLOAD_AGENT}/skills/${skillId}`, { method: "DELETE" });
+      assert.strictEqual(removed.status, 202, `eliminación de Skill: ${removed.rawText}`);
+      assert.deepStrictEqual((removed.body as { skills?: unknown }).skills, []);
     });
 
     it("OAuth providers está disponible como extensión panel/operator", async () => {

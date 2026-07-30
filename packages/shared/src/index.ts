@@ -6,3 +6,4 @@ export * from "./pi.js";
 export * from "./auth.js";
 export * from "./prompt.js";
 export * from "./envstore.js";
+export * from "./skill-content.js";

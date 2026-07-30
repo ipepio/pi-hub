@@ -5,6 +5,7 @@ import {
   agentPaths,
   allocatePort,
   dataPaths,
+  isMaterializedSkillSource,
   isValidAgentName,
   piInstall,
   readAgent,
@@ -121,7 +122,10 @@ export async function listPackages(env: PihubEnv, agentName?: string): Promise<s
     };
     return (raw.packages ?? [])
       .map((p) => (typeof p === "string" ? p : p.source ?? ""))
-      .filter(Boolean);
+      // Una Skill de contenido es un package local solo como detalle de pi.
+      // Su path jamás sale por /packages ni por el detalle de un Agent; se
+      // administra exclusivamente con /skills usando el UUID del dashboard.
+      .filter((source) => source && !isMaterializedSkillSource(env.dataDir, source, agentName));
   } catch {
     return [];
   }

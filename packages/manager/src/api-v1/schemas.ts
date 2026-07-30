@@ -77,3 +77,19 @@ export const replacePackagesV1Schema = z.object({
 export const packageItemV1Schema = z.object({
   source: z.string().min(1),
 });
+
+/** Skill declarativa que el dashboard ya posee: pihub recibe su UUID estable
+ * y ficheros relativos a la raíz de esa Skill (`SKILL.md` es obligatorio). */
+export const skillContentV1Schema = z.object({
+  skillId: z
+    .string()
+    .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+  files: z
+    .array(
+      z.object({
+        path: z.string().min(1),
+        content: z.string(),
+      }),
+    )
+    .min(1),
+});

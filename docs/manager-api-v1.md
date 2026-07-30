@@ -225,7 +225,74 @@ diferencia también responde `202`, pero no ejecuta pi ni reinicia. La
 instalación/eliminación de un Agent con turno vivo se rechaza con
 `TURN_IN_PROGRESS`; los cambios globales recargan Runners activos en diferido.
 
-## 7. Sesiones y turnos SSE
+## 7. Skills desde contenido
+
+Estas rutas son distintas de `/packages`: sirven para una **Skill** que el
+dashboard ya almacena y asigna explícitamente. El dashboard aporta siempre su
+`skillId` UUID; pihub no crea una segunda identidad ni devuelve el path local
+que pi guarda en `settings.json`.
+
+| Método | Ruta | Body | Semántica |
+|---|---|---|---|
+| `GET` | `/agents/:name/skills` | — | Lista `skillId` instalados solo para el Agent |
+| `POST` | `/agents/:name/skills` | contenido | Instala/actualiza una Skill local al Agent |
+| `DELETE` | `/agents/:name/skills/:skillId` | — | Quita la referencia pi y el contenido local |
+| `GET` | `/skills` | — | Lista `skillId` instalados para todo el Runtime |
+| `POST` | `/skills` | contenido | Instala/actualiza una Skill global |
+| `DELETE` | `/skills/:skillId` | — | Quita la referencia pi y el contenido global |
+
+La respuesta de todas las rutas es `202 { "skills": ["<skillId>"] }` en
+mutaciones y `200` con la misma forma en lecturas. No incluye `source`,
+`settings.json` ni ningún path de `/data`. Las Skills de contenido tampoco
+aparecen por `/packages` ni en el campo `packages` de un Agent: esa superficie
+solo enumera fuentes URL/npm/git que el caller puede manejar sin conocer la
+topología del Runtime.
+
+### Contenido JSON
+
+```json
+{
+  "skillId": "0d1c80cf-7889-4ab6-9a5c-8d5b32b3b530",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "content": "---\nname: revisar\ndescription: Revisa cambios.\n---\n\n# Revisar\n"
+    },
+    { "path": "references/checklist.md", "content": "# Checklist\n" }
+  ]
+}
+```
+
+`path` es relativo a la raíz de la Skill; `SKILL.md` debe existir exactamente
+en esa raíz. Se rechazan paths absolutos, `..`, backslashes, NUL y duplicados.
+Cada fichero admite hasta 5 MiB y el total hasta 20 MiB.
+
+### ZIP multipart
+
+Para contenido binario o varios ficheros, `POST` acepta `multipart/form-data`
+con los campos `skillId` y `archive` (un ZIP). El ZIP tiene los mismos límites
+descomprimidos: pihub comprueba el tamaño declarado de cada entry y el total
+**antes** de descomprimir; rechaza symlinks, traversal, paths duplicados y ZIP
+corruptos. Los ficheros se escriben como ficheros regulares no ejecutables.
+
+pihub materializa el contenido de modo persistente, separado por scope, como un
+package local convencional de pi: `skills/<skillId>/SKILL.md`. La razón es que
+pi `0.80.3` registra `pi install ./ruta` por referencia y no copia la ruta.
+Una actualización con el mismo `skillId` reemplaza el árbol persistente sin
+duplicar settings ni volver a ejecutar `pi install`; el reinicio hace que el
+Runner cargue el contenido nuevo. `DELETE` ejecuta `pi remove` sobre la ruta
+interna antes de borrar ese árbol.
+
+Una mutación local se rechaza con `TURN_IN_PROGRESS` si ese Agent tiene un turno
+vivo. Una mutación global se rechaza si cualquier Agent tiene un turno vivo,
+porque la recarga alcanza a todos los Runners. Si no lo hay, los Runners que
+corresponden se recargan en diferido.
+
+Un ZIP puede llevar assets o documentación auxiliar, pero pi no ejecuta
+`npm install` para un source local: no interpretes incluir `package.json` como
+instalación automática de dependencias.
+
+## 8. Sesiones y turnos SSE
 
 ### Sesión declarada
 
@@ -316,7 +383,7 @@ comando interno. El siguiente final o cierre del WebSocket se traduce a
 `abortSignal` del body se acepta solo por compatibilidad y no cancela nada. No
 hay `GET /turns/:id`: los turnos son efímeros por instancia.
 
-## 8. Uploads, transcribe y commands
+## 9. Uploads, transcribe y commands
 
 | Método | Ruta | Uso |
 |---|---|---|
@@ -345,7 +412,7 @@ el Runner (50 MB); un exceso se traduce a `413 PAYLOAD_TOO_LARGE`.
 `commands` devuelve `{ "skills": [...], "prompts": [...] }`. Un Runner
 parado, inaccesible o con respuesta inválida devuelve `RESOURCE_UNAVAILABLE`.
 
-## 9. OAuth de Providers
+## 10. OAuth de Providers
 
 Estas rutas son extensiones del panel/operador, no parte de la interfaz de
 ejecución del dashboard:
@@ -361,7 +428,7 @@ POST /auth/logout/:provider
 Están habilitadas por `PIHUB_OAUTH_PROVIDERS`. Usan la misma auth dual de v1:
 Bearer para servicio o cookie + CSRF para panel.
 
-## 10. Rotación de token
+## 11. Rotación de token
 
 ```text
 POST /auth/rotate
@@ -374,7 +441,7 @@ responde `503 RESOURCE_UNAVAILABLE` porque una rotación efectiva exige cambiar
 el entorno persistente y reiniciar el Manager. No trates un `200` inexistente
 como confirmación de rotación.
 
-## 11. Invariantes
+## 12. Invariantes
 
 1. El Manager es el único puente hacia un Runner.
 2. Los secretos no salen en respuestas, URLs ni errores.
