@@ -560,11 +560,11 @@ export function createApiV1Router(
     const workspaceDir = agentPaths(env.dataDir, name).workspaceDir;
     for (const source of toInstall) {
       const result = await piInstall(env.dataDir, source, workspaceDir);
-      if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${source}`);
+      if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
     }
     for (const source of toRemove) {
       const result = await piRemove(env.dataDir, source, workspaceDir);
-      if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${source}`);
+      if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove package");
     }
 
     if (wasRunning) await supervisor.restart(name);
@@ -589,7 +589,7 @@ export function createApiV1Router(
     }
 
     const result = await piInstall(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
-    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${parsed.data.source}`);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
     scheduleAgentReload(supervisor, name);
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
@@ -610,7 +610,7 @@ export function createApiV1Router(
     }
 
     const result = await piRemove(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
-    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${parsed.data.source}`);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove package");
     scheduleAgentReload(supervisor, name);
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
@@ -624,7 +624,7 @@ export function createApiV1Router(
     const actuales = await listPackages(env);
     if (actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
     const result = await piInstall(env.dataDir, parsed.data.source);
-    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${parsed.data.source}`);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
     scheduleGlobalReload(supervisor);
     return c.json({ packages: await listPackages(env) }, 202);
   });
@@ -636,7 +636,7 @@ export function createApiV1Router(
     const actuales = await listPackages(env);
     if (!actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
     const result = await piRemove(env.dataDir, parsed.data.source);
-    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${parsed.data.source}`);
+    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove package");
     scheduleGlobalReload(supervisor);
     return c.json({ packages: await listPackages(env) }, 202);
   });
