@@ -1,13 +1,16 @@
 /* pihub — panel del manager (vanilla JS, sin build) */
-import { agentSocketUrl, agentPackagesUrl, agentEnvUrl } from "/agent-channel.js";
+import { createPanelApi, PanelApiError } from "/panel-api.js";
+import { createPanelTurns } from "/panel-turns.js";
 import { renderMarkdown } from "/markdown.js";
 
 const $ = (id) => document.getElementById(id);
 let selectedAgent = null;
-let agentSocket = null;
-let agentReconnectTimer = null;
+let currentTurn = null;
+let sessionKey = null;
 let currentAgentResponse = null;
 let currentAgentThinking = null;
+const panelApi = createPanelApi();
+const panelTurns = createPanelTurns();
 
 // Re-parsing the whole accumulated response through renderMarkdown on every
 // single delta is O(n^2) over a response and freezes the tab on long
@@ -55,7 +58,7 @@ $("sidebar-overlay").addEventListener("click", closeSidebar);
 
 // ---------- navigation ----------
 function navigate(screen) {
-  if (screen !== "agent" && agentSocket) closeAgentSocket();
+  if (screen !== "agent" && currentTurn) void abortCurrentTurn({ silent: true });
   document.querySelectorAll(".screen").forEach((s) => s.classList.remove("active"));
   $(`screen-${screen}`)?.classList.add("active");
   document.querySelectorAll(".sidebar-link").forEach((l) =>
@@ -67,22 +70,30 @@ document.querySelectorAll(".sidebar-link").forEach((l) =>
   l.addEventListener("click", () => navigate(l.dataset.screen)),
 );
 
-// ---------- api ----------
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
-    ...options,
-  });
-  if (res.status === 401) {
-    showLogin();
-    throw new Error("no autorizado");
-  }
-  return res;
-}
-
+// ---------- auth ----------
 function showLogin() {
   $("login").classList.remove("hidden");
   $("app").classList.add("hidden");
+}
+
+function panelErrorMessage(error, fallback = "No se pudo completar la operación") {
+  if (error instanceof PanelApiError && error.code === "TURN_IN_PROGRESS") {
+    return "Hay un turno en curso; espera a que termine o cancélalo antes de cambiar el modelo.";
+  }
+  if (error instanceof PanelApiError && error.isCsrfError) {
+    return "La sesión del panel necesita una recarga para validar CSRF.";
+  }
+  return error?.message || fallback;
+}
+
+function showPanelError(error, fallback) {
+  if (error instanceof PanelApiError && error.requiresLogin) showLogin();
+  addAgentSystem(`⚠️ ${panelErrorMessage(error, fallback)}`);
+}
+
+function csrfCookieValue() {
+  const prefix = "pihub_csrf=";
+  return document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length) || "";
 }
 
 $("login-form").addEventListener("submit", async (e) => {
@@ -90,10 +101,16 @@ $("login-form").addEventListener("submit", async (e) => {
   const res = await fetch("/auth/session", {
     method: "POST",
     headers: { "content-type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ token: $("token-input").value }),
   });
-  if (res.ok) init();
-  else $("login-error").textContent = "Token incorrecto";
+  if (res.ok) {
+    const body = await res.json();
+    panelApi.setCsrfToken(body.csrfToken || csrfCookieValue());
+    panelTurns.setCsrfToken(body.csrfToken || csrfCookieValue());
+    $("login-error").textContent = "";
+    init();
+  } else $("login-error").textContent = "Token incorrecto";
 });
 
 // ---------- agentes ----------
@@ -104,8 +121,13 @@ const STATE_CHIP = {
 };
 
 async function loadAgents() {
-  const res = await api("/api/agents");
-  const agents = await res.json();
+  let agents;
+  try {
+    agents = await panelApi.listAgents();
+  } catch (error) {
+    if (error instanceof PanelApiError && error.requiresLogin) showLogin();
+    return;
+  }
   const wrap = $("agent-list");
   wrap.innerHTML = "";
   if (!agents.length) {
@@ -133,7 +155,7 @@ async function loadAgents() {
 
     const meta = document.createElement("p");
     meta.className = "list-item-sub";
-    meta.textContent = `:${agent.port} · ${agent.model || "modelo por defecto"}${agent.telegram ? " · ✈ telegram" : ""}`;
+    meta.textContent = `${agent.model || "modelo por defecto"}${agent.telegram ? " · ✈ telegram" : ""}`;
 
     const conversation = document.createElement("button");
     conversation.type = "button";
@@ -153,8 +175,15 @@ async function loadAgents() {
     primary.textContent = running ? "Detener" : "Iniciar";
     primary.onclick = async () => {
       primary.disabled = true;
-      await api(`/api/agents/${agent.name}/${running ? "stop" : "start"}`, { method: "POST" });
-      loadAgents();
+      try {
+        if (running) await panelApi.stopAgent(agent.name);
+        else await panelApi.startAgent(agent.name);
+        await loadAgents();
+      } catch (error) {
+        showPanelError(error);
+      } finally {
+        primary.disabled = false;
+      }
     };
 
     const restart = document.createElement("button");
@@ -162,8 +191,14 @@ async function loadAgents() {
     restart.textContent = "Reiniciar";
     restart.onclick = async () => {
       restart.disabled = true;
-      await api(`/api/agents/${agent.name}/restart`, { method: "POST" });
-      loadAgents();
+      try {
+        await panelApi.restartAgent(agent.name);
+        await loadAgents();
+      } catch (error) {
+        showPanelError(error);
+      } finally {
+        restart.disabled = false;
+      }
     };
 
     const chat = document.createElement("button");
@@ -178,8 +213,12 @@ async function loadAgents() {
     del.textContent = "Borrar";
     del.onclick = async () => {
       if (!confirm(`¿Borrar el agente "${agent.name}" y todos sus datos?`)) return;
-      await api(`/api/agents/${agent.name}`, { method: "DELETE" });
-      loadAgents();
+      try {
+        await panelApi.deleteAgent(agent.name);
+        await loadAgents();
+      } catch (error) {
+        showPanelError(error);
+      }
     };
 
     actions.append(primary, restart, chat, del);
@@ -193,9 +232,12 @@ let modelCatalog = [];
 let selectedAgentModel = "";
 
 async function loadModels() {
-  const response = await api("/api/models").catch(() => null);
-  if (!response?.ok) return;
-  modelCatalog = (await response.json()).models || [];
+  const response = await panelApi.listModels().catch((error) => {
+    if (error instanceof PanelApiError && error.requiresLogin) showLogin();
+    return null;
+  });
+  if (!response) return;
+  modelCatalog = response.models || [];
   if (!modelCatalog.length) return; // sin catálogo: queda el input libre
   const sel = $("new-model-select");
   sel.innerHTML = "";
@@ -221,44 +263,91 @@ function setAgentModel(model) {
 // ---------- Agent workspace: chat + resources ----------
 function openAgent(agent) {
   selectedAgent = agent;
+  sessionKey = panelTurns.createSessionKey();
+  currentTurn = null;
   setAgentModel(agent.model || "");
   $("selected-agent-name").textContent = agent.name;
   $("agent-messages").innerHTML = "";
   switchAgentPanel("chat");
   navigate("agent");
-  connectAgent();
+  setAgentConnection(true, "Listo");
   void loadAgentCommands();
 }
 
-function closeAgentSocket() {
-  clearTimeout(agentReconnectTimer);
-  agentReconnectTimer = null;
-  if (agentSocket) {
-    agentSocket.onclose = null;
-    agentSocket.close();
-    agentSocket = null;
-  }
-  setAgentConnection(false);
-}
-
-function setAgentConnection(connected) {
+function setAgentConnection(connected, label = connected ? "Listo" : "Desconectado") {
   $("agent-connection").classList.toggle("chip-ok", connected);
-  $("agent-connection-text").textContent = connected ? "Conectado" : "Desconectado";
+  $("agent-connection-text").textContent = label;
 }
 
-function connectAgent() {
-  closeAgentSocket();
-  if (!selectedAgent) return;
-  const activeAgent = selectedAgent.name;
-  agentSocket = new WebSocket(agentSocketUrl(location, selectedAgent));
-  agentSocket.onopen = () => setAgentConnection(true);
-  agentSocket.onmessage = (event) => handleAgentMessage(JSON.parse(event.data));
-  agentSocket.onclose = () => {
-    setAgentConnection(false);
-    if (selectedAgent?.name === activeAgent && $("screen-agent").classList.contains("active")) {
-      agentReconnectTimer = setTimeout(connectAgent, 2000);
+function finishTurn(turnId, statusMessage) {
+  if (currentTurn?.turnId !== turnId) return;
+  $("agent-abort").classList.add("hidden");
+  currentAgentResponse?.classList.remove("streaming");
+  currentAgentResponse = null;
+  currentAgentThinking = null;
+  currentTurn = null;
+  setAgentConnection(true, "Listo");
+  if (statusMessage) addAgentSystem(statusMessage);
+}
+
+function handleTurnEvent(event, turnId) {
+  const data = event.data || {};
+  switch (event.event) {
+    case "turn-start":
+      $("agent-abort").classList.remove("hidden");
+      break;
+    case "chunk":
+      if (!currentAgentResponse) {
+        currentAgentResponse = addAgentMessage("assistant");
+        currentAgentResponse.classList.add("streaming");
+      }
+      currentAgentResponse.markdownSource = (currentAgentResponse.markdownSource || "") + (data.delta || "");
+      scheduleAgentMarkdownRender(currentAgentResponse);
+      break;
+    case "thinking-delta":
+      if (!currentAgentThinking) currentAgentThinking = addAgentMessage("thinking");
+      currentAgentThinking.textContent += data.delta || "";
+      scrollAgentChat();
+      break;
+    case "tool-start":
+      addAgentSystem(`Ejecutando ${data.toolName || "tool"}…`);
+      currentAgentResponse?.classList.remove("streaming");
+      currentAgentResponse = null;
+      break;
+    case "tool-end":
+      addAgentSystem(`${data.isError ? "⚠️ " : "✔ "}${data.toolName || "tool"} ${data.isError ? "falló" : "terminó"}`);
+      break;
+    case "turn-complete":
+      finishTurn(turnId);
+      break;
+    case "turn-aborted":
+      finishTurn(turnId, "— respuesta cancelada —");
+      break;
+    case "turn-error":
+      finishTurn(turnId, `⚠️ ${data.message || "El Agent no pudo completar el turno"}`);
+      break;
+  }
+}
+
+async function consumeTurn(turn) {
+  setAgentConnection(true, "Conectando…");
+  try {
+    for await (const event of turn.events) {
+      if (currentTurn?.turnId === turn.turnId) handleTurnEvent(event, turn.turnId);
     }
-  };
+    if (currentTurn?.turnId === turn.turnId) {
+      currentTurn = null;
+      $("agent-abort").classList.add("hidden");
+      setAgentConnection(false, "Stream perdido");
+      addAgentSystem("⚠️ El stream se cerró sin un evento terminal; reintenta de forma explícita.");
+    }
+  } catch (error) {
+    if (currentTurn?.turnId !== turn.turnId) return;
+    currentTurn = null;
+    $("agent-abort").classList.add("hidden");
+    setAgentConnection(false, "Stream perdido");
+    showPanelError(error, "El stream del Agent falló; reintenta de forma explícita.");
+  }
 }
 
 function scrollAgentChat() {
@@ -288,53 +377,6 @@ function addAgentSystem(text) {
   scrollAgentChat();
 }
 
-function handleAgentMessage(message) {
-  switch (message.type) {
-    case "agent_start":
-      $("agent-abort").classList.remove("hidden");
-      break;
-    case "agent_end":
-      $("agent-abort").classList.add("hidden");
-      currentAgentResponse?.classList.remove("streaming");
-      currentAgentResponse = null;
-      currentAgentThinking = null;
-      break;
-    case "text_delta":
-      if (!currentAgentResponse) {
-        currentAgentResponse = addAgentMessage("assistant");
-        currentAgentResponse.classList.add("streaming");
-      }
-      currentAgentResponse.markdownSource = (currentAgentResponse.markdownSource || "") + message.delta;
-      scheduleAgentMarkdownRender(currentAgentResponse);
-      break;
-    case "thinking_delta":
-      if (!currentAgentThinking) currentAgentThinking = addAgentMessage("thinking");
-      currentAgentThinking.textContent += message.delta;
-      scrollAgentChat();
-      break;
-    case "tool_start":
-      addAgentSystem(`Ejecutando ${message.toolName}…`);
-      currentAgentResponse?.classList.remove("streaming");
-      currentAgentResponse = null;
-      break;
-    case "session_new":
-      $("agent-messages").innerHTML = "";
-      addAgentSystem("— sesión nueva —");
-      break;
-    case "ready":
-      if (message.model) setAgentModel(message.model);
-      if (message.stt !== undefined) setAgentSttUi(message.stt);
-      break;
-    case "model_changed":
-      setAgentModel(message.model);
-      addAgentSystem(`— modelo cambiado a ${message.model} —`);
-      break;
-    case "error":
-      addAgentSystem(`⚠️ ${message.message}`);
-      break;
-  }
-}
-
 function switchAgentPanel(panel) {
   $("agent-panel-chat").classList.toggle("active", panel === "chat");
   $("agent-panel-resources").classList.toggle("active", panel === "resources");
@@ -344,8 +386,9 @@ function switchAgentPanel(panel) {
 }
 
 $("agent-back").addEventListener("click", () => {
-  closeAgentSocket();
+  if (currentTurn) void abortCurrentTurn({ silent: true });
   selectedAgent = null;
+  sessionKey = null;
   navigate("agents");
 });
 $("agent-tab-chat").addEventListener("click", () => switchAgentPanel("chat"));
@@ -358,7 +401,7 @@ function autoGrowTextarea(el) {
 
 // ---------- comandos del chat ----------
 const CHAT_COMMANDS = [
-  { cmd: "/model", args: "<proveedor/id>", desc: "Cambia el modelo en vivo (no persiste)" },
+  { cmd: "/model", args: "<proveedor/id>", desc: "Cambia el modelo y lo guarda" },
   { cmd: "/models", args: "", desc: "Lista los modelos disponibles" },
   { cmd: "/new", args: "", desc: "Empieza una sesión nueva" },
   { cmd: "/status", args: "", desc: "Estado del agente" },
@@ -372,13 +415,15 @@ let agentCommands = [];
 async function loadAgentCommands() {
   agentCommands = [];
   if (!selectedAgent) return;
-  const response = await api(`/api/agents/${selectedAgent.name}/commands`).catch(() => null);
-  if (!response?.ok) return;
-  const data = await response.json();
-  agentCommands = [
-    ...(data.skills || []).map((s) => ({ cmd: `/skill:${s.name}`, args: "", desc: s.description || "skill" })),
-    ...(data.prompts || []).map((p) => ({ cmd: `/${p.name}`, args: p.argumentHint || "", desc: p.description || "prompt" })),
-  ];
+  try {
+    const data = await panelApi.listCommands(selectedAgent.name);
+    agentCommands = [
+      ...(data.skills || []).map((s) => ({ cmd: `/skill:${s.name}`, args: "", desc: s.description || "skill" })),
+      ...(data.prompts || []).map((p) => ({ cmd: `/${p.name}`, args: p.argumentHint || "", desc: p.description || "prompt" })),
+    ];
+  } catch {
+    // El catálogo es una mejora de UX; un Agent puede seguir procesando el chat.
+  }
 }
 
 function allChatCommands() {
@@ -429,6 +474,22 @@ function listModelsInChat() {
   }
 }
 
+async function abortCurrentTurn({ silent = false } = {}) {
+  if (!currentTurn || !selectedAgent) return false;
+  const turn = currentTurn;
+  const agentName = selectedAgent.name;
+  if (turn.abortRequested) return true;
+  turn.abortRequested = true;
+  try {
+    await panelApi.abortTurn(agentName, turn.turnId);
+    return true;
+  } catch (error) {
+    turn.abortRequested = false;
+    if (!silent) showPanelError(error, "No se pudo cancelar el turno");
+    return false;
+  }
+}
+
 // Devuelve true si el comando era de la UI; false → se reenvía al agente
 // (pi expande /skill:nombre, prompt templates y comandos de extensiones).
 async function runChatCommand(line) {
@@ -449,27 +510,41 @@ async function runChatCommand(line) {
         listModelsInChat();
         break;
       }
-      if (agentSocket?.readyState === WebSocket.OPEN) {
-        agentSocket.send(JSON.stringify({ type: "set_model", model: arg }));
+      if (!selectedAgent) break;
+      try {
+        const updated = await panelApi.updateAgent(selectedAgent.name, { model: arg });
+        selectedAgent = { ...selectedAgent, ...updated };
+        setAgentModel(updated.model || arg);
+        addAgentSystem(`— modelo guardado: ${updated.model || arg} —`);
+      } catch (error) {
+        showPanelError(error);
       }
       break;
     case "/new":
-      if (agentSocket?.readyState === WebSocket.OPEN) agentSocket.send(JSON.stringify({ type: "new_session" }));
+      await abortCurrentTurn({ silent: true });
+      sessionKey = panelTurns.createSessionKey();
+      currentTurn = null;
+      currentAgentResponse = null;
+      currentAgentThinking = null;
+      $("agent-abort").classList.add("hidden");
+      $("agent-messages").innerHTML = "";
+      addAgentSystem("— sesión nueva —");
+      setAgentConnection(true, "Listo");
       break;
     case "/stop":
-      if (agentSocket?.readyState === WebSocket.OPEN) agentSocket.send(JSON.stringify({ type: "abort" }));
+      if (currentTurn) await abortCurrentTurn();
+      else addAgentSystem("No hay una respuesta en curso.");
       break;
     case "/status": {
       if (!selectedAgent) break;
-      const response = await api(`/api/agents/${selectedAgent.name}`).catch(() => null);
-      if (!response?.ok) {
-        addAgentSystem("⚠️ No se pudo obtener el estado");
-        break;
+      try {
+        const s = await panelApi.getAgent(selectedAgent.name);
+        addAgentSystem(
+          `Agente ${s.name} · ${s.state} · modelo default ${s.model || "(default)"} · en vivo ${selectedAgentModel || "(default)"} · telegram ${s.telegram ? "sí" : "no"}`,
+        );
+      } catch (error) {
+        showPanelError(error, "No se pudo obtener el estado");
       }
-      const s = await response.json();
-      addAgentSystem(
-        `Agente ${s.name} · ${s.state} · modelo default ${s.model || "(default)"} · en vivo ${selectedAgentModel || "(default)"} · telegram ${s.telegram ? "sí" : "no"}`,
-      );
       break;
     }
     default:
@@ -479,15 +554,22 @@ async function runChatCommand(line) {
 }
 
 function sendToAgent(text) {
-  if (agentSocket?.readyState !== WebSocket.OPEN) return;
+  if (!selectedAgent || !sessionKey) return;
+  if (currentTurn) {
+    addAgentSystem("Hay una respuesta en curso; espera a que termine o pulsa cancelar.");
+    return;
+  }
   const input = $("agent-chat-input");
   const content = addAgentMessage("user");
   content.textContent = text;
-  agentSocket.send(JSON.stringify({ type: "prompt", text }));
   input.value = "";
   currentAgentResponse = null;
   currentAgentThinking = null;
   autoGrowTextarea(input);
+
+  const turn = panelTurns.startTurn({ agentName: selectedAgent.name, sessionKey, message: text });
+  currentTurn = turn;
+  void consumeTurn(turn);
 }
 
 $("agent-chat-form").addEventListener("submit", (event) => {
@@ -539,18 +621,13 @@ function insertIntoAgentInput(text) {
 }
 
 async function transcribeAgentBlob(blob, filename) {
-  const form = new FormData();
-  form.append("file", blob, filename);
-  const response = await fetch(`/api/agents/${selectedAgent.name}/transcribe`, {
-    method: "POST",
-    body: form,
-  }).catch(() => null);
-  const body = await response?.json().catch(() => ({}));
-  if (!response?.ok) {
-    addAgentSystem(`⚠️ Transcripción fallida: ${body?.error || response?.status || "error de red"}`);
+  try {
+    const body = await panelApi.transcribe(selectedAgent.name, blob, filename);
+    return body?.text || "";
+  } catch (error) {
+    showPanelError(error, "Transcripción fallida");
     return "";
   }
-  return body.text || "";
 }
 
 async function handleAgentAttachment(file) {
@@ -567,19 +644,13 @@ async function handleAgentAttachment(file) {
     return;
   }
   addAgentSystem(`Subiendo ${file.name}…`);
-  const form = new FormData();
-  form.append("file", file, file.name);
-  const response = await fetch(`/api/agents/${selectedAgent.name}/upload`, {
-    method: "POST",
-    body: form,
-  }).catch(() => null);
-  const body = await response?.json().catch(() => ({}));
-  if (!response?.ok) {
-    addAgentSystem(`⚠️ No se pudo subir: ${body?.error || response?.status || "error de red"}`);
-    return;
+  try {
+    const body = await panelApi.upload(selectedAgent.name, file, file.name);
+    const kb = Math.max(1, Math.round(body.size / 1024));
+    insertIntoAgentInput(`[Archivo adjunto: ${body.path} — ${body.name}, ${body.type}, ${kb} KB. Léelo desde esa ruta del workspace.]`);
+  } catch (error) {
+    showPanelError(error, "No se pudo subir el fichero");
   }
-  const kb = Math.max(1, Math.round(body.size / 1024));
-  insertIntoAgentInput(`[Archivo adjunto: ${body.path} — ${body.name}, ${body.type}, ${kb} KB. Léelo desde esa ruta del workspace.]`);
 }
 
 async function toggleAgentRecording() {
@@ -618,29 +689,28 @@ $("agent-attach-input").addEventListener("change", () => {
   $("agent-attach-input").value = "";
   if (file) void handleAgentAttachment(file);
 });
-$("agent-abort").addEventListener("click", () => agentSocket?.send(JSON.stringify({ type: "abort" })));
+$("agent-abort").addEventListener("click", () => void abortCurrentTurn());
 
 async function loadAgentResources() {
   if (!selectedAgent) return;
-  const [packageResponse, envResponse, globalPackageResponse, agentResponse] = await Promise.all([
-    api(agentPackagesUrl(selectedAgent.name)),
-    api(agentEnvUrl(selectedAgent.name)),
-    api("/api/packages"),
-    api(`/api/agents/${selectedAgent.name}`),
-  ]);
-  const agentPackages = (await packageResponse.json()).packages;
-  const env = await envResponse.json();
-  const globalPackages = (await globalPackageResponse.json()).packages;
-  if (agentResponse.ok) {
-    const fresh = await agentResponse.json();
+  try {
+    const [agentPackages, agentEnv, globalPackages, globalEnv, fresh] = await Promise.all([
+      panelApi.listAgentPackages(selectedAgent.name),
+      panelApi.listAgentEnv(selectedAgent.name),
+      panelApi.listGlobalPackages(),
+      panelApi.listGlobalEnv(),
+      panelApi.getAgent(selectedAgent.name),
+    ]);
     selectedAgent = { ...selectedAgent, ...fresh };
+    renderKeyList($("agent-packages"), agentPackages, (source) => removeAgentPackage(source, "agent"));
+    renderKeyList($("agent-global-packages"), globalPackages, (source) => removeAgentPackage(source, "global"));
+    renderKeyList($("agent-env"), agentEnv, (key) => removeAgentEnv(key, "agent"), "••••••");
+    renderKeyList($("agent-global-env"), globalEnv, (key) => removeAgentEnv(key, "global"), "••••••");
+    renderTelegramCard();
+    renderVoiceCard();
+  } catch (error) {
+    showPanelError(error, "No se pudieron cargar los recursos");
   }
-  renderKeyList($("agent-packages"), agentPackages, (source) => removeAgentPackage(source, "agent"));
-  renderKeyList($("agent-global-packages"), globalPackages, (source) => removeAgentPackage(source, "global"));
-  renderKeyList($("agent-env"), env.agent || [], (key) => removeAgentEnv(key, "agent"), "••••••");
-  renderKeyList($("agent-global-env"), env.global || [], (key) => removeAgentEnv(key, "global"), "••••••");
-  renderTelegramCard();
-  renderVoiceCard();
 }
 
 function renderTelegramCard() {
@@ -660,19 +730,23 @@ function renderVoiceCard() {
 }
 
 async function removeAgentPackage(source, scope) {
-  await api("/api/packages", {
-    method: "DELETE",
-    body: JSON.stringify({ source, scope, ...(scope === "agent" ? { agent: selectedAgent.name } : {}) }),
-  });
-  setTimeout(loadAgentResources, 800);
+  try {
+    if (scope === "agent") await panelApi.removeAgentPackage(selectedAgent.name, source);
+    else await panelApi.removeGlobalPackage(source);
+    setTimeout(loadAgentResources, 800);
+  } catch (error) {
+    showPanelError(error, "No se pudo quitar el paquete");
+  }
 }
 
 async function removeAgentEnv(key, scope) {
-  await api("/api/env", {
-    method: "DELETE",
-    body: JSON.stringify({ key, scope, ...(scope === "agent" ? { agent: selectedAgent.name } : {}) }),
-  });
-  setTimeout(loadAgentResources, 800);
+  try {
+    if (scope === "agent") await panelApi.removeAgentEnv(selectedAgent.name, key);
+    else await panelApi.removeGlobalEnv(key);
+    setTimeout(loadAgentResources, 800);
+  } catch (error) {
+    showPanelError(error, "No se pudo quitar la variable");
+  }
 }
 
 $("agent-package-form").addEventListener("submit", async (event) => {
@@ -681,14 +755,15 @@ $("agent-package-form").addEventListener("submit", async (event) => {
   if (!source || !selectedAgent) return;
   const scope = document.querySelector('input[name="agent-package-scope"]:checked').value;
   $("agent-package-status").textContent = "Instalando…";
-  const response = await api("/api/packages", {
-    method: "POST",
-    body: JSON.stringify({ source, scope, ...(scope === "agent" ? { agent: selectedAgent.name } : {}) }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-package-status").textContent = response.ok ? "Instalado ✔ · reiniciando Agent…" : `Error: ${body.error || response.status}`;
-  if (response.ok) $("agent-package-source").value = "";
-  setTimeout(loadAgentResources, 1000);
+  try {
+    if (scope === "agent") await panelApi.installAgentPackage(selectedAgent.name, source);
+    else await panelApi.installGlobalPackage(source);
+    $("agent-package-status").textContent = "Instalado ✔ · reiniciando Agent…";
+    $("agent-package-source").value = "";
+    setTimeout(loadAgentResources, 1000);
+  } catch (error) {
+    $("agent-package-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 $("agent-env-form").addEventListener("submit", async (event) => {
@@ -696,17 +771,16 @@ $("agent-env-form").addEventListener("submit", async (event) => {
   const key = $("agent-env-key").value.trim();
   if (!key || !selectedAgent) return;
   const scope = document.querySelector('input[name="agent-env-scope"]:checked').value;
-  const response = await api("/api/env", {
-    method: "POST",
-    body: JSON.stringify({ key, value: $("agent-env-value").value, scope, ...(scope === "agent" ? { agent: selectedAgent.name } : {}) }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-env-status").textContent = response.ok ? "Guardado ✔ · reiniciando Agent…" : `Error: ${body.error || response.status}`;
-  if (response.ok) {
+  try {
+    if (scope === "agent") await panelApi.setAgentEnv(selectedAgent.name, key, $("agent-env-value").value);
+    else await panelApi.setGlobalEnv(key, $("agent-env-value").value);
+    $("agent-env-status").textContent = "Guardado ✔ · reiniciando Agent…";
     $("agent-env-key").value = "";
     $("agent-env-value").value = "";
+    setTimeout(loadAgentResources, 1000);
+  } catch (error) {
+    $("agent-env-status").textContent = `Error: ${panelErrorMessage(error)}`;
   }
-  setTimeout(loadAgentResources, 1000);
 });
 
 $("agent-telegram-form").addEventListener("submit", async (event) => {
@@ -714,30 +788,26 @@ $("agent-telegram-form").addEventListener("submit", async (event) => {
   const token = $("agent-telegram-token").value.trim();
   if (!token || !selectedAgent) return;
   $("agent-telegram-status").textContent = "Guardando…";
-  const response = await api(`/api/agents/${selectedAgent.name}`, {
-    method: "PATCH",
-    body: JSON.stringify({ telegramToken: token }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-telegram-status").textContent = response.ok
-    ? "Guardado ✔ · reiniciando Agent…"
-    : `Error: ${body.error || response.status}`;
-  setTimeout(loadAgentResources, 1500);
+  try {
+    await panelApi.updateAgent(selectedAgent.name, { telegramToken: token });
+    $("agent-telegram-status").textContent = "Guardado ✔ · reiniciando Agent…";
+    setTimeout(loadAgentResources, 1500);
+  } catch (error) {
+    $("agent-telegram-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 $("agent-telegram-remove").addEventListener("click", async () => {
   if (!selectedAgent) return;
   if (!confirm(`¿Quitar el bot de Telegram de "${selectedAgent.name}"?`)) return;
   $("agent-telegram-status").textContent = "Quitando…";
-  const response = await api(`/api/agents/${selectedAgent.name}`, {
-    method: "PATCH",
-    body: JSON.stringify({ telegramToken: null }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-telegram-status").textContent = response.ok
-    ? "Bot quitado ✔ · reiniciando Agent…"
-    : `Error: ${body.error || response.status}`;
-  setTimeout(loadAgentResources, 1500);
+  try {
+    await panelApi.updateAgent(selectedAgent.name, { telegramToken: null });
+    $("agent-telegram-status").textContent = "Bot quitado ✔ · reiniciando Agent…";
+    setTimeout(loadAgentResources, 1500);
+  } catch (error) {
+    $("agent-telegram-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 $("agent-voice-form").addEventListener("submit", async (event) => {
@@ -745,38 +815,33 @@ $("agent-voice-form").addEventListener("submit", async (event) => {
   const voice = $("agent-voice-input").value.trim();
   if (!voice || !selectedAgent) return;
   $("agent-voice-status").textContent = "Guardando…";
-  const response = await api(`/api/agents/${selectedAgent.name}`, {
-    method: "PATCH",
-    body: JSON.stringify({ ttsVoice: voice }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-voice-status").textContent = response.ok
-    ? "Guardada ✔ · reiniciando Agent…"
-    : `Error: ${body.error || response.status}`;
-  setTimeout(loadAgentResources, 1500);
+  try {
+    await panelApi.updateAgent(selectedAgent.name, { ttsVoice: voice });
+    $("agent-voice-status").textContent = "Guardada ✔ · reiniciando Agent…";
+    setTimeout(loadAgentResources, 1500);
+  } catch (error) {
+    $("agent-voice-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 $("agent-voice-remove").addEventListener("click", async () => {
   if (!selectedAgent) return;
   $("agent-voice-status").textContent = "Quitando…";
-  const response = await api(`/api/agents/${selectedAgent.name}`, {
-    method: "PATCH",
-    body: JSON.stringify({ ttsVoice: null }),
-  });
-  const body = await response.json().catch(() => ({}));
-  $("agent-voice-status").textContent = response.ok
-    ? "Voz global ✔ · reiniciando Agent…"
-    : `Error: ${body.error || response.status}`;
-  setTimeout(loadAgentResources, 1500);
+  try {
+    await panelApi.updateAgent(selectedAgent.name, { ttsVoice: null });
+    $("agent-voice-status").textContent = "Voz global ✔ · reiniciando Agent…";
+    setTimeout(loadAgentResources, 1500);
+  } catch (error) {
+    $("agent-voice-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 $("create-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("create-error").textContent = "";
   const packages = $("new-packages").value.split(",").map((s) => s.trim()).filter(Boolean);
-  const res = await api("/api/agents", {
-    method: "POST",
-    body: JSON.stringify({
+  try {
+    await panelApi.createAgent({
       name: $("new-name").value.trim(),
       model:
         ($("new-model-select").classList.contains("hidden")
@@ -786,14 +851,12 @@ $("create-form").addEventListener("submit", async (e) => {
       telegramToken: $("new-telegram").value.trim() || undefined,
       systemPrompt: $("new-system").value.trim() || undefined,
       packages: packages.length ? packages : undefined,
-    }),
-  });
-  if (res.ok) {
+    });
     $("create-form").reset();
     $("create-agent").open = false;
-    loadAgents();
-  } else {
-    $("create-error").textContent = (await res.json()).error || "Error";
+    await loadAgents();
+  } catch (error) {
+    $("create-error").textContent = panelErrorMessage(error, "Error al crear el Agent");
   }
 });
 
@@ -842,12 +905,19 @@ function renderKeyList(el, items, onRemove, sub) {
 
 // ---------- paquetes globales ----------
 async function loadGlobalPackages() {
-  const res = await api("/api/packages");
-  const { packages } = await res.json();
-  renderKeyList($("global-packages"), packages, async (source) => {
-    await api("/api/packages", { method: "DELETE", body: JSON.stringify({ source, scope: "global" }) });
-    setTimeout(loadGlobalPackages, 800);
-  });
+  try {
+    const packages = await panelApi.listGlobalPackages();
+    renderKeyList($("global-packages"), packages, async (source) => {
+      try {
+        await panelApi.removeGlobalPackage(source);
+        setTimeout(loadGlobalPackages, 800);
+      } catch (error) {
+        showPanelError(error, "No se pudo quitar el paquete");
+      }
+    });
+  } catch (error) {
+    showPanelError(error, "No se pudieron cargar los paquetes");
+  }
 }
 
 $("install-form").addEventListener("submit", async (e) => {
@@ -855,24 +925,31 @@ $("install-form").addEventListener("submit", async (e) => {
   const source = $("install-source").value.trim();
   if (!source) return;
   $("install-status").textContent = "Instalando…";
-  const res = await api("/api/packages", {
-    method: "POST",
-    body: JSON.stringify({ source, scope: "global" }),
-  });
-  const body = await res.json().catch(() => ({}));
-  $("install-status").textContent = res.ok ? "Instalado ✔ (agentes reiniciándose…)" : `Error: ${body.error || res.status}`;
-  $("install-source").value = "";
-  setTimeout(loadGlobalPackages, 1000);
+  try {
+    await panelApi.installGlobalPackage(source);
+    $("install-status").textContent = "Instalado ✔ (agentes reiniciándose…)";
+    $("install-source").value = "";
+    setTimeout(loadGlobalPackages, 1000);
+  } catch (error) {
+    $("install-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 // ---------- variables de entorno globales ----------
 async function loadGlobalEnv() {
-  const res = await api("/api/env");
-  const { global } = await res.json();
-  renderKeyList($("global-env"), global, async (key) => {
-    await api("/api/env", { method: "DELETE", body: JSON.stringify({ key, scope: "global" }) });
-    setTimeout(loadGlobalEnv, 800);
-  }, "••••••");
+  try {
+    const keys = await panelApi.listGlobalEnv();
+    renderKeyList($("global-env"), keys, async (key) => {
+      try {
+        await panelApi.removeGlobalEnv(key);
+        setTimeout(loadGlobalEnv, 800);
+      } catch (error) {
+        showPanelError(error, "No se pudo quitar la variable");
+      }
+    }, "••••••");
+  } catch (error) {
+    showPanelError(error, "No se pudieron cargar las variables");
+  }
 }
 
 $("env-form").addEventListener("submit", async (e) => {
@@ -881,57 +958,63 @@ $("env-form").addEventListener("submit", async (e) => {
   if (!key) return;
   const value = $("env-value").value;
   $("env-status").textContent = "Guardando…";
-  const res = await api("/api/env", {
-    method: "POST",
-    body: JSON.stringify({ key, value, scope: "global" }),
-  });
-  const body = await res.json().catch(() => ({}));
-  $("env-status").textContent = res.ok ? "Guardado ✔ (agentes reiniciándose…)" : `Error: ${body.error || res.status}`;
-  $("env-key").value = "";
-  $("env-value").value = "";
-  setTimeout(loadGlobalEnv, 1000);
+  try {
+    await panelApi.setGlobalEnv(key, value);
+    $("env-status").textContent = "Guardado ✔ (agentes reiniciándose…)";
+    $("env-key").value = "";
+    $("env-value").value = "";
+    setTimeout(loadGlobalEnv, 1000);
+  } catch (error) {
+    $("env-status").textContent = `Error: ${panelErrorMessage(error)}`;
+  }
 });
 
 // ---------- OAuth ----------
 let pollTimer = null;
 
 async function loadProviders() {
-  const res = await api("/api/auth/providers");
-  const { providers } = await res.json();
-  if (!providers.length) return;
-  $("nav-oauth").classList.remove("hidden");
-  const wrap = $("oauth-list");
-  wrap.innerHTML = "";
-  for (const p of providers) {
-    const card = document.createElement("div");
-    card.className = "card";
-    const header = document.createElement("div");
-    header.className = "card-header";
-    const title = document.createElement("span");
-    title.className = "card-title";
-    title.textContent = p.name;
-    const chip = document.createElement("span");
-    chip.className = `chip ${p.loggedIn ? "chip-ok" : "chip-danger"}`;
-    chip.innerHTML = '<span class="chip-dot"></span>';
-    chip.append(p.loggedIn ? " Conectado" : " Desconectado");
-    header.append(title, chip);
+  try {
+    const { providers } = await panelApi.oauth.providers();
+    if (!providers.length) return;
+    $("nav-oauth").classList.remove("hidden");
+    const wrap = $("oauth-list");
+    wrap.innerHTML = "";
+    for (const p of providers) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const header = document.createElement("div");
+      header.className = "card-header";
+      const title = document.createElement("span");
+      title.className = "card-title";
+      title.textContent = p.name;
+      const chip = document.createElement("span");
+      chip.className = `chip ${p.loggedIn ? "chip-ok" : "chip-danger"}`;
+      chip.innerHTML = '<span class="chip-dot"></span>';
+      chip.append(p.loggedIn ? " Conectado" : " Desconectado");
+      header.append(title, chip);
 
-    const btn = document.createElement("button");
-    btn.className = `btn btn-sm ${p.loggedIn ? "btn-secondary" : "btn-primary"}`;
-    btn.textContent = p.loggedIn ? "Desconectar" : "Conectar";
-    btn.onclick = async () => {
-      if (p.loggedIn) {
-        await api(`/api/auth/logout/${p.id}`, { method: "POST" });
-        loadProviders();
-      } else {
-        const r = await api(`/api/auth/login/${p.id}`, { method: "POST" });
-        const flow = await r.json();
-        if (flow.error) return alert(flow.error);
-        pollFlow(flow.id);
-      }
-    };
-    card.append(header, btn);
-    wrap.appendChild(card);
+      const btn = document.createElement("button");
+      btn.className = `btn btn-sm ${p.loggedIn ? "btn-secondary" : "btn-primary"}`;
+      btn.textContent = p.loggedIn ? "Desconectar" : "Conectar";
+      btn.onclick = async () => {
+        try {
+          if (p.loggedIn) {
+            await panelApi.oauth.logout(p.id);
+            await loadProviders();
+          } else {
+            const flow = await panelApi.oauth.startLogin(p.id);
+            if (flow.error) return alert(flow.error);
+            pollFlow(flow.id);
+          }
+        } catch (error) {
+          $("oauth-msg").textContent = `⚠️ ${panelErrorMessage(error)}`;
+        }
+      };
+      card.append(header, btn);
+      wrap.appendChild(card);
+    }
+  } catch (error) {
+    if (error instanceof PanelApiError && error.requiresLogin) showLogin();
   }
 }
 
@@ -974,36 +1057,45 @@ function pollFlow(id) {
   clearInterval(pollTimer);
   $("oauth-input-form").onsubmit = (e) => {
     e.preventDefault();
-    submitFlow(id, $("oauth-input").value.trim());
+    void submitFlow(id, $("oauth-input").value.trim());
     $("oauth-input").value = "";
   };
   pollTimer = setInterval(async () => {
-    const res = await api(`/api/auth/flows/${id}`);
-    if (res.ok) renderFlow(await res.json());
+    try {
+      renderFlow(await panelApi.oauth.getFlow(id));
+    } catch (error) {
+      $("oauth-msg").textContent = `⚠️ ${panelErrorMessage(error)}`;
+    }
   }, 1200);
 }
 
 async function submitFlow(id, value) {
-  await api(`/api/auth/flows/${id}/input`, { method: "POST", body: JSON.stringify({ value }) });
+  try {
+    await panelApi.oauth.submitFlowInput(id, value);
+  } catch (error) {
+    $("oauth-msg").textContent = `⚠️ ${panelErrorMessage(error)}`;
+  }
 }
 
 // ---------- init ----------
 async function init() {
+  const csrfToken = csrfCookieValue();
+  panelApi.setCsrfToken(csrfToken);
+  panelTurns.setCsrfToken(csrfToken);
   try {
-    const res = await api("/api/status");
-    const status = await res.json();
-    $("status-line").textContent = `pi ${status.pi} · ${status.agents} agente(s) · puertos ${status.portRange[0]}-${status.portRange[1]}`;
+    const status = await panelApi.status();
+    $("status-line").textContent = `pi ${status.pi} · ${status.agents} agentes`;
     $("login").classList.add("hidden");
     $("app").classList.remove("hidden");
     navigate("agents");
-    loadAgents();
-    loadModels();
-    loadGlobalPackages();
-    loadGlobalEnv();
-    loadProviders();
-    setInterval(loadAgents, 10000);
-  } catch {
-    /* login mostrado */
+    void loadAgents();
+    void loadModels();
+    void loadGlobalPackages();
+    void loadGlobalEnv();
+    void loadProviders();
+    setInterval(() => void loadAgents(), 10000);
+  } catch (error) {
+    if (error instanceof PanelApiError && error.requiresLogin) showLogin();
   }
 }
 
