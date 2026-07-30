@@ -29,6 +29,7 @@ function runningSupervisor(actions: string[]): Supervisor {
     start: async () => actions.push("start"),
     stop: async () => actions.push("stop"),
     restart: async () => actions.push("restart"),
+    restartAllRunning: async () => actions.push("restartAllRunning"),
     statusOf: async (config: { name: string }) => ({ ...config, state: "running", port: 4100, pid: 42, telegram: false }),
   } as unknown as Supervisor;
 }
@@ -169,6 +170,81 @@ test("PUT /agents/:name/env exige la credencial de servicio", async () => {
       body: JSON.stringify({ env: {} }),
     });
     assert.equal(response.status, 401);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("PUT /agents/:name/env/:key fija una variable atómica y solo devuelve claves", async () => {
+  const dataDir = await setup();
+  try {
+    const actions: string[] = [];
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, runningSupervisor(actions));
+    const response = await app.request("http://pihub.test/agents/agent/env/NEW_KEY", {
+      method: "PUT",
+      headers: { authorization: "Bearer service-token", "content-type": "application/json" },
+      body: JSON.stringify({ value: "secret-value" }),
+    });
+    const rawText = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(rawText), { keys: ["NEW_KEY"] });
+    assert.doesNotMatch(rawText, /secret-value/);
+    assert.deepEqual(await readEnvStore(dataDir, "agent"), { NEW_KEY: "secret-value" });
+    assert.deepEqual(actions, ["restart"]);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("DELETE /agents/:name/env/:key elimina solo esa variable", async () => {
+  const dataDir = await setup();
+  try {
+    await setEnv(dataDir, "REMOVE_ME", "secret", "agent");
+    await setEnv(dataDir, "KEEP_ME", "keep", "agent");
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, runningSupervisor([]));
+    const response = await app.request("http://pihub.test/agents/agent/env/REMOVE_ME", {
+      method: "DELETE",
+      headers: { authorization: "Bearer service-token" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { keys: ["KEEP_ME"] });
+    assert.deepEqual(await readEnvStore(dataDir, "agent"), { KEEP_ME: "keep" });
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("el store global de /api/v1/env está separado del Agent y opera por clave", async () => {
+  const dataDir = await setup();
+  try {
+    await setEnv(dataDir, "AGENT_ONLY", "agent-secret", "agent");
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, runningSupervisor([]));
+    const put = await app.request("http://pihub.test/env/GLOBAL_KEY", {
+      method: "PUT",
+      headers: { authorization: "Bearer service-token", "content-type": "application/json" },
+      body: JSON.stringify({ value: "global-secret" }),
+    });
+    assert.equal(put.status, 200);
+    assert.deepEqual(await put.json(), { keys: ["GLOBAL_KEY"] });
+
+    const get = await app.request("http://pihub.test/env", {
+      headers: { authorization: "Bearer service-token" },
+    });
+    const getText = await get.text();
+    assert.deepEqual(JSON.parse(getText), { keys: ["GLOBAL_KEY"] });
+    assert.doesNotMatch(getText, /global-secret|agent-secret|AGENT_ONLY/);
+    assert.deepEqual(await readEnvStore(dataDir), { GLOBAL_KEY: "global-secret" });
+
+    const remove = await app.request("http://pihub.test/env/GLOBAL_KEY", {
+      method: "DELETE",
+      headers: { authorization: "Bearer service-token" },
+    });
+    assert.equal(remove.status, 200);
+    assert.deepEqual(await remove.json(), { keys: [] });
+    assert.deepEqual(await readEnvStore(dataDir), {});
+    assert.deepEqual(await readEnvStore(dataDir, "agent"), { AGENT_ONLY: "agent-secret" });
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }

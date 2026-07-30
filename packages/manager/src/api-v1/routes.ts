@@ -5,6 +5,8 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import {
   agentPaths,
+  isProtectedEnvKey,
+  isValidEnvKey,
   listAgents,
   listEnvKeys,
   piInstall,
@@ -13,6 +15,8 @@ import {
   readAgent,
   readEnvStore,
   replaceEnvStore,
+  setEnv,
+  unsetEnv,
   type AgentConfig,
   type AgentStatus,
   type PihubEnv,
@@ -38,6 +42,7 @@ import {
   createTurnV1Schema,
   replaceEnvV1Schema,
   replacePackagesV1Schema,
+  setEnvValueV1Schema,
   updateAgentV1Schema,
 } from "./schemas.js";
 
@@ -372,6 +377,106 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
       await aplicarRuntimeAction(supervisor, name, action);
 
       return c.json({ keys: await listEnvKeys(env.dataDir, name) });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update env");
+    }
+  });
+
+  // Operaciones atómicas para el panel: conservan las variables que otras
+  // pestañas puedan haber añadido y nunca devuelven valores secretos.
+  app.put("/agents/:name/env/:key", async (c) => {
+    const name = c.req.param("name");
+    const key = c.req.param("key");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+
+    const parsed = setEnvValueV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
+
+    try {
+      const wasRunning = supervisor.state(name).state === "running";
+      const antes = await snapshotRuntimeInput(env, config);
+      const despuesProyectado = { ...antes, env: { ...antes.env, [key]: parsed.data.value } };
+      const action = decideRuntimeAction({
+        wasRunning,
+        wasEnabled: config.enabled,
+        isEnabled: config.enabled,
+        fingerprintChanged:
+          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
+      });
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      }
+
+      await setEnv(env.dataDir, key, parsed.data.value, name);
+      await aplicarRuntimeAction(supervisor, name, action);
+      return c.json({ keys: await listEnvKeys(env.dataDir, name) });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update env");
+    }
+  });
+
+  app.delete("/agents/:name/env/:key", async (c) => {
+    const name = c.req.param("name");
+    const key = c.req.param("key");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+
+    try {
+      const wasRunning = supervisor.state(name).state === "running";
+      const antes = await snapshotRuntimeInput(env, config);
+      const projectedEnv = { ...antes.env };
+      delete projectedEnv[key];
+      const action = decideRuntimeAction({
+        wasRunning,
+        wasEnabled: config.enabled,
+        isEnabled: config.enabled,
+        fingerprintChanged:
+          agentRuntimeFingerprint(antes) !==
+          agentRuntimeFingerprint({ ...antes, env: projectedEnv }),
+      });
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      }
+
+      await unsetEnv(env.dataDir, key, name);
+      await aplicarRuntimeAction(supervisor, name, action);
+      return c.json({ keys: await listEnvKeys(env.dataDir, name) });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update env");
+    }
+  });
+
+  // Store global del panel: solo claves en lectura y operaciones por clave.
+  // Un cambio global se aplica a los Runners activos mediante el mismo reload
+  // diferido que usaba la superficie legacy, sin mezclarlo con un Agent.
+  app.get("/env", async (c) => c.json({ keys: await listEnvKeys(env.dataDir) }));
+
+  app.put("/env/:key", async (c) => {
+    const key = c.req.param("key");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+    const parsed = setEnvValueV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
+
+    try {
+      await setEnv(env.dataDir, key, parsed.data.value);
+      scheduleGlobalReload(supervisor);
+      return c.json({ keys: await listEnvKeys(env.dataDir) });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Could not update env");
+    }
+  });
+
+  app.delete("/env/:key", async (c) => {
+    const key = c.req.param("key");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+
+    try {
+      const existed = await unsetEnv(env.dataDir, key);
+      if (existed) scheduleGlobalReload(supervisor);
+      return c.json({ keys: await listEnvKeys(env.dataDir) });
     } catch {
       return fail(c, "BAD_REQUEST", "Could not update env");
     }
@@ -801,6 +906,13 @@ function toAgentV1(status: AgentStatus): Omit<AgentStatus, "port" | "pid"> & {
   // que ya lo leyera. Encontrado con el test de integración del adapter,
   // que recibía siempre `stopped` porque `status` no existía.
   return { ...safe, status: safe.state };
+}
+
+/** El store global afecta a todos los Runners; se recarga sin bloquear el PUT. */
+function scheduleGlobalReload(supervisor: Supervisor): void {
+  setTimeout(() => {
+    void supervisor.restartAllRunning().catch(() => {});
+  }, 500);
 }
 
 /** Helper compartido por las rutas: traduce un código a su respuesta. */

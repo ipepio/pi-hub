@@ -63,6 +63,11 @@ export const replaceEnvV1Schema = z.object({
   env: z.record(z.string(), z.string()),
 });
 
+/** Operación atómica del panel: el valor nunca se devuelve en la respuesta. */
+export const setEnvValueV1Schema = z.object({
+  value: z.string(),
+});
+
 /** Spec §4.3b, `PUT /agents/:name/packages`. Conjunto COMPLETO, converge con install/remove. */
 export const replacePackagesV1Schema = z.object({
   packages: z.array(z.string().min(1)),
