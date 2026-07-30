@@ -109,3 +109,39 @@ test("PUT /agents/:name/packages exige la credencial de servicio", async () => {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test("POST y DELETE /agents/:name/packages validan el item sin aceptar un conjunto", async () => {
+  const dataDir = await setup();
+  try {
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+    const post = await app.request("http://pihub.test/agents/agent/packages", {
+      method: "POST",
+      headers: { authorization: "Bearer service-token", "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const remove = await app.request("http://pihub.test/agents/agent/packages", {
+      method: "DELETE",
+      headers: { authorization: "Bearer service-token", "content-type": "application/json" },
+      body: JSON.stringify({ packages: [] }),
+    });
+    assert.equal(post.status, 400);
+    assert.equal(remove.status, 400);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("GET /api/v1/packages devuelve solo el store global", async () => {
+  const dataDir = await setup();
+  try {
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+    const response = await app.request("http://pihub.test/packages", {
+      headers: { authorization: "Bearer service-token" },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { packages: [] });
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+

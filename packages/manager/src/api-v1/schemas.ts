@@ -72,3 +72,8 @@ export const setEnvValueV1Schema = z.object({
 export const replacePackagesV1Schema = z.object({
   packages: z.array(z.string().min(1)),
 });
+
+/** Operación atómica del panel: una fuente por petición. */
+export const packageItemV1Schema = z.object({
+  source: z.string().min(1),
+});

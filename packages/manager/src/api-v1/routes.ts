@@ -40,6 +40,7 @@ import {
   createAgentV1Schema,
   createSessionV1Schema,
   createTurnV1Schema,
+  packageItemV1Schema,
   replaceEnvV1Schema,
   replacePackagesV1Schema,
   setEnvValueV1Schema,
@@ -534,6 +535,75 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
 
+  // --- Panel/operator extensions: paquetes por item ---
+  app.post("/agents/:name/packages", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+
+    const actuales = await listPackages(env, name);
+    if (actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+
+    const wasRunning = supervisor.state(name).state === "running";
+    if (wasRunning && hayTurnoVivo(name)) {
+      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+    }
+
+    const result = await piInstall(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
+    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${parsed.data.source}`);
+    scheduleAgentReload(supervisor, name);
+    return c.json({ packages: await listPackages(env, name) }, 202);
+  });
+
+  app.delete("/agents/:name/packages", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+
+    const actuales = await listPackages(env, name);
+    if (!actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+
+    const wasRunning = supervisor.state(name).state === "running";
+    if (wasRunning && hayTurnoVivo(name)) {
+      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+    }
+
+    const result = await piRemove(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
+    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${parsed.data.source}`);
+    scheduleAgentReload(supervisor, name);
+    return c.json({ packages: await listPackages(env, name) }, 202);
+  });
+
+  app.get("/packages", async (c) => c.json({ packages: await listPackages(env) }));
+
+  app.post("/packages", async (c) => {
+    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+
+    const actuales = await listPackages(env);
+    if (actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    const result = await piInstall(env.dataDir, parsed.data.source);
+    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not install ${parsed.data.source}`);
+    scheduleGlobalReload(supervisor);
+    return c.json({ packages: await listPackages(env) }, 202);
+  });
+
+  app.delete("/packages", async (c) => {
+    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+
+    const actuales = await listPackages(env);
+    if (!actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    const result = await piRemove(env.dataDir, parsed.data.source);
+    if (!result.ok) return fail(c, "BAD_REQUEST", `Could not remove ${parsed.data.source}`);
+    scheduleGlobalReload(supervisor);
+    return c.json({ packages: await listPackages(env) }, 202);
+  });
+
   // --- §4.3d Ciclo de vida explícito (Fase 1, §1.3 del plan) ---
   //
   // Operación imperativa, distinta del estado declarativo del PATCH.
@@ -906,6 +976,13 @@ function toAgentV1(status: AgentStatus): Omit<AgentStatus, "port" | "pid"> & {
   // que ya lo leyera. Encontrado con el test de integración del adapter,
   // que recibía siempre `stopped` porque `status` no existía.
   return { ...safe, status: safe.state };
+}
+
+/** Recarga diferida tras una operación atómica del panel. */
+function scheduleAgentReload(supervisor: Supervisor, name: string): void {
+  setTimeout(() => {
+    void supervisor.restart(name).catch(() => {});
+  }, 500);
 }
 
 /** El store global afecta a todos los Runners; se recarga sin bloquear el PUT. */
