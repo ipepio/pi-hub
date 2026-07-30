@@ -35,7 +35,13 @@ import {
   projectUpdatedAgent,
   type RuntimeAction,
 } from "./restart-policy.js";
-import { isDuplicateTurn, rememberTurn, toTurnEvent } from "./turns.js";
+import {
+  isDuplicateTurn,
+  rememberTurn,
+  toTurnEvent,
+  type TurnEventProfile,
+  type TurnSseEvent,
+} from "./turns.js";
 import { diffPackages } from "./package-sync.js";
 import {
   createAgentV1Schema,
@@ -49,6 +55,11 @@ import {
 } from "./schemas.js";
 
 const MANAGER_VERSION = "0.6.0";
+
+interface TurnoVivo {
+  ws: WebSocket;
+  abortRequested: boolean;
+}
 
 /** Variables de contexto de `/api/v1`. El correlationId viaja en toda respuesta de error. */
 export type ApiV1Env = { Variables: { correlationId: string } };
@@ -88,7 +99,7 @@ export function createApiV1Router(
    * Es lo que permite `POST .../turns/:turnId/abort` (bug 3) y que el
    * PATCH rechace con `TURN_IN_PROGRESS` en vez de reiniciar un turno vivo.
    */
-  const turnosVivos = new Map<string, WebSocket>();
+  const turnosVivos = new Map<string, TurnoVivo>();
   const claveTurno = (name: string, turnId: string) => `${name}:${turnId}`;
   const hayTurnoVivo = (name: string) => hasLiveTurnForAgent(turnosVivos.keys(), name);
 
@@ -782,6 +793,12 @@ export function createApiV1Router(
   // --- §4.5 Turnos ---
 
   app.post("/agents/:name/turns", async (c) => {
+    const requestedEventProfile = c.req.query("eventProfile");
+    if (requestedEventProfile !== undefined && !["basic", "verbose"].includes(requestedEventProfile)) {
+      return fail(c, "BAD_REQUEST", "eventProfile must be basic or verbose");
+    }
+    const eventProfile = (requestedEventProfile ?? "basic") as TurnEventProfile;
+
     // El body se valida PRIMERO: turnId/idempotencyKey/correlationId son
     // obligatorios (H01.04) y su ausencia es 400 aunque el agente tampoco
     // exista — así lo fija el contract test de §4.5.
@@ -823,10 +840,21 @@ export function createApiV1Router(
       const clave = claveTurno(name, turnId);
       await new Promise<void>((resolve) => {
         let cerrado = false;
-        const cerrar = () => {
-          if (cerrado) return;
-          cerrado = true;
-          turnosVivos.delete(clave);
+
+        // Las escrituras se ENCADENAN: `writeSSE` es asíncrona y los
+        // mensajes del WS llegan en ráfaga. Sin esta cadena, el evento
+        // terminal cerraba el stream antes de que su propia escritura se
+        // vaciara y `turn-complete` NO llegaba nunca al cliente —
+        // encontrado con un turno real, no en los tests unitarios.
+        let escrituras: Promise<void> = Promise.resolve();
+        const emitir = (evento: TurnSseEvent) => {
+          escrituras = escrituras.then(() =>
+            stream.writeSSE({ event: evento.event, data: JSON.stringify(evento.data) }),
+          );
+          return escrituras;
+        };
+
+        const cerrarSocket = () => {
           try {
             ws.close();
           } catch {
@@ -835,60 +863,87 @@ export function createApiV1Router(
           resolve();
         };
 
+        /** Emite un terminal, si corresponde, antes de resolver el stream. */
+        const finalizar = (terminal?: TurnSseEvent) => {
+          if (cerrado) return;
+          cerrado = true;
+          turnosVivos.delete(clave);
+          const escrituraFinal = terminal ? emitir(terminal) : escrituras;
+          void escrituraFinal.then(cerrarSocket, cerrarSocket);
+        };
+
         // Si el cliente se va, se corta el turno: mantener el WS abierto
-        // contra un Runner que sigue generando sería una fuga.
-        stream.onAbort(cerrar);
+        // contra un Runner que sigue generando sería una fuga. El cliente ya
+        // no puede recibir un terminal, así que este camino no escribe SSE.
+        stream.onAbort(() => finalizar());
 
         ws.on("open", () => {
+          if (cerrado) {
+            cerrarSocket();
+            return;
+          }
           // Registrado solo tras `open`: mandar `{type:"abort"}` antes de
           // que el WS esté realmente conectado no es seguro.
-          turnosVivos.set(clave, ws);
+          turnosVivos.set(clave, { ws, abortRequested: false });
           ws.send(JSON.stringify({ type: "prompt", text: message }));
         });
 
-        // Las escrituras se ENCADENAN: `writeSSE` es asíncrona y los
-        // mensajes del WS llegan en ráfaga. Sin esta cadena, el evento
-        // terminal cerraba el stream antes de que su propia escritura se
-        // vaciara y `turn-complete` NO llegaba nunca al cliente —
-        // encontrado con un turno real, no en los tests unitarios.
-        let escrituras: Promise<void> = Promise.resolve();
-        const emitir = (evento: { event: string; data: Record<string, unknown> }) => {
-          escrituras = escrituras.then(() =>
-            stream.writeSSE({ event: evento.event, data: JSON.stringify(evento.data) }),
-          );
-          return escrituras;
-        };
-
         ws.on("message", (raw: unknown) => {
-          let mensaje: { type: string; delta?: string; message?: string };
+          let mensaje: { type: string; delta?: unknown; message?: unknown; toolName?: unknown; isError?: unknown };
           try {
             mensaje = JSON.parse(String(raw)) as typeof mensaje;
           } catch {
             return;
           }
-          const evento = toTurnEvent(mensaje, turnId);
+          const turno = turnosVivos.get(clave);
+          const evento = toTurnEvent(
+            mensaje,
+            turnId,
+            eventProfile,
+            turno?.abortRequested === true,
+          );
           if (!evento) return;
 
-          const escrito = emitir(evento);
-          // `agent_end` y `error` son terminales: se cierra DESPUÉS de
-          // que el evento haya salido de verdad.
-          if (evento.event === "turn-complete" || evento.event === "turn-error") {
-            void escrito.then(cerrar, cerrar);
+          const terminal =
+            evento.event === "turn-complete" ||
+            evento.event === "turn-aborted" ||
+            evento.event === "turn-error";
+          if (terminal) {
+            // `agent_end` y `error` son terminales: se cierra DESPUÉS de
+            // que el evento haya salido de verdad.
+            finalizar(evento);
+          } else {
+            void emitir(evento);
           }
         });
 
         ws.on("error", () => {
-          void emitir({
+          const turno = turnosVivos.get(clave);
+          if (turno?.abortRequested) {
+            finalizar({ event: "turn-aborted", data: { turnId } });
+            return;
+          }
+          finalizar({
             event: "turn-error",
             data: {
               turnId,
               code: "RESOURCE_UNAVAILABLE",
               message: "Runner unavailable",
             },
-          }).then(cerrar, cerrar);
+          });
         });
 
-        ws.on("close", cerrar);
+        ws.on("close", () => {
+          const turno = turnosVivos.get(clave);
+          // Un Runner que cierra el socket sin agent_end después de un abort
+          // sigue teniendo una terminal pública: no dejamos al caller con
+          // un SSE colgado ni disfrazamos la cancelación de error.
+          if (turno?.abortRequested) {
+            finalizar({ event: "turn-aborted", data: { turnId } });
+          } else {
+            finalizar();
+          }
+        });
       });
     });
   });
@@ -907,10 +962,22 @@ export function createApiV1Router(
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const ws = turnosVivos.get(claveTurno(name, turnId));
-    if (!ws) return fail(c, "TURN_NOT_FOUND", "Turn not found or already finished");
+    const turno = turnosVivos.get(claveTurno(name, turnId));
+    if (!turno) return fail(c, "TURN_NOT_FOUND", "Turn not found or already finished");
 
-    ws.send(JSON.stringify({ type: "abort" }));
+    // Se marca antes de enviar el comando: tanto el próximo agent_end como
+    // un close/error sin agent_end deben publicar turn-aborted.
+    turno.abortRequested = true;
+    try {
+      turno.ws.send(JSON.stringify({ type: "abort" }));
+    } catch {
+      // El close del socket resolverá el stream con turn-aborted igualmente.
+      try {
+        turno.ws.close();
+      } catch {
+        // Ya estaba cerrado.
+      }
+    }
     return c.body(null, 202);
   });
 

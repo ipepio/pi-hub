@@ -49,10 +49,13 @@ describe("traducción del vocabulario del Runner al de la spec §4.5", () => {
     });
   });
 
-  it("agent_end cierra el turno", () => {
-    const traducido = toTurnEvent({ type: "agent_end" }, TURN);
-    assert.strictEqual(traducido?.event, "turn-complete");
-    assert.strictEqual((traducido?.data as { turnId: string }).turnId, TURN);
+  it("agent_end cierra el turno en basic, también si el perfil se omite", () => {
+    const traducido = toTurnEvent({ type: "agent_end" }, TURN, "basic");
+    assert.deepStrictEqual(traducido, {
+      event: "turn-complete",
+      data: { turnId: TURN, totalTokens: 0 },
+    });
+    assert.deepStrictEqual(toTurnEvent({ type: "agent_end" }, TURN), traducido);
   });
 
   it("un error del Runner se traduce sin filtrar su texto crudo", () => {
@@ -64,12 +67,60 @@ describe("traducción del vocabulario del Runner al de la spec §4.5", () => {
     assert.doesNotMatch(JSON.stringify(traducido?.data), /\/data/);
   });
 
-  it("el razonamiento y las tools NO se reenvían: no están en el vocabulario del dashboard", () => {
+  it("el razonamiento y las tools se omiten en basic", () => {
     // Mapearlos a `chunk` mezclaría razonamiento con respuesta, que es
-    // peor que omitirlos. Se descartan explícitamente, no por descuido.
-    assert.strictEqual(toTurnEvent({ type: "thinking_delta", delta: "mmm" }, TURN), undefined);
-    assert.strictEqual(toTurnEvent({ type: "tool_start", toolName: "x" }, TURN), undefined);
+    // peor que omitirlos. `basic` conserva explícitamente ese comportamiento.
+    assert.strictEqual(toTurnEvent({ type: "thinking_delta", delta: "mmm" }, TURN, "basic"), undefined);
+    assert.strictEqual(toTurnEvent({ type: "tool_start", toolName: "x" }, TURN, "basic"), undefined);
+    assert.strictEqual(toTurnEvent({ type: "tool_end", toolName: "x", isError: false }, TURN, "basic"), undefined);
     assert.strictEqual(toTurnEvent({ type: "ready", agent: "a", sessionId: "s" }, TURN), undefined);
+  });
+
+  it("verbose traduce thinking_delta al evento público thinking-delta", () => {
+    assert.deepStrictEqual(toTurnEvent({ type: "thinking_delta", delta: "mmm" }, TURN, "verbose"), {
+      event: "thinking-delta",
+      data: { turnId: TURN, delta: "mmm" },
+    });
+  });
+
+  it("verbose traduce tool_start y tool_end con los campos del Runner", () => {
+    assert.deepStrictEqual(toTurnEvent({ type: "tool_start", toolName: "read" }, TURN, "verbose"), {
+      event: "tool-start",
+      data: { turnId: TURN, toolName: "read" },
+    });
+    assert.deepStrictEqual(
+      toTurnEvent({ type: "tool_end", toolName: "read", isError: true }, TURN, "verbose"),
+      {
+        event: "tool-end",
+        data: { turnId: TURN, toolName: "read", isError: true },
+      },
+    );
+  });
+
+  it("toolName no expone paths ni argumentos del Runner", () => {
+    assert.deepStrictEqual(
+      toTurnEvent({ type: "tool_start", toolName: "read /data/agents/a --secret" }, TURN, "verbose"),
+      {
+        event: "tool-start",
+        data: { turnId: TURN, toolName: "read" },
+      },
+    );
+    assert.deepStrictEqual(
+      toTurnEvent({ type: "tool_end", toolName: "/data/agents/a", isError: false }, TURN, "verbose"),
+      {
+        event: "tool-end",
+        data: { turnId: TURN, toolName: "tool", isError: false },
+      },
+    );
+  });
+
+  it("agent_end se traduce a turn-aborted si el turno fue abortado", () => {
+    for (const profile of ["basic", "verbose"] as const) {
+      assert.deepStrictEqual(toTurnEvent({ type: "agent_end" }, TURN, profile, true), {
+        event: "turn-aborted",
+        data: { turnId: TURN },
+      });
+    }
   });
 
   it("un tipo desconocido se ignora en vez de romper el turno", () => {
