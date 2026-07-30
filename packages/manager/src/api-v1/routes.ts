@@ -176,6 +176,40 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
     });
   });
 
+  // --- Panel/operator extensions: commands ---
+  // El dashboard no consume esta ruta; el panel necesita el catálogo humano
+  // del Runner y nunca debe recibir su error crudo ni su topología.
+  app.get("/agents/:name/commands", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    let status: AgentStatus;
+    try {
+      status = await supervisor.statusOf(config);
+    } catch {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
+    if (status.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${status.port}/api/commands`, {
+        headers: { authorization: `Bearer ${env.apiToken}` },
+      });
+      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+      const body = (await response.json().catch(() => undefined)) as {
+        skills?: unknown;
+        prompts?: unknown;
+      } | undefined;
+      if (!Array.isArray(body?.skills) || !Array.isArray(body?.prompts)) {
+        return fail(c, "RESOURCE_UNAVAILABLE", "Runner returned an invalid command catalog");
+      }
+      return c.json({ skills: body.skills, prompts: body.prompts });
+    } catch {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
+  });
+
   // --- §4.3 Agents ---
 
   app.get("/agents", async (c) => {
@@ -447,6 +481,46 @@ export function createApiV1Router(env: PihubEnv, supervisor: Supervisor): Hono<A
       },
       201,
     );
+  });
+
+  // --- Panel/operator extensions: transcribe ---
+  // Se reenvía el multipart al Runner; el Manager no duplica el cliente STT.
+  app.post("/agents/:name/transcribe", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    let status: AgentStatus;
+    try {
+      status = await supervisor.statusOf(config);
+    } catch {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
+    if (status.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${status.port}/api/transcribe`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.apiToken}`,
+          ...(c.req.header("content-type") ? { "content-type": c.req.header("content-type")! } : {}),
+        },
+        body: c.req.raw.body,
+        duplex: "half",
+      } as RequestInit);
+
+      if (response.status === 501) return c.json({ error: "STT no configurado" }, 501);
+      if (response.status === 413) return fail(c, "PAYLOAD_TOO_LARGE", "Audio too large");
+      if (response.status === 400) return fail(c, "BAD_REQUEST", "Invalid audio upload");
+      if (response.status >= 500) return fail(c, "VOICE_PROVIDER_ERROR", "Voice provider failed");
+      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+
+      const body = (await response.json().catch(() => undefined)) as { text?: unknown } | undefined;
+      if (typeof body?.text !== "string") return fail(c, "INTERNAL_ERROR", "Invalid transcription response");
+      return c.json({ text: body.text });
+    } catch {
+      return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+    }
   });
 
   // --- §4.6 Subida de ficheros ---

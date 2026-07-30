@@ -22,6 +22,7 @@ describe("api-v1 error envelope", () => {
       "TURN_IN_PROGRESS",
       "MODEL_FORBIDDEN",
       "RESOURCE_UNAVAILABLE",
+      "VOICE_PROVIDER_ERROR",
       "INTERNAL_ERROR",
       "MISSING_AUTH",
       "INVALID_AUTH",
@@ -32,6 +33,10 @@ describe("api-v1 error envelope", () => {
     ] as const) {
       assert.ok(HTTP_STATUS_BY_CODE[code], `falta status para ${code}`);
     }
+  });
+
+  it("VOICE_PROVIDER_ERROR es un error 502", () => {
+    assert.strictEqual(HTTP_STATUS_BY_CODE.VOICE_PROVIDER_ERROR, 502);
   });
 
   it("CSRF_REQUIRED y CSRF_INVALID son errores 403", () => {
