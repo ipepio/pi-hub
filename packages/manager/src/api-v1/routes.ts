@@ -41,7 +41,7 @@ import {
   updateAgentV1Schema,
 } from "./schemas.js";
 
-const MANAGER_VERSION = "0.1.0";
+const MANAGER_VERSION = "0.6.0";
 
 /** Variables de contexto de `/api/v1`. El correlationId viaja en toda respuesta de error. */
 export type ApiV1Env = { Variables: { correlationId: string } };
