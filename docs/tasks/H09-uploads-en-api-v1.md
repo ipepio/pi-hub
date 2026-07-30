@@ -1,5 +1,9 @@
 # H09 — Exponer subida de ficheros en `/api/v1`
 
+> **Estado: completada.** Publicada en `v0.4.0` y mantenida en `v0.6.0`.
+> La referencia vigente es [`../manager-api-v1.md`](../manager-api-v1.md) §8;
+> esta task conserva el análisis y los criterios originales como historial.
+
 **Va antes que** la T08 del dashboard, que no puede empezar sin esta ruta.
 
 ## Goal

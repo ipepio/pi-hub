@@ -1,198 +1,134 @@
 # Qué queda en pihub, y por qué
 
-> Cada entrada dice **qué falta**, **por qué no está hecho** y **qué se rompe si sigue
-> así**. Si algo está pendiente por una razón que ya no es cierta, bórralo de aquí.
+> Estado revisado para **v0.6.0** (2026-07-30). Cada entrada identifica qué
+> falta, por qué no se implementa aún y qué impacto tiene. No son backlog
+> genérico: si el motivo deja de ser válido, la entrada debe eliminarse o
+> actualizarse.
 
----
+## 1. Motor de autonomía: diseño aceptado, sin implementación
 
-## 1. El motor de autonomía — solo existe como diseño
+Los ocho ADRs de [`adr/`](adr/) describen Loop, Initiative, Agenda, Trigger,
+Callback, sesión aislada y recuperación al arrancar. No existen todavía los
+módulos que los materializan ni la persistencia que necesitarían.
 
-**Lo más grande que queda en todo el proyecto.**
+**Impacto:** el dashboard puede proyectar autonomía contra un fake, pero no hay
+una fuente real que ejecute Trigger → Initiative → `waiting_human`.
 
-Los 8 ADRs de `docs/adr/` describen un sistema completo: Loop central en el Manager,
-interacción asíncrona con callback, sesión aislada por iniciativa, dispatcher único,
-auto-enqueue solo vía trigger, canal interno de iniciativas, iniciativas `running` que
-fallan al arrancar, y callback que lleva resultado + continuación.
+**Desbloqueo:** implementar el diseño de los ADRs como trabajo de Runtime, sin
+reformular la decisión de arquitectura. No debe confundirse con el chat o con
+el bridge SSE ya operativo.
 
-**Nada de eso tiene implementación.** No existen `loop.ts`, `initiative.ts`, `agenda.ts`
-ni `trigger.ts`.
+## 2. Hardening de Runtime standalone (H01.05/H01.07)
 
-**Qué bloquea:** el E2E de autonomía del dashboard (Trigger → Initiative →
-`waiting_human` → resuelto). El dashboard ya tiene sus proyecciones construidas contra un
-fake, esperando la fuente real.
+El panel ya no conoce ni abre conexiones a los puertos de Runner. Sin embargo,
+el `docker-compose.yml` standalone aún publica `4100-4199` y la imagen base no
+impone por sí sola las restricciones de un User Runtime gestionado.
 
-**Por qué importa el orden:** los ADRs están aceptados y son coherentes entre sí, así que
-el diseño no hay que rehacerlo. Es trabajo de implementación, no de decisión.
+**Impacto:** un actor que alcance la red de ese contenedor puede intentar hablar
+directamente con un Runner, evitando el Manager y su autorización.
 
----
+**Desbloqueo:** cerrar los puertos de Runner en el despliegue standalone y
+endurecer la imagen con usuario no root, capabilities eliminadas y filesystem
+de solo lectura, sin romper el bridge interno Manager → Runner. El Provisioner
+del dashboard ya aplica esa postura para sus User Runtimes; no hay que
+duplicarla en el Manager.
 
-## 2. Hardening del runtime (H01.05, H01.07)
+## 3. Variables `$VAR` de `models.json` no llegan automáticamente al Runner
 
-Un Agent corre y responde, pero **el aislamiento no es el de producción**.
+El Supervisor no hereda el entorno completo del Manager. Eso protege
+`API_TOKEN` y secretos no destinados al Agent, pero un Provider configurado en
+`models.json` como `"apiKey": "$MI_KEY"` solo funcionará si `MI_KEY` se pone
+en el Env Store global o del Agent.
 
-### H01.05 — El Manager como único punto de entrada
+**Impacto:** una instalación que confiaba en herencia de entorno puede recibir
+un error genérico del Runner tras actualizar; el Manager tenía la variable,
+pero el Runner no.
 
-**Falta:** que los puertos del Runner (4100-4199) estén cerrados hacia fuera y su UI no
-sea alcanzable directamente.
+**Desbloqueo:** resolver explícitamente las variables que `models.json`
+referencia y añadir únicamente esas a la allowlist del Runner, o resolverlas
+antes de lanzar el proceso. No se debe deshacer la allowlist completa.
 
-**Estado real:** `/api/v1` ya no filtra esos puertos en ninguna respuesta (verificado),
-pero eso es distinto de que estén cerrados a nivel de red.
+## 4. Herramientas de red en la imagen
 
-**Qué se rompe si sigue así:** alguien con acceso a la red del contenedor puede hablar
-con un Runner saltándose al Manager, y con él toda la autorización.
+La imagen trae `curl`, `git`, `ripgrep`, Node y `uv`/`uvx`; no promete `ping`,
+`dig`, `netcat` o `wget`. En un Runtime gestionado con root filesystem de solo
+lectura, un Agent tampoco puede instalar herramientas del sistema en caliente.
 
-### H01.07 — Imagen non-root, capabilities eliminadas, filesystem read-only
+**Impacto:** un Agent puede intentar instalar una herramienta inexistente y
+fallar. En una política de red que bloquea destinos internos, añadir algunas de
+ellas tampoco daría por sí solo una capacidad útil.
 
-**Falta:** endurecer el `Dockerfile`. Hoy la imagen corre como root.
+**Desbloqueo:** decidir qué herramientas justifican entrar en el Dockerfile y
+documentar para el Agent la política de red efectiva. No instalar paquetes en
+runtime como solución implícita.
 
-**Qué se rompe si sigue así:** el dashboard **no puede declarar verdes sus threat tests
-de egress**, porque no controla esta imagen.
+## 5. Servicio systemd: no es un sandbox
 
----
+`scripts/install.sh` instala un servicio nativo. En su modo por defecto corre
+como root y el Agent puede administrar el host. `--user <nombre>` reduce
+privilegios de sistema, pero conserva red y un `HOME` persistente.
 
-## 3. H01.06 rompe los `models.json` que usan `$VAR`
+**Impacto:** aplicar de forma silenciosa restricciones pensadas para Docker
+cambiaría el producto nativo; no aplicarlas significa que no ofrece aislamiento
+entre Agents.
 
-**Regresión real, encontrada el 2026-07-29 en una instalación de verdad.**
+**Desbloqueo:** si se necesita un tercer perfil nativo acotado, diseñarlo de
+forma explícita con directivas systemd (`ProtectSystem`, `NoNewPrivileges`,
+`CapabilityBoundingSet`, `MemoryMax`, `PrivateTmp`, `IPAddressDeny`) y su
+matriz de capacidades. No mezclarlo con el modo Docker gestionado.
 
-`models.json` admite referenciar la credencial por variable de entorno, que es la
-forma de no escribir un secreto en un fichero:
+## 6. SSE e idempotencia son efímeros
 
-```json
-"providers": { "NaN": { "baseUrl": "…", "apiKey": "$NAN_API_KEY" } }
-```
+`idempotencyKey`, turnos vivos y la asociación con el WebSocket interno viven
+en memoria del Manager. El panel maneja un stream que termina sin evento final
+como "stream perdido" y pide reintento explícito.
 
-El Manager tiene esa variable; **el Runner ya no**. Antes de H01.06 la heredaba
-con el resto del entorno. Ahora la allowlist la corta, `auth.json` está vacío, y
-el turno muere con `INTERNAL_ERROR / "Runner error"` — sin nada en `runner.log`
-que explique por qué.
+**Impacto:** un restart del Manager pierde esas referencias. No existe replay
+SSE ni `Last-Event-ID`; repetir una clave después de ese restart puede volver a
+iniciar el trabajo.
 
-**Qué se rompe si sigue así:** cualquier instalación autoalojada que configure
-sus providers con `$VAR` —que es la práctica recomendada— deja de responder al
-actualizar a v0.4.0 o superior, con un error genérico y sin pista.
+**Desbloqueo:** un buffer/replay durable y una semántica de recuperación entre
+instancias. Es una ampliación de contrato separada: no simular replay
+reintentando automáticamente el POST desde el panel.
 
-**El arreglo no es deshacer H01.06.** Cortar la herencia es correcto: el Runner no
-debe ver `API_TOKEN` ni los secretos de otros Agents. Lo que falta es que el
-Manager **derive de `models.json` qué variables hacen falta** y añada solo esas a
-la allowlist, o que resuelva los `$VAR` antes de arrancar el Runner.
+## 7. Metadatos de la imagen Docker
 
-Así el Runner recibe exactamente las credenciales que su configuración
-referencia, y nada más — que es lo que H01.06 quería decir.
+El `Dockerfile` aún declara una label de versión `0.1.0` y un `source` histórico,
+aunque la release vigente es `v0.6.0` y el workflow de publicación puede añadir
+labels correctas al artefacto distribuido.
 
-**Mientras tanto**, el rodeo es mover esas variables al EnvStore global, que sí
-llega al Runner. El `CHANGELOG` debería decirlo con ese nivel de concreción: no
-"el entorno ya no se hereda", sino "si tu `models.json` usa `$VAR`, muévela al
-EnvStore o el agente dejará de responder".
+**Impacto:** una imagen construida localmente puede exponer metadatos engañosos
+a un operador o a una herramienta de inventario; no cambia la ejecución.
 
----
+**Desbloqueo:** alinear las OCI labels del `Dockerfile` con el repositorio y la
+versión construida, o derivarlas del build de forma reproducible. Es cambio de
+imagen, no una corrección de contrato v1.
 
-## 4. La imagen no trae herramientas de red ni `wget`
+## 8. Diagnóstico de errores de Provider en turnos
 
-**Estado:** un Agent tiene `bash`, `python3`, `node`, `curl`, `git`, `grep`, `sed`,
-`awk`, `find` y `tar`. No tiene `ping`, `dig`, `netcat` ni `wget`.
+Un error del Provider puede llegar desde el Runner como `error`, que el Manager
+traduce a `turn-error` con `INTERNAL_ERROR` y mensaje saneado. El Manager no
+expone el detalle del Provider al caller.
 
-**Por qué importa:** no puede instalarlos. La imagen corre con `ReadonlyRootfs` y
-como usuario `1000:1000`, así que un `apt-get install` falla —comprobado— y eso
-es deliberado: un Agent que ejecuta comandos no debe poder modificarse a sí mismo.
+**Impacto:** el dashboard/panel distinguen un turno fallido de uno terminado,
+pero no siempre pueden diagnosticar si la causa concreta fue cuota, credencial
+o red sin inspeccionar logs del Runtime.
 
-Lo que ocurre hoy es que el Agent intenta instalarlo, falla y **se lo explica al
-usuario**, que es correcto pero desconcertante: parece una limitación accidental
-cuando es una decisión.
+**Desbloqueo:** definir un vocabulario seguro de errores de Provider, registrarlo
+en el origen y propagar solo códigos/mensajes permitidos. Nunca reenviar el
+texto crudo de Provider o Runner.
 
-**Qué lo desbloquea:** decidir qué herramientas merecen estar y añadirlas al
-`Dockerfile`. Es una línea, queda auditable y no debilita nada.
+## Decisiones que no se deben deshacer accidentalmente
 
-La pregunta previa es si hacen falta: con la Network Policy activa —bloquea
-`10/8`, `172.16/12`, `192.168/16` y el rango de metadata— casi todo lo que un
-`ping` probaría está bloqueado de todos modos, así que la herramienta diría "no
-hay ruta" sin explicar por qué. Si se añaden, conviene que el Agent sepa **que
-existe una política de red**, no solo que el comando falla.
-
-## 5. El servicio nativo no acota al agente, y es deliberado
-
-**Estado:** `scripts/install.sh` instala pihub como servicio de systemd. Por
-defecto el agente corre como **root y es dueño de la máquina**: administra el
-sistema, instala paquetes, abre conexiones y entra por SSH a otros equipos.
-
-**Por qué no es un defecto:** es el producto. Quien instala pihub en su servidor
-quiere un agente que administre ese servidor — la promesa de aislamiento es la
-del contenedor, no la de esta vía. `--user <nombre>` da el punto intermedio: sin
-privilegios de sistema, conservando red y `HOME`.
-
-**Lo que queda pendiente de verdad**, si algún día se quiere un tercer perfil:
-`systemd` tiene primitivas equivalentes a las de Docker —`ProtectSystem=strict`,
-`NoNewPrivileges=yes`, `CapabilityBoundingSet=`, `MemoryMax=`, `PrivateTmp=yes`,
-`IPAddressDeny=`— así que un modo "nativo pero acotado" es alcanzable sin
-contenedor. No se hace ahora porque cada una de esas primitivas recorta lo que
-los agentes pueden hacer, y este modo existe justamente para no recortarlo.
-
-**Lo que sí hay que vigilar:** que una decisión de aislamiento pensada para el
-contenedor no se aplique en silencio a esta vía. Ya pasó una vez — ver §3, donde
-`H01.06` rompió los `models.json` con `$VAR` de las instalaciones autoalojadas.
-
-## 6. Deuda menor, identificada
-
-| Qué | Por qué se dejó | Impacto |
-|---|---|---|
-| El `LABEL` del `Dockerfile` apunta a `earendil-works/goguest_agent_pi` | Es un repo que ya no es este | Ninguno: las labels del workflow ganan y la imagen publicada lleva el `source` correcto |
-| El workflow publica un tag `latest` | `metadata-action` lo añade por defecto | Inocuo, el dashboard fija por digest — pero contradice la intención declarada |
-| No hay `.dockerignore` | Nunca se necesitó | El contexto de build carga `.git` de más; solo velocidad |
-| `totalTokens` va a 0 en `turn-complete` | El Runner no reporta consumo | Un número inventado sería peor para calcular coste aguas arriba |
-| La rotación de credencial no rota de verdad | Rotar exige reiniciar el Manager con el valor nuevo en el entorno | La ruta valida y responde `RESOURCE_UNAVAILABLE` con el motivo; aceptar el cambio en memoria daría una falsa sensación de haber rotado |
-| `contract-red` fuera de `npm test` | Necesita un Manager arrancado | Tiene su propio script; correrlo antes de cerrar cualquier cambio en `/api/v1` |
-
-### Un error del Provider debe terminar el turno como `turn-error`
-
-**Falta:** que un turno que muere por un error del Provider emita `turn-error` con su
-código, en vez de `turn-complete` sin contenido.
-
-**Por qué no está hecho:** requiere una task H con su release y digest compatibles; esta
-anotación deja fuera el cambio de código.
-
-**Caso real verificado en T12:** el Provider respondió `HTTP 402` con el mensaje claro
-`You've reached the monthly token limit for deepseek-v4-flash. The counter resets on the
-1st.` (`type: monthly_cap_reached`). El dashboard tenía credencial válida y otros Models
-(`gemma4`, `mimo-v2.5` y `qwen3.6`) respondían correctamente; el límite es mensual y por
-Model, no falta de saldo general.
-
-Pero ese error no deja rastro en la cadena: los logs del contenedor no lo mencionan, el
-`runner.log` persistido queda vacío y el Manager emite `agent_end` sin texto. El dashboard
-solo recibe “el runtime terminó el turno sin devolver contenido”. El Runner también debe
-registrar el error del Provider, además de propagarlo como `turn-error`.
-
-**Qué se rompe si sigue así:** el dashboard no puede distinguir entre “el modelo no tenía
-nada que decir” y “la llamada al Provider falló”, y el smoke tampoco puede diagnosticar
-la causa. Mientras el error se pierda en origen, ningún diagnóstico basado en logs puede
-funcionar: reordenar el clasificador del smoke no arregla este caso porque el `402` nunca
-se escribe.
-
----
-
-## Decisiones que conviene no deshacer sin leer
-
-### El error del panel conserva el campo `error`
-
-El 401 del guard de `/api/*` lleva **a la vez** el envelope nuevo (`code`, `message`,
-`correlationId`) y el `error` de siempre. `panel.js` solo mira `res.status` para el
-login, **pero sí lee `body.error`** en subida de ficheros, instalación de paquetes y env:
-sin el campo mostraría `undefined`. Es aditivo, nunca sustitutivo.
-
-### El build construye `shared` primero, explícitamente
-
-`npm run build --workspaces` respeta el orden **alfabético** (cli, manager, …, shared),
-no el de dependencias. Como `@pihub/shared` apunta sus tipos a `dist/index.d.ts`, el
-manager compilaba antes de que esos `.d.ts` existieran: 15 errores `TS2307`.
-
-En local no se veía porque `packages/*/dist` ya estaba de builds anteriores. **Docker
-siempre parte limpio, así que la imagen nunca se había podido construir.** Si alguien
-"simplifica" ese script, el build de la imagen vuelve a romperse.
-
-### `/api/v1` se monta ANTES del guard del panel
-
-El `app.use("/api/*")` del panel casa también con `/api/v1/*`. Si el router se montara
-después, una petición sin credencial a `/api/v1` devolvería el envelope viejo y los
-contract tests fallarían.
-
-### El ejemplo de la spec §4.3 ya no muestra `ports.runner`
-
-Contradecía su propia §7. Se resolvió a favor de la prohibición: el dashboard nunca habla
-con el Runner, así que ese puerto no le sirve de nada y solo filtra topología interna.
+- El panel usa `/api/v1`, cookie same-origin y CSRF; no recibe el Bearer en
+  JavaScript ni abre un WebSocket hacia un Runner.
+- Las rutas `/api/*` siguen por compatibilidad del CLI actual. El panel no las
+  usa y no deben recibir capacidad nueva.
+- `/api/v1` se registra antes del guard legacy `/api/*`, porque ese patrón
+  también coincide con el prefijo versionado.
+- Las lecturas de env devuelven claves, nunca valores. El store global y el del
+  Agent se mantienen separados.
+- La build raíz compila `shared` antes de los demás workspaces; Docker parte de
+  un árbol limpio y detecta el orden incorrecto.
+- `totalTokens: 0` en `turn-complete` es deliberado mientras el Runner no mida
+  consumo real; un número inventado sería peor.

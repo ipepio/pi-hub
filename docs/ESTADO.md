@@ -1,98 +1,92 @@
 # Estado de pihub
 
-> Última verificación: **2026-07-27**, versión **v0.5.0**. Comprobado ejecutando.
+> Última verificación: **2026-07-30** · versión **v0.6.0** · commit
+> `fde0ecd`. Comprobado ejecutando la suite local.
 
-## Qué funciona
+## Verificado
 
 | Capacidad | Estado |
 |---|---|
-| Manager REST (Hono) + panel web | Funciona |
-| Runner por agente con streaming | Funciona |
-| Memoria persistente (`memory_save`/`memory_read`, Shared Memory) | Funciona |
-| Telegram, voz (STT/TTS), CLI, OAuth | Funciona |
-| **Interfaz privada `/api/v1`** | Funciona — **contract-red 10/10** |
-| **Turno real por SSE** | Funciona end-to-end |
+| Manager HTTP (Hono), Supervisor y panel web | Funciona |
+| Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
+| API privada `/api/v1` | Funciona |
+| Panel migrado a `/api/v1` | Funciona: cookie + CSRF, sin token Bearer en browser |
+| Chat del panel por HTTP/SSE | Funciona: Manager → WS interno del Runner |
+| Eventos `basic` y `verbose`, incluida cancelación | Funciona |
+| CRUD, ciclo de vida, env, paquetes, uploads, transcribe y OAuth v1 | Funciona |
+| Instalación Docker y servicio systemd | Funciona |
 
-`npm test` → **63/63**. `npm run typecheck` limpio. `npm run test:contract-red` → **10/10**
-(requiere el Manager arrancado).
-
-## Los dos escenarios
-
-pihub sirve **dos modos con el mismo código**, y nunca coexisten:
-
-| Modo | Cómo | Superficie de configuración |
-|---|---|---|
-| **Gobernado por el dashboard** | `PIHUB_PANEL_ENABLED=false` | Solo `/api/v1` — el panel no se monta |
-| **Standalone** | por defecto | El panel web, sin dashboard |
-
-Por eso no hay problema de doble fuente de verdad: la configuración se toca desde un
-sitio o desde el otro, nunca desde los dos a la vez.
-
-**Ningún cambio puede romper el modo standalone.** Las rutas `/api/*` y el panel siguen
-funcionando igual que antes de que existiera `/api/v1`.
-
-## `/api/v1` — la frontera con el dashboard
-
-El contrato completo está en [`manager-api-v1.md`](manager-api-v1.md). Lo esencial:
-
-- **Service auth** con vocabulario estable: `MISSING_AUTH` (no mandaste credencial) es
-  distinto de `INVALID_AUTH` (la mandaste y no vale). No acepta cookie: el panel y el
-  servicio son credenciales distintas.
-- **Error envelope** `{ code, message, correlationId }` con catálogo cerrado.
-  `INTERNAL_ERROR` nunca lleva el detalle real al caller.
-- **Turnos** con `turnId`, `idempotencyKey` y `correlationId` obligatorios. Repetir una
-  `idempotencyKey` devuelve el turno original **sin re-ejecutar**.
-- **Channel Sessions aisladas** por `sessionKey`: cada clave tiene su `ChatHub`,
-  `AgentSession` y transcript; reabrir la misma clave reanuda contexto y dos claves
-  distintas no lo comparten.
-- **No se filtra nada interno**: ni paths (`/data`), ni puertos de Runner (4100-4199),
-  ni el token de servicio.
-
-### El turno es un puente WebSocket → SSE
-
-El Runner **no tiene endpoint HTTP de chat**: solo acepta prompts por WebSocket (`/ws`).
-Y la spec §7 prohíbe exponer WebSockets al dashboard. Así que el Manager abre el WS
-contra su Runner y traduce cada mensaje:
-
-```
-agent_start  → turn-start
-text_delta   → chunk
-agent_end    → turn-complete
-error        → turn-error   (código estable, nunca el texto crudo del Runner)
+```text
+npm run typecheck  # limpio
+npm test           # 197 tests passed
 ```
 
-`thinking_delta` y las tools **no se reenvían**: no están en el vocabulario del
-dashboard, y mapearlas a `chunk` mezclaría razonamiento con respuesta. Un tipo
-desconocido se ignora en vez de cortar el turno.
+`npm run test:contract-red --workspace packages/manager` sigue siendo una
+verificación separada contra un Manager real; no forma parte de `npm test`.
 
-## Imagen publicada
+## Modos de Runtime
 
-```
-ghcr.io/ipepio/pi-hub@sha256:f6851b50b5b629f233f4444b759b758955ff617d380e244d4386f58e99ef9a3b
-```
+| Modo | Configuración | Administración | Panel |
+|---|---|---|---|
+| **Gobernador** | `PIHUB_PANEL_ENABLED=true` | Operador local | Montado |
+| **Gobernado** | `PIHUB_PANEL_ENABLED=false` | Dashboard/control plane externo | No montado |
 
-Pública (verificado con `docker logout` + `docker pull` anónimo). Se publica sola al
-empujar un tag `v*`:
+Ambos usan el mismo Manager y `/api/v1`; solo cambia quién posee la superficie
+humana. El modo se selecciona con el instalador (`--governor`/`--governed`) o
+editando `PIHUB_PANEL_ENABLED` y reiniciando el Manager.
 
-```bash
-git tag v0.3.0 && git push origin v0.3.0
-```
+## Frontera HTTP
 
-El digest sale en el último paso del job y es lo que el dashboard debe fijar.
+`/api/v1` es la interfaz vigente para el dashboard y el panel:
 
-## Cómo levantarlo
+- Bearer es la autenticación de servicio. El panel usa cookie same-origin y
+  CSRF en mutaciones; un Bearer inválido nunca cae como fallback a una cookie.
+- El Manager es el puente: abre el WebSocket interno hacia el Runner y expone
+  turnos como SSE.
+- El perfil `basic` entrega ciclo de vida y respuesta. `verbose`, usado por el
+  panel, añade thinking y herramientas saneadas.
+- `turnId`, `sessionKey`, `idempotencyKey` y `correlationId` son obligatorios
+  para un turno. La idempotencia y turnos vivos son por instancia de Manager.
+- Ninguna respuesta v1 contiene tokens, valores de env, PID, puertos de Runner,
+  paths internos ni el texto crudo de un Runner.
+- Las rutas legacy `/api/*` permanecen para compatibilidad con el CLI actual,
+  pero el panel ya no las llama y no son el destino de nuevas integraciones.
 
-```bash
-docker compose up -d --build     # Manager en :4000
-npm test                         # suite completa
-npm run test:contract-red --workspace packages/manager   # contra el Manager arrancado
-```
+La referencia completa, incluidos métodos, payloads, SSE y errores, está en
+[`manager-api-v1.md`](manager-api-v1.md).
 
-## Dónde está cada cosa
+## Runtime e instalación
 
-| Necesitas | Mira |
+- **Docker:** imagen Ubuntu 24.04 con Node 22, pi `0.80.3`, `uv`/`uvx` y
+  volumen `/data`. El Provisioner del dashboard es quien añade aislamiento
+  fuerte a sus User Runtimes.
+- **Servicio systemd:** `scripts/install.sh` instala código en `/opt/pihub`,
+  datos en `/var/lib/pihub` y configuración en `/etc/pihub/pihub.env`. En root
+  el Agent administra la máquina; `--user <nombre>` reduce privilegios pero no
+  convierte el servicio en un sandbox.
+- **Supervisor:** reinicia un Runner que cae hasta cinco veces en 60 segundos
+  con backoff; después lo marca `errored`.
+
+## Lo que no cambia ni está terminado
+
+- El motor de autonomía (Loop, Agenda, Initiative y Trigger) sigue siendo
+  diseño aceptado, no código.
+- El `docker-compose.yml` standalone aún publica los puertos de Runner. El
+  panel no los usa, pero cerrarlos es hardening pendiente.
+- La limitación de `$VAR` en `models.json` para un Runner aislado sigue abierta.
+- El contrato publicado no ofrece replay durable de SSE ni idempotencia tras un
+  reinicio del Manager.
+
+Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md).
+
+## Dónde encontrar cada cosa
+
+| Necesidad | Documento |
 |---|---|
-| Por qué el sistema es como es | [`docs/adr/`](adr/) — 8 decisiones |
-| El contrato con el dashboard | [`docs/manager-api-v1.md`](manager-api-v1.md) |
-| Qué queda por hacer y por qué | [`docs/PENDIENTE.md`](PENDIENTE.md) |
-| Lenguaje del dominio | [`CONTEXT.md`](../CONTEXT.md) |
+| Instalar, operar y entender los modos | [`../README.md`](../README.md) |
+| Contribuir y probar | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
+| Métodos y contrato HTTP | [`manager-api-v1.md`](manager-api-v1.md) |
+| Resultado de la migración del panel | [`design-fase-4-panel-api-v1.md`](design-fase-4-panel-api-v1.md) |
+| Límites, deuda y roadmap | [`PENDIENTE.md`](PENDIENTE.md) |
+| Vocabulario | [`../CONTEXT.md`](../CONTEXT.md) |
+| Diseño de autonomía pendiente | [`adr/`](adr/) |

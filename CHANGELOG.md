@@ -5,8 +5,18 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-30
+
 ### Added
 
+- **Panel sobre `/api/v1`**: el panel usa la API versionada con cookie
+  same-origin y CSRF; ya no abre WebSockets hacia Runners ni conoce sus
+  puertos. El chat usa HTTP/SSE y solicita el perfil `verbose` para mostrar
+  thinking y tools saneadas.
+- **Paridad v1 para el panel**: operaciones atómicas de env y paquetes de
+  Agent/global, commands, transcribe, OAuth, `GET /agents/:name`, modelo
+  opcional al crear, lifecycle con guard de turno vivo y abort con terminal
+  `turn-aborted`.
 - **Instalación como servicio**: `sudo ./scripts/install.sh` instala pihub como
   unidad de systemd en Debian/Ubuntu — arranca con la máquina, se reinicia si
   cae, y deja el código en `/opt/pihub`, los datos en `/var/lib/pihub` y la
@@ -27,6 +37,9 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ### Changed
 
+- **Contrato de control**: `/api/v1` es la superficie vigente para panel y
+  dashboard. Las rutas `/api/*` se conservan de forma temporal para el CLI
+  actual; no son el destino de integraciones nuevas.
 - **Aislamiento del Runner**: los Runners arrancados por el Manager ya no heredan
   el entorno completo del contenedor. Solo reciben variables de sistema necesarias,
   los Env Stores global y del Agent (con precedencia Agent > global) y las variables

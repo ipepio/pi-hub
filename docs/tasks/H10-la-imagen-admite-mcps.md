@@ -1,5 +1,9 @@
 # H10 — Que la imagen admita MCPs y skills de verdad
 
+> **Estado: completada.** La imagen actual incluye `uv`/`uvx` y fija `HOME`
+> dentro del volumen persistente `/data/home`; se mantiene en `v0.6.0`.
+> Esta task conserva el análisis y los criterios originales como historial.
+
 ## Goal
 
 Que un Agent dentro del contenedor pueda **instalar y ejecutar** MCPs y skills,

@@ -1,124 +1,137 @@
 # Contribuir a pihub
 
-Gracias por tu interés en contribuir a pihub. Este documento describe cómo
-desarrollar, probar y enviar cambios al proyecto.
+pihub es un monorepo TypeScript que ejecuta Agents persistentes sobre pi. Antes
+de modificar una interfaz visible, lee [`CONTEXT.md`](CONTEXT.md), la referencia
+[`docs/manager-api-v1.md`](docs/manager-api-v1.md) y los ADRs aplicables.
 
-## Requisitos previos
+## Requisitos
 
-- **Node.js ≥ 22** (`node -v` debe mostrar v22+)
-- **pi CLI** global: `npm i -g --ignore-scripts @earendil-works/pi-coding-agent`
-- **Git**
-- (Opcional) **Docker** para probar el contenedor completo
-
-## Estructura del monorepo
-
-```
-goguest_agent_pi/
-├── packages/
-│   ├── shared/          # Tipos, env, auth, memoria, prompt — biblioteca compartida
-│   ├── manager/         # API REST + supervisor de runners + panel web
-│   ├── runner/          # Proceso por agente: chat WS, Telegram, STT/TTS
-│   ├── cli/             # CLI `pihub` (cliente fino de la API del manager)
-│   └── memory-extension/# Extensión pi de memoria persistente (se copia raw al volumen)
-├── docs/
-│   ├── adr/             # Decisiones de arquitectura (Architecture Decision Records)
-│   ├── design-brief.md  # Brief de diseño UI
-│   └── specs/           # Especificaciones de features
-├── agents.example.json  # Manifiesto de provisión declarativa
-├── models.example.json  # Plantilla de modelos custom
-├── .env.example         # Variables de entorno documentadas
-├── Dockerfile
-└── docker-compose.yml
-```
-
-## Desarrollo local (sin Docker)
+- Node.js **22 o superior**.
+- npm (el lockfile es `package-lock.json`).
+- pi CLI `@earendil-works/pi-coding-agent@0.80.3` para ejecutar un Runtime real.
+- Docker, opcional pero necesario para verificar la imagen/Manager real.
 
 ```bash
-# Instalar dependencias
-npm install --ignore-scripts
-
-# Compilar todos los paquetes
+npm ci --ignore-scripts
 npm run build
-
-# Typecheck completo
 npm run typecheck
-
-# Ejecutar tests
 npm test
+```
 
-# Arrancar el manager (requiere `pi` en el PATH)
+La suite usa `node --test --experimental-strip-types`. El build compila primero
+`@pihub/shared`: no sustituyas el script raíz por un `--workspaces` plano, ya
+que npm no garantiza el orden de dependencias y el Manager necesita los tipos
+generados por `shared`.
+
+## Estructura
+
+```text
+packages/
+  shared/            tipos, env, almacenamiento, memoria, auth y helpers pi
+  manager/           Manager HTTP, API /api/v1, Supervisor y panel web
+  runner/            proceso por Agent, WS interno, Telegram, STT/TTS
+  cli/               cliente administrativo de compatibilidad
+  memory-extension/  extensión pi de memoria persistente
+scripts/
+  install.sh          instalación systemd para Debian/Ubuntu
+  uninstall.sh        retirada conservadora o con --purge
+docs/
+  manager-api-v1.md   contrato vigente Manager ↔ dashboard/panel
+  ESTADO.md           capacidades verificadas
+  PENDIENTE.md        límites y deuda explícita
+  adr/                diseño aceptado del Loop de autonomía pendiente
+```
+
+## Ejecutar localmente
+
+```bash
+# Requiere pi en PATH y un directorio de datos escribible.
 PIHUB_DATA_DIR=./data API_TOKEN=dev npm start
 ```
 
-El manager arranca en `:4000` por defecto. Los runners se asignan puertos
-4100-4199.
+El Manager escucha en `:4000` por defecto. En modo gobernador
+(`PIHUB_PANEL_ENABLED=true`) sirve el panel; el panel llama a `/api/v1` con una
+cookie same-origin y CSRF. En modo gobernado (`false`) no se sirve el panel y
+un control plane usa Bearer contra `/api/v1`.
 
-### Modo desarrollo con auto-rebuild
-
-Para desarrollo iterativo, compila en modo watch un paquete a la vez:
+Para iterar sin Docker, compila los paquetes que cambies en otra terminal:
 
 ```bash
-# Terminal 1: shared (se compila primero, otros dependen de él)
-cd packages/shared && npx tsc -p tsconfig.json --watch
-
-# Terminal 2: manager
-cd packages/manager && npx tsc -p tsconfig.json --watch
+npx tsc -p packages/shared/tsconfig.json --watch
+npx tsc -p packages/manager/tsconfig.json --watch
 ```
 
-## Tests
-
-Los tests usan el runner nativo de Node (`node --test`) con
-`--experimental-strip-types` para ejecutar TypeScript directamente.
+## Pruebas y contrato externo
 
 ```bash
-# Todos los tests
 npm test
+npm run typecheck
 
-# Tests de un paquete
-node --test --experimental-strip-types packages/shared/test/*.test.js
-node --test --experimental-strip-types packages/manager/test/*.test.js
+# Requiere un Manager real arrancado y API_TOKEN disponible.
+npm run test:contract-red --workspace packages/manager
 ```
 
-## Reglas de contribución
+Los unit tests no sustituyen `contract-red`: la frontera con el dashboard es
+HTTP y SSE contra un Manager real. Si cambias `/api/v1`, auth, streaming,
+multipart, ciclo de vida o serialización, actualiza la spec y ejecuta ambos.
 
-1. **Rama de trabajo**: crear una rama descriptiva (`feat/memory-access-levels`,
-   `fix/telegram-reconnect`, etc.).
+## Reglas de diseño
 
-2. **Commits**: seguir [Conventional Commits](https://www.conventionalcommits.org/):
-   - `feat:` nueva funcionalidad
-   - `fix:` corrección de bug
-   - `docs:` cambios en documentación
-   - `refactor:` reestructuración sin cambio de comportamiento
-   - `test:` añadir o modificar tests
-   - `chore:` tareas de mantenimiento
+1. **Manager como frontera.** El panel y el dashboard nunca conocen puerto,
+   PID, path ni WebSocket de un Runner. El Manager es el único puente hacia el
+   Runner.
+2. **`/api/v1` primero.** Toda capacidad nueva de control se diseña y prueba
+   en la interfaz versionada. `/api/*` es compatibilidad para el CLI actual,
+   no una superficie donde añadir producto nuevo.
+3. **Auth explícita.** Bearer es para servicios. La cookie de panel solo sirve
+   same-origin y cada mutación exige CSRF. No expongas `API_TOKEN` al browser,
+   URL, logs ni mensajes de error.
+4. **Errores cerrados.** Los callers reciben el envelope versionado y un código
+   del catálogo; no reciben texto crudo de Runner, stacks, puertos ni paths.
+5. **Estado declarativo e imperativo.** `PATCH` converge configuración y solo
+   reinicia cuando cambia la huella efectiva. `start`/`stop`/`restart` son
+   comandos explícitos. Nunca cortes un turno vivo: usa `TURN_IN_PROGRESS`.
+6. **Secretos por env store.** El Runner no hereda el entorno completo del
+   Manager. Los valores no se exponen en lecturas; las claves protegidas no se
+   pueden escribir.
+7. **Compatibilidad de Runtime.** No cambies la versión de pi ni su interfaz
+   sin declarar la compatibilidad de imagen y dashboard.
 
-3. **Tipado**: el proyecto es estrictamente tipado (`strict: true`). No usar
-   `any`; preferir tipos propios o `unknown` + narrowing.
+## Cambios y commits
 
-4. **No romper la API pública**: si un cambio modifica tipos de `@pihub/shared`,
-   actualizar todos los paquetes consumidores en el mismo commit/PR.
+- Crea una rama descriptiva.
+- Sigue Conventional Commits: `feat:`, `fix:`, `docs:`, `test:`, `refactor:` o
+  `chore:`.
+- Mantén TypeScript estricto: no uses `any`; estrecha `unknown`.
+- Todo bug lleva un test que demuestra el comportamiento. Toda capacidad nueva
+  se prueba por su interfaz pública, no accediendo a internals.
+- Actualiza `README.md`, `.env.example`, `docs/manager-api-v1.md`,
+  `docs/ESTADO.md`, `docs/PENDIENTE.md` o ADRs cuando cambie lo que un operador,
+  dashboard o Agent observa.
 
-5. **Tests**: toda funcionalidad nueva debe incluir tests. Los bugs deben incluir
-   un test que falle antes del fix y pase después.
+Antes de proponer un cambio:
 
-6. **Documentación**: actualizar README, `.env.example` o ADRs si el cambio
-   afecta a la interfaz visible (API, CLI, env vars, tipos).
+```bash
+npm run build
+npm run typecheck
+npm test
+```
 
-## Arquitectura — Decisiones clave
+Para cambios de composición, Docker o `/api/v1`, añade además el Manager real
+con `npm run test:contract-red --workspace packages/manager`.
 
-El proyecto documenta sus decisiones de arquitectura en
-[`docs/adr/`](docs/adr/). Lee los ADRs existentes antes de proponer cambios
-arquitectónicos significativos. Si tu PR introduce una nueva decisión, crea un
-ADR siguiendo el formato establecido.
+## Instalación de producción
 
-## Proceso de Pull Request
+El instalador nativo solo soporta Debian/Ubuntu con systemd:
 
-1. Asegurar que `npm run typecheck` y `npm test` pasan.
-2. Abrir PR contra `main` con descripción clara del cambio.
-3. Referenciar issues si existen (`Fixes #123`).
-4. El PR será revisado; puede requerir cambios menores.
+```bash
+sudo ./scripts/install.sh --governor
+sudo ./scripts/install.sh --governed
+sudo ./scripts/install.sh --user pihub
+```
 
-## Licencia
-
-Al contribuir, aceptas que tus contribuciones se licencien bajo la
-[MIT License](LICENSE) del proyecto.
+No supongas que el servicio native tiene la postura de seguridad del Runtime
+Docker gestionado. En root, el Agent administra la máquina. En `--user`, pierde
+privilegios de sistema, pero sigue teniendo red y `HOME`. Lee el README y
+`packaging/pihub.service` antes de endurecer systemd: cada directiva de
+aislamiento cambia las capacidades del producto.
