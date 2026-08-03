@@ -178,6 +178,38 @@ export class Supervisor {
     for (const name of names) await this.restart(name);
   }
 
+  /**
+   * Recarga el estado de credenciales en todos los Runners sin reiniciarlos.
+   * El Runner responde 202 mientras tiene un turno vivo; se reintenta de forma
+   * acotada para no cortar una respuesta normal ni conservar una revocación
+   * indefinidamente en un proceso activo.
+   */
+  async reloadProviderState(): Promise<void> {
+    const agents = await listAgents(this.env.dataDir);
+    await Promise.all(
+      agents
+        .filter((agent) => agent.enabled && this.isRunning(agent.name))
+        .map((agent) => this.reloadProviderStateFor(agent)),
+    );
+  }
+
+  private async reloadProviderStateFor(config: AgentConfig): Promise<void> {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${config.port}/api/providers/reload`, {
+          method: "POST",
+          headers: this.env.apiToken ? { authorization: `Bearer ${this.env.apiToken}` } : {},
+        });
+        if (response.status === 200) return;
+        if (response.status !== 202) return;
+      } catch {
+        // Runner may still be starting; the next attempt is safe and idempotent.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    console.warn(`[supervisor] no se pudo recargar credenciales del Agent ${config.name}`);
+  }
+
   state(name: string): { state: AgentRunState; pid?: number } {
     const managed = this.processes.get(name);
     if (!managed) return { state: "stopped" };

@@ -2,13 +2,11 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
-  AuthStorage,
   DefaultResourceLoader,
-  ModelRegistry,
   SessionManager,
-  createAgentSession,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
+import { createRuntimeProviders, type ResolvedRuntimeModel } from "@pihub/providers";
 import {
   agentPaths,
   dataPaths,
@@ -22,7 +20,7 @@ import {
   type PihubEnv,
 } from "@pihub/shared";
 
-export type ResolvedModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
+export type ResolvedModel = ResolvedRuntimeModel;
 
 /**
  * Convierte una identidad de Channel Session en un directorio estable que
@@ -35,8 +33,7 @@ export function sessionStorageDirectory(sessionsDir: string, sessionKey: string)
 
 /** Crea AgentSessions del agente con system prompt (SYSTEM.md + memoria) y modelo configurados. */
 export class SessionFactory {
-  readonly authStorage: AuthStorage;
-  readonly modelRegistry: ModelRegistry;
+  readonly runtimeProviders: ReturnType<typeof createRuntimeProviders>;
   readonly paths: AgentPaths;
   private readonly globalDir: string;
 
@@ -51,20 +48,21 @@ export class SessionFactory {
       ? { ...agent, sessionsDir: sessionStorageDirectory(agent.sessionsDir, sessionKey) }
       : agent;
     this.globalDir = dataPaths(env.dataDir).globalDir;
-    this.authStorage = AuthStorage.create(path.join(this.globalDir, "auth.json"));
-    this.modelRegistry = ModelRegistry.create(this.authStorage, path.join(this.globalDir, "models.json"));
+    this.runtimeProviders = createRuntimeProviders({
+      dataDir: env.dataDir,
+      agentName: config.name,
+      oauthProviders: env.oauthProviders,
+    });
   }
 
   forSession(sessionKey: string): SessionFactory {
     return new SessionFactory(this.env, this.config, sessionKey);
   }
 
-  resolveModel(spec?: string): ReturnType<ModelRegistry["find"]> {
+  async resolveModel(spec?: string): Promise<ResolvedModel | undefined> {
     const raw = spec ?? this.config.model;
     if (!raw) return undefined;
-    const slash = raw.indexOf("/");
-    if (slash < 0) return undefined;
-    return this.modelRegistry.find(raw.slice(0, slash), raw.slice(slash + 1));
+    return this.runtimeProviders.resolveModel(raw);
   }
 
   /**
@@ -91,14 +89,8 @@ export class SessionFactory {
   }
 
   /** Modelos disponibles (models.json + built-ins de pi) con su estado de credenciales. */
-  listModels(): ModelInfo[] {
-    this.modelRegistry.refresh();
-    return this.modelRegistry.getAll().map((model) => ({
-      provider: model.provider,
-      id: model.id,
-      name: model.name,
-      configured: this.modelRegistry.hasConfiguredAuth(model),
-    }));
+  async listModels(): Promise<ModelInfo[]> {
+    return (await this.runtimeProviders.snapshot()).models;
   }
 
   private async memorySection(): Promise<string> {
@@ -136,17 +128,14 @@ export class SessionFactory {
     });
     await loader.reload();
 
-    const model = overrideModel ?? this.resolveModel();
-    const { session } = await createAgentSession({
+    const model = overrideModel ?? (await this.resolveModel());
+    return this.runtimeProviders.createSession({
       cwd: this.paths.workspaceDir,
       agentDir: this.globalDir,
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
       ...(model ? { model } : {}),
       ...(this.config.thinkingLevel ? { thinkingLevel: this.config.thinkingLevel } : {}),
       resourceLoader: loader,
       sessionManager: SessionManager.create(this.paths.workspaceDir, this.paths.sessionsDir),
     });
-    return session;
   }
 }

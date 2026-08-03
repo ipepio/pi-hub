@@ -74,6 +74,12 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
     }),
   );
 
+  app.post("/api/providers/reload", async (c) => {
+    if (hub.isStreaming) return c.json({ status: "deferred" }, 202);
+    await factory.runtimeProviders.apply({ type: "refresh" });
+    return c.json({ status: "reloaded" });
+  });
+
   app.post("/api/session/new", async (c) => c.json({ sessionId: await hub.newSession() }));
 
   // --- Comandos del agente: skills y prompt templates instalados ---
@@ -120,9 +126,9 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
   });
 
   // --- Modelos disponibles (solo lectura; los providers se gestionan por env/archivos/CLI) ---
-  app.get("/api/models", (c) =>
+  app.get("/api/models", async (c) =>
     c.json({
-      models: factory.listModels(),
+      models: await factory.listModels(),
       current: hub.modelId ?? null,
       default: config.model ?? null,
     }),

@@ -6,7 +6,7 @@ import {
   scaffoldGlobalDirs,
   type PihubEnv,
 } from "@pihub/shared";
-import { memoryExtensionSource, modelsSeedFile } from "./paths.js";
+import { memoryExtensionSource } from "./paths.js";
 
 async function exists(file: string): Promise<boolean> {
   return fs
@@ -27,18 +27,12 @@ async function installedPackages(settingsFile: string): Promise<Set<string>> {
   }
 }
 
-/** Prepara /data en el arranque: dirs, seed de models.json, extensión de memoria y stack global. */
+/** Prepara /data en el arranque: dirs, extensión de memoria y stack global. */
 export async function bootstrap(env: PihubEnv): Promise<void> {
   const paths = await scaffoldGlobalDirs(env.dataDir);
 
-  // Seed de models.json desde el repo (PIHUB_OVERWRITE_MODELS manda sobre el volumen)
-  const modelsTarget = path.join(paths.globalDir, "models.json");
-  if (await exists(modelsSeedFile)) {
-    if (env.overwriteModels || !(await exists(modelsTarget))) {
-      await fs.copyFile(modelsSeedFile, modelsTarget);
-      console.log(`[bootstrap] models.json seeded en ${modelsTarget}`);
-    }
-  }
+  // El RuntimeProviders Module prepara models.json antes de esta fase; bootstrap
+  // solo conserva la infraestructura global, memoria y paquetes.
 
   // Extensión de memoria: se sincroniza siempre con la versión de la imagen
   const memoryTarget = path.join(paths.globalDir, "extensions", "pihub-memory.ts");

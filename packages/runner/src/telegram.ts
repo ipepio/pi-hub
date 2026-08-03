@@ -73,7 +73,7 @@ export function startTelegram(
       await ctx.reply("Uso: /model proveedor/id — p.ej. /model anthropic/claude-sonnet-5");
       return;
     }
-    const model = factory.resolveModel(spec);
+    const model = await factory.resolveModel(spec);
     if (!model) {
       await ctx.reply(`No conozco el modelo "${spec}". Formato: proveedor/id`);
       return;

@@ -27,6 +27,7 @@ import {
 import type { Supervisor } from "./supervisor.js";
 import type { OAuthService } from "./oauth.js";
 import { listModels } from "./models.js";
+import { createRuntimeProviders, type RuntimeProviders } from "@pihub/providers";
 import { panelDir } from "./paths.js";
 import {
   createApiV1Router,
@@ -83,8 +84,15 @@ const envUnsetSchema = z.object({
   agent: z.string().optional(),
 });
 
-export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthService): Hono {
+export function createApi(
+  env: PihubEnv,
+  supervisor: Supervisor,
+  oauth: OAuthService,
+  runtimeProviders?: RuntimeProviders,
+): Hono {
   const app = new Hono();
+  const providers =
+    runtimeProviders ?? createRuntimeProviders({ dataDir: env.dataDir, oauthProviders: env.oauthProviders });
 
   app.post("/auth/session", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { token?: string };
@@ -104,7 +112,7 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
   // resuelve en orden de registro, así que registrar el router primero deja
   // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
   // ruta `/api/*` del panel.
-  app.route("/api/v1", createApiV1Router(env, supervisor, oauth));
+  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers));
 
   app.use("/api/*", async (c, next) => {
     const authorization = c.req.header("authorization");
@@ -140,9 +148,9 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
   });
 
   // --- Modelos disponibles (solo lectura) ---
-  app.get("/api/models", (c) => {
+  app.get("/api/models", async (c) => {
     try {
-      return c.json({ models: listModels(env) });
+      return c.json({ models: await listModels(providers) });
     } catch (error) {
       console.error("[manager] error listando modelos:", error);
       return c.json({ models: [] });
@@ -328,11 +336,11 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
   });
 
   // --- OAuth (gated por PIHUB_OAUTH_PROVIDERS) ---
-  app.get("/api/auth/providers", (c) => c.json({ providers: oauth.providers() }));
+  app.get("/api/auth/providers", async (c) => c.json({ providers: await oauth.providers() }));
 
-  app.post("/api/auth/login/:provider", (c) => {
+  app.post("/api/auth/login/:provider", async (c) => {
     try {
-      return c.json(oauth.startLogin(c.req.param("provider")));
+      return c.json(await oauth.startLogin(c.req.param("provider")));
     } catch (error) {
       return c.json({ error: (error as Error).message }, 400);
     }
@@ -346,14 +354,14 @@ export function createApi(env: PihubEnv, supervisor: Supervisor, oauth: OAuthSer
   app.post("/api/auth/flows/:id/input", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { value?: string };
     try {
-      return c.json(oauth.submitInput(c.req.param("id"), body.value ?? ""));
+      return c.json(await oauth.submitInput(c.req.param("id"), body.value ?? ""));
     } catch (error) {
       return c.json({ error: (error as Error).message }, 400);
     }
   });
 
-  app.post("/api/auth/logout/:provider", (c) => {
-    oauth.logout(c.req.param("provider"));
+  app.post("/api/auth/logout/:provider", async (c) => {
+    await oauth.logout(c.req.param("provider"));
     return c.json({ ok: true });
   });
 

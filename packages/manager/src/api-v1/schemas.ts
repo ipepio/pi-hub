@@ -78,6 +78,13 @@ export const packageItemV1Schema = z.object({
   source: z.string().min(1),
 });
 
+/** Definición custom sin secretos; `apiKey` solo cruza la mutación y nunca se devuelve. */
+export const customProviderV1Schema = z.object({
+  baseUrl: z.string().min(1),
+  models: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) })).min(1),
+  apiKey: z.string().optional(),
+});
+
 /** Skill declarativa que el dashboard ya posee: pihub recibe su UUID estable
  * y ficheros relativos a la raíz de esa Skill (`SKILL.md` es obligatorio). */
 export const skillContentV1Schema = z.object({

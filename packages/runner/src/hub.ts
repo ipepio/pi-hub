@@ -99,7 +99,7 @@ export class ChatHub {
     if (this.isStreaming) {
       throw new Error("Hay una respuesta en curso; espera a que termine para cambiar de modelo");
     }
-    const model = this.factory.resolveModel(spec);
+    const model = await this.factory.resolveModel(spec);
     if (!model) throw new Error(`Modelo desconocido: ${spec} (formato proveedor/id)`);
     const session = await this.ensureSession();
     await session.setModel(model); // lanza si no hay credenciales configuradas

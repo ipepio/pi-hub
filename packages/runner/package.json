@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@pihub/shared": "0.7.0",
+    "@pihub/providers": "0.7.0",
     "@earendil-works/pi-coding-agent": "0.80.3",
     "hono": "^4.6.0",
     "@hono/node-server": "^1.13.0",

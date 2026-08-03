@@ -28,6 +28,7 @@ import {
 } from "@pihub/shared";
 import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
 import { listModels } from "../models.js";
+import { createRuntimeProviders, type RuntimeProviders } from "@pihub/providers";
 import type { Supervisor } from "../supervisor.js";
 import type { OAuthService } from "../oauth.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
@@ -52,6 +53,7 @@ import {
   createAgentV1Schema,
   createSessionV1Schema,
   createTurnV1Schema,
+  customProviderV1Schema,
   packageItemV1Schema,
   replaceEnvV1Schema,
   skillContentV1Schema,
@@ -94,6 +96,10 @@ export function createApiV1Router(
   env: PihubEnv,
   supervisor: Supervisor,
   oauth: OAuthService,
+  providers: RuntimeProviders = createRuntimeProviders({
+    dataDir: env.dataDir,
+    oauthProviders: env.oauthProviders,
+  }),
 ): Hono<ApiV1Env> {
   const app = new Hono<ApiV1Env>();
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
@@ -149,11 +155,11 @@ export function createApiV1Router(
   // Panel/operator extension: OAuth de providers. Estas rutas comparten el
   // OAuthService del Manager, pero no forman parte de la Interface del
   // dashboard/control plane.
-  app.get("/auth/providers", (c) => c.json({ providers: oauth.providers() }));
+  app.get("/auth/providers", async (c) => c.json({ providers: await oauth.providers() }));
 
-  app.post("/auth/login/:provider", (c) => {
+  app.post("/auth/login/:provider", async (c) => {
     try {
-      return c.json(oauth.startLogin(c.req.param("provider")));
+      return c.json(await oauth.startLogin(c.req.param("provider")));
     } catch (error) {
       return c.json({ error: (error as Error).message }, 400);
     }
@@ -167,14 +173,14 @@ export function createApiV1Router(
   app.post("/auth/flows/:id/input", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { value?: string };
     try {
-      return c.json(oauth.submitInput(c.req.param("id"), body.value ?? ""));
+      return c.json(await oauth.submitInput(c.req.param("id"), body.value ?? ""));
     } catch (error) {
       return c.json({ error: (error as Error).message }, 400);
     }
   });
 
-  app.post("/auth/logout/:provider", (c) => {
-    oauth.logout(c.req.param("provider"));
+  app.post("/auth/logout/:provider", async (c) => {
+    await oauth.logout(c.req.param("provider"));
     return c.json({ ok: true });
   });
 
@@ -214,11 +220,47 @@ export function createApiV1Router(
 
   // --- §4.7 Modelos disponibles (solo lectura, Fase 1 §1.3 del plan) ---
 
-  app.get("/models", (c) => {
+  app.get("/models", async (c) => {
     try {
-      return c.json({ models: listModels(env) });
+      return c.json({ models: await listModels(providers) });
     } catch {
       return c.json({ models: [] });
+    }
+  });
+
+  // --- Providers first-class (aditivo; /models permanece intacto) ---
+
+  app.get("/providers", async (c) => {
+    try {
+      return c.json({ providers: (await providers.snapshot()).providers });
+    } catch {
+      return c.json({ providers: [] });
+    }
+  });
+
+  app.put("/providers/custom/:providerId", async (c) => {
+    const parsed = customProviderV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid custom Provider definition");
+    try {
+      const change = await providers.apply({
+        type: "upsert-custom-provider",
+        providerId: c.req.param("providerId"),
+        definition: { baseUrl: parsed.data.baseUrl, models: parsed.data.models },
+        ...(parsed.data.apiKey !== undefined ? { apiKey: parsed.data.apiKey } : {}),
+      });
+      const provider = change.snapshot.providers.find((item) => item.id === c.req.param("providerId"));
+      return provider ? c.json({ provider }) : fail(c, "INTERNAL_ERROR", "Provider state unavailable");
+    } catch {
+      return fail(c, "BAD_REQUEST", "Invalid custom Provider definition");
+    }
+  });
+
+  app.delete("/providers/custom/:providerId", async (c) => {
+    try {
+      await providers.apply({ type: "delete-custom-provider", providerId: c.req.param("providerId") });
+      return c.json({ ok: true });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Custom Provider could not be deleted");
     }
   });
 
@@ -229,11 +271,13 @@ export function createApiV1Router(
   // que en `toAgentV1`).
   app.get("/status", async (c) => {
     const agents = await listAgents(env.dataDir);
+    const providerSnapshot = await providers.snapshot();
     return c.json({
       version: MANAGER_VERSION,
       pi: await piVersion(env.dataDir),
       agents: agents.length,
       panel: env.panelEnabled,
+      providerConfigurationIssues: providerSnapshot.configurationIssues,
     });
   });
 

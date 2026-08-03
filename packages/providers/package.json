@@ -1,0 +1,19 @@
+{
+  "name": "@pihub/providers",
+  "version": "0.7.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@pihub/shared": "0.7.0",
+    "@earendil-works/pi-coding-agent": "0.80.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
