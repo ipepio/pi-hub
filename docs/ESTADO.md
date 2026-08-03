@@ -93,6 +93,8 @@ La referencia completa, incluidos métodos, payloads, SSE y errores, está en
   custom Providers; requiere autorización posterior para publicar y actualizar
   el digest del dashboard.
 
+Checkpoint candidate: [`verification/providers-v0.8.0-candidate.md`](verification/providers-v0.8.0-candidate.md).
+
 Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md).
 
 ## Dónde encontrar cada cosa
