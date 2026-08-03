@@ -35,6 +35,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/
 COPY packages/manager/package.json packages/manager/
+COPY packages/providers/package.json packages/providers/
 COPY packages/runner/package.json packages/runner/
 COPY packages/cli/package.json packages/cli/
 COPY packages/memory-extension/package.json packages/memory-extension/
