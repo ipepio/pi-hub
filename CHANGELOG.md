@@ -5,6 +5,23 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-03
+
+### Added
+
+- **Skills por contenido en `/api/v1`**: listado e instalación global o por Agent,
+  contenido JSON y ZIP, validación de paths y límites, persistencia atómica,
+  reemplazo idempotente, eliminación y protección `TURN_IN_PROGRESS`.
+- Las respuestas de Skills exponen únicamente sus IDs; no filtran paths internos,
+  configuraciones de pi, secretos ni errores crudos del Runner.
+
+### Compatibility
+
+- Se conservan sin cambios incompatibles `/api/v1/models`, OAuth, Agents, turnos,
+  `/packages` y las rutas legacy `/api/*`.
+- OAuth de suscripción usa IDs explícitos de AuthStorage: `anthropic` y
+  `openai-codex`; `openai` no es un ID OAuth válido.
+
 ## [0.6.0] — 2026-07-30
 
 ### Added

@@ -1,6 +1,6 @@
 # Qué queda en pihub, y por qué
 
-> Estado revisado para **v0.6.0** (2026-07-30). Cada entrada identifica qué
+> Estado revisado para **v0.7.0** (2026-08-03). Cada entrada identifica qué
 > falta, por qué no se implementa aún y qué impacto tiene. No son backlog
 > genérico: si el motivo deja de ser válido, la entrada debe eliminarse o
 > actualizarse.
@@ -91,20 +91,7 @@ iniciar el trabajo.
 instancias. Es una ampliación de contrato separada: no simular replay
 reintentando automáticamente el POST desde el panel.
 
-## 7. Metadatos de la imagen Docker
-
-El `Dockerfile` aún declara una label de versión `0.1.0` y un `source` histórico,
-aunque la release vigente es `v0.6.0` y el workflow de publicación puede añadir
-labels correctas al artefacto distribuido.
-
-**Impacto:** una imagen construida localmente puede exponer metadatos engañosos
-a un operador o a una herramienta de inventario; no cambia la ejecución.
-
-**Desbloqueo:** alinear las OCI labels del `Dockerfile` con el repositorio y la
-versión construida, o derivarlas del build de forma reproducible. Es cambio de
-imagen, no una corrección de contrato v1.
-
-## 8. Diagnóstico de errores de Provider en turnos
+## 7. Diagnóstico de errores de Provider en turnos
 
 Un error del Provider puede llegar desde el Runner como `error`, que el Manager
 traduce a `turn-error` con `INTERNAL_ERROR` y mensaje saneado. El Manager no

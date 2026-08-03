@@ -60,7 +60,7 @@ import {
   updateAgentV1Schema,
 } from "./schemas.js";
 
-const MANAGER_VERSION = "0.6.0";
+const MANAGER_VERSION = "0.7.0";
 
 interface TurnoVivo {
   ws: WebSocket;

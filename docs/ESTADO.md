@@ -1,7 +1,7 @@
 # Estado de pihub
 
-> Última verificación: **2026-07-30** · versión **v0.6.0** · commit
-> `fde0ecd`. Comprobado ejecutando la suite local.
+> Última verificación: **2026-08-03** · versión **v0.7.0** · release candidate
+> construido desde el feature commit `04a2be1` y validado localmente.
 
 ## Verificado
 

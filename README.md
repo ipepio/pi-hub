@@ -254,8 +254,8 @@ herramientas de red adicionales. Consulta las limitaciones vigentes en
   correspondiente. Los `$VAR` de `models.json` tienen una limitación conocida
   para Runners aislados; consulta `docs/PENDIENTE.md` antes de actualizar una
   instalación existente.
-- `PIHUB_OAUTH_PROVIDERS=anthropic,openai` habilita OAuth en el panel y en
-  `/api/v1/auth/*`.
+- `PIHUB_OAUTH_PROVIDERS=anthropic,openai-codex` habilita OAuth en el panel y en
+  `/api/v1/auth/*`. Los IDs son los que entiende AuthStorage; `openai` no es un ID OAuth válido.
 - `PIHUB_TELEGRAM_ALLOWED_USERS` limita los IDs de Telegram; vacío permite
   cualquiera, por lo que no es apropiado para una instalación expuesta.
 - Configura `PIHUB_SPEECH_URL`, `PIHUB_STT_MODEL` y opcionalmente
