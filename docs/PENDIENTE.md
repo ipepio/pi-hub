@@ -1,6 +1,6 @@
 # Qué queda en pihub, y por qué
 
-> Estado revisado para **v0.7.0** (2026-08-03). Cada entrada identifica qué
+> Estado revisado para **v0.8.0 candidate** (2026-08-03). Cada entrada identifica qué
 > falta, por qué no se implementa aún y qué impacto tiene. No son backlog
 > genérico: si el motivo deja de ser válido, la entrada debe eliminarse o
 > actualizarse.
@@ -87,11 +87,12 @@ iniciar el trabajo.
 instancias. Es una ampliación de contrato separada: no simular replay
 reintentando automáticamente el POST desde el panel.
 
-## 7. Release separada del Providers Module
+## 7. Publicación posterior del Providers Module
 
 El Module profundo, el catálogo first-class, custom Providers, la proyección
 managed y el registro de Providers de Extensions están implementados en la rama
-`feature/providers-module`, con `npm test` y `npm run typecheck` verdes.
+`release/v0.8.0-providers-candidate`, con la verificación local documentada en
+`docs/verification/providers-v0.8.0-candidate.md`.
 
 **Verificado localmente:** la imagen `pihub:providers-candidate` se construyó
 con el árbol limpio (`sha256:903a195206c4979443ffa3ebc3313bbf2875b99a605fdfd32425395f2a51720f`)
@@ -101,12 +102,12 @@ durante un turno con recarga diferida, restart del Runner, persistencia y
 ausencia de secretos/paths en las respuestas. La matriz unitaria cubre además
 atomicidad, rollback, OAuth y proyección idempotente.
 
-**Pendiente:** verificar el intercambio OAuth completo contra un Provider real y
-la mutación de credenciales mientras un turno real está vivo; ambos requieren
-credenciales/callback y un Provider de inferencia disponible. Después hay que
-publicar una release separada y actualizar explícitamente el digest del
-dashboard. Hasta entonces el dashboard mantiene su camino legacy y no se cambia
-el digest publicado v0.7.0.
+**Verificado:** intercambio OAuth real con `openai-codex`, catálogo Manager/Runner coherente, turno real, logout durante turno con recarga diferida, rechazo posterior de credencial revocada y restart con estado persistido correcto.
+
+**Pendiente:** autorización para publicar la imagen y actualizar explícitamente el digest del dashboard. Para ello:
+La imagen debe publicarse como release separada y el dashboard debe actualizarse
+explícitamente. Hasta entonces el dashboard mantiene su camino legacy y no se
+cambia el digest publicado v0.7.0.
 
 ## 8. Diagnóstico de errores de Provider en turnos
 

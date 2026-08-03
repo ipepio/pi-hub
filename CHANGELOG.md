@@ -5,6 +5,21 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-03
+
+### Added
+
+- **Providers Module**: catálogo first-class de Runtime Provider Connections,
+  Providers managed y custom, OAuth y registro de Providers de Extensions.
+- `PUT /api/v1/managed/providers` como proyección replace idempotente protegida
+  por service token, con escrituras atómicas y recarga diferida de Runners.
+
+### Compatibility
+
+- `/api/v1/models`, OAuth, Agents y turnos conservan su contrato anterior.
+- La imagen v0.8.0 es una release candidate local; no se ha publicado ni
+  actualizado ningún digest externo.
+
 ## [0.7.0] — 2026-08-03
 
 ### Added

@@ -1,8 +1,8 @@
 # Estado de pihub
 
-> Última verificación: **2026-08-03** · versión **v0.7.0** · release candidate
-> de Providers construido desde `add6a88` y validado localmente. El digest
-> publicado `v0.7.0` sigue siendo el baseline sin Providers.
+> Última verificación: **2026-08-03** · versión **v0.8.0** · release candidate
+> local de Providers construido desde `df1f533` sobre el ancestro Skills
+> `6008a7c`. No se ha creado tag ni publicado imagen.
 
 ## Verificado
 
@@ -11,7 +11,7 @@
 | Manager HTTP (Hono), Supervisor y panel web | Funciona |
 | Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
 | API privada `/api/v1` | Funciona |
-| Runtime Providers Module (catálogo, OAuth, custom y managed projection) | Funciona en la rama `feature/providers-module`; no forma parte todavía del digest publicado v0.7.0 |
+| Runtime Providers Module (catálogo, OAuth, custom y managed projection) | Funciona en la rama `release/v0.8.0-providers-candidate`; OAuth real verificado en Runtime desechable, pendiente de autorización de publicación |
 | Runtime Provider Connections de Extensions | Funciona detrás del Runner; Manager solo observa estado redactado |
 | Panel migrado a `/api/v1` | Funciona: cookie + CSRF, sin token Bearer en browser |
 | Chat del panel por HTTP/SSE | Funciona: Manager → WS interno del Runner |
@@ -89,9 +89,9 @@ La referencia completa, incluidos métodos, payloads, SSE y errores, está en
 - El contrato publicado no ofrece replay durable de SSE ni idempotencia tras un
   reinicio del Manager.
 - La imagen publicada `v0.7.0` sigue siendo legacy para Providers. La rama
-  `feature/providers-module` añade `/providers`, `/managed/providers` y custom
-  Providers; requiere una release candidata separada antes de actualizar el
-  digest del dashboard.
+  `release/v0.8.0-providers-candidate` añade `/providers`, `/managed/providers` y
+  custom Providers; requiere autorización posterior para publicar y actualizar
+  el digest del dashboard.
 
 Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md).
 

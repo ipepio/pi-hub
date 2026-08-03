@@ -138,7 +138,7 @@ export function createApi(
     const agents = await listAgents(env.dataDir);
     return c.json({
       ok: true,
-      version: "0.7.0",
+      version: "0.8.0",
       pi: await piVersion(env.dataDir),
       agents: agents.length,
       panel: env.panelEnabled,

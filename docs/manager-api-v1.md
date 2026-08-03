@@ -1,6 +1,6 @@
 # Referencia de la API privada del Manager — `/api/v1`
 
-> **Versión:** pihub `v0.7.0`
+> **Versión:** pihub `v0.8.0`
 >
 > **Estado:** implementada y consumida por el panel y por el dashboard.
 >
@@ -110,7 +110,7 @@ en sus propios errores de flujo; no exponen detalles de Runner.
 Ejemplos:
 
 ```json
-{ "status": "ok", "version": "0.7.0", "timestamp": "..." }
+{ "status": "ok", "version": "0.8.0", "timestamp": "..." }
 ```
 
 ```json
@@ -121,7 +121,7 @@ Ejemplos:
 ```
 
 ```json
-{ "version": "0.7.0", "pi": "0.80.3", "agents": 2, "panel": true }
+{ "version": "0.8.0", "pi": "0.80.3", "agents": 2, "panel": true }
 ```
 
 `/status` no incluye el rango de puertos de Runner ni topología interna.

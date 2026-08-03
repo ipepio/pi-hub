@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 # OCI labels — set via docker build --label or CI
-LABEL org.opencontainers.image.version="pihub:0.7.0"
+LABEL org.opencontainers.image.version="pihub:0.8.0"
 LABEL org.opencontainers.image.source="https://github.com/ipepio/pi-hub"
 LABEL org.opencontainers.image.ref="0.80.3"
 

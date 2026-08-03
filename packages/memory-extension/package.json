@@ -1,6 +1,6 @@
 {
   "name": "@pihub/memory-extension",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Extensión pi de memoria persistente (el fichero src/pihub-memory.ts se copia al volumen en el bootstrap; no se compila)",
   "scripts": {

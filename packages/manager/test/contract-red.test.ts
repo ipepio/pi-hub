@@ -22,6 +22,8 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const MANAGER_URL = process.env.MANAGER_URL ?? "http://127.0.0.1:4000";
+// The contract is Provider-agnostic; local verification may inject a deterministic seam.
+const CONTRACT_MODEL = process.env.PIHUB_CONTRACT_MODEL ?? "anthropic/claude-sonnet-5";
 
 function loadApiToken(): string {
   if (process.env.API_TOKEN) return process.env.API_TOKEN;
@@ -128,7 +130,7 @@ before(async () => {
   UPLOAD_AGENT = `h09-upload-${Date.now()}`;
   const created = await request("/api/v1/agents", {
     method: "POST",
-    body: { name: UPLOAD_AGENT, model: "anthropic/claude-sonnet-5" },
+    body: { name: UPLOAD_AGENT, model: CONTRACT_MODEL },
   });
   assert.strictEqual(created.status, 201, `no se pudo crear el Agent de H09: ${created.rawText}`);
   DEFAULT_AGENT = `h09-default-${Date.now()}`;
@@ -226,7 +228,7 @@ async function ensureTurnAgent(): Promise<void> {
         method: "POST",
         body: {
           name: TURN_AGENT,
-          model: "anthropic/claude-sonnet-5",
+          model: CONTRACT_MODEL,
           thinkingLevel: "low",
         },
       });

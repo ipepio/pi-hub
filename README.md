@@ -251,12 +251,12 @@ herramientas de red adicionales. Consulta las limitaciones vigentes en
 - Copia `models.example.json` a `models.json` para Providers custom. Ese
   archivo no se versiona porque puede describir secretos.
 - Añade las API keys referenciadas por `models.json` al entorno o al Env Store
-  correspondiente. En la rama `feature/providers-module`, `RuntimeProviders`
+  correspondiente. En la rama `release/v0.8.0-providers-candidate`, `RuntimeProviders`
   resuelve `$VAR` desde el Env Store sin heredar el entorno completo del Manager.
 - `GET /api/v1/providers` publica el catálogo observado y redactado. El panel
   standalone puede gestionar custom Providers; el control plane usa
   `PUT /api/v1/managed/providers`, que conserva OAuth y Providers standalone.
-  Estas rutas pertenecen a una release posterior y no están en el digest
+  Estas rutas pertenecen al candidate v0.8.0 y todavía no están en el digest
   publicado v0.7.0.
 - `PIHUB_OAUTH_PROVIDERS=anthropic,openai-codex` habilita OAuth en el panel y en
   `/api/v1/auth/*`. El Module valida estos IDs contra AuthStorage y publica un
