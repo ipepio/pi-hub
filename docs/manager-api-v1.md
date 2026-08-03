@@ -102,6 +102,10 @@ en sus propios errores de flujo; no exponen detalles de Runner.
 | `GET` | `/readiness` | Comprueba acceso al directorio de datos |
 | `GET` | `/status` | Versión, pi, número de Agents y si el panel está montado |
 | `GET` | `/models` | Catálogo de Models y disponibilidad de credenciales |
+| `GET` | `/providers` | Catálogo observado de Runtime Provider Connections |
+| `PUT` | `/managed/providers` | Reemplaza la proyección managed (solo Bearer de servicio) |
+| `PUT` | `/providers/custom/:providerId` | Define/actualiza un Provider custom |
+| `DELETE` | `/providers/custom/:providerId` | Revoca y elimina un Provider custom |
 
 Ejemplos:
 
@@ -121,6 +125,49 @@ Ejemplos:
 ```
 
 `/status` no incluye el rango de puertos de Runner ni topología interna.
+
+### Providers y Runtime Provider Connections
+
+`GET /providers` devuelve únicamente estado observado y redactado:
+
+```json
+{
+  "providers": [{
+    "id": "provider-id",
+    "name": "Provider",
+    "origin": "built_in | models_json | managed | extension",
+    "authMethods": ["api_key"],
+    "status": "connected | missing_credentials | error",
+    "models": [{ "provider": "provider-id", "id": "model", "name": "Model", "configured": true }],
+    "capabilities": []
+  }]
+}
+```
+
+Una **Runtime Provider Connection** es la conexión efectiva de un Provider
+para este User Runtime; no crea un Model global ni evita las políticas del
+Dashboard. `managed` es propiedad del estado deseado enviado por el dashboard;
+`built_in`, `models_json` y `extension` pertenecen al Runtime standalone.
+
+`PUT /managed/providers` recibe el reemplazo completo:
+
+```json
+{ "providers": [{
+  "id": "dashboard-provider",
+  "baseUrl": "https://api.example/v1",
+  "models": [{ "id": "chat", "name": "Chat" }],
+  "apiKey": "solo-en-la-mutación"
+}]}
+```
+
+Esta ruta exige Bearer de servicio aunque el resto de `/api/v1` admita lecturas
+con cookie del panel. Solo sustituye entradas `managed`, conserva Providers
+standalone y credenciales OAuth, escribe de forma atómica y devuelve el estado
+observado sin `apiKey`, paths ni errores crudos. La operación es idempotente.
+
+Los endpoints `custom` separan definición y credencial: la API key solo se
+acepta en la mutación y se guarda mediante `AuthStorage`; nunca se mezcla con
+`models.json`, se serializa en una respuesta ni se escribe en logs.
 
 ## 4. Agents y ciclo de vida
 

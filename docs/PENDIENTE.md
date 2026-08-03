@@ -33,20 +33,16 @@ de solo lectura, sin romper el bridge interno Manager → Runner. El Provisioner
 del dashboard ya aplica esa postura para sus User Runtimes; no hay que
 duplicarla en el Manager.
 
-## 3. Variables `$VAR` de `models.json` no llegan automáticamente al Runner
+## 3. Variables `$VAR` de `models.json` en el Runtime Providers Module ✅ Resuelto en `feature/providers-module`
 
-El Supervisor no hereda el entorno completo del Manager. Eso protege
-`API_TOKEN` y secretos no destinados al Agent, pero un Provider configurado en
-`models.json` como `"apiKey": "$MI_KEY"` solo funcionará si `MI_KEY` se pone
-en el Env Store global o del Agent.
+`RuntimeProviders` resuelve explícitamente las referencias `$VAR` desde el Env
+Store global y, en el Runner, desde el Env Store del Agent por encima del
+Store global. Solo la API key efectiva entra en la instancia privada de
+`AuthStorage`; nunca se devuelve por HTTP ni se imprime.
 
-**Impacto:** una instalación que confiaba en herencia de entorno puede recibir
-un error genérico del Runner tras actualizar; el Manager tenía la variable,
-pero el Runner no.
-
-**Desbloqueo:** resolver explícitamente las variables que `models.json`
-referencia y añadir únicamente esas a la allowlist del Runner, o resolverlas
-antes de lanzar el proceso. No se debe deshacer la allowlist completa.
+La imagen publicada v0.7.0 todavía no contiene este Module. El comportamiento
+queda pendiente de una release candidata de Providers y de su rollout; la
+solución no hereda el entorno completo del Manager.
 
 ## 4. Herramientas de red en la imagen
 
@@ -91,7 +87,19 @@ iniciar el trabajo.
 instancias. Es una ampliación de contrato separada: no simular replay
 reintentando automáticamente el POST desde el panel.
 
-## 7. Diagnóstico de errores de Provider en turnos
+## 7. Release separada del Providers Module
+
+El Module profundo, el catálogo first-class, custom Providers, la proyección
+managed y el registro de Providers de Extensions están implementados en la rama
+`feature/providers-module`, con `npm test` y `npm run typecheck` verdes.
+
+**Pendiente:** construir una imagen candidata, ejecutar Manager/Runner reales y
+verificar OAuth, dos Agents del mismo Runtime, turnos vivos durante login/logout,
+proyección idempotente y ausencia de secretos antes de publicar una nueva
+release. El dashboard debe mantener su camino legacy hasta que esa matriz esté
+verde; no se cambia el digest v0.7.0 en este trabajo.
+
+## 8. Diagnóstico de errores de Provider en turnos
 
 Un error del Provider puede llegar desde el Runner como `error`, que el Manager
 traduce a `turn-error` con `INTERNAL_ERROR` y mensaje saneado. El Manager no

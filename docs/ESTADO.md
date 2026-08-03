@@ -10,6 +10,8 @@
 | Manager HTTP (Hono), Supervisor y panel web | Funciona |
 | Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
 | API privada `/api/v1` | Funciona |
+| Runtime Providers Module (catálogo, OAuth, custom y managed projection) | Funciona en la rama `feature/providers-module`; no forma parte todavía del digest publicado v0.7.0 |
+| Runtime Provider Connections de Extensions | Funciona detrás del Runner; Manager solo observa estado redactado |
 | Panel migrado a `/api/v1` | Funciona: cookie + CSRF, sin token Bearer en browser |
 | Chat del panel por HTTP/SSE | Funciona: Manager → WS interno del Runner |
 | Eventos `basic` y `verbose`, incluida cancelación | Funciona |
@@ -18,7 +20,7 @@
 
 ```text
 npm run typecheck  # limpio
-npm test           # 207 tests passed
+npm test           # 219 tests passed
 ```
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
@@ -78,6 +80,10 @@ La referencia completa, incluidos métodos, payloads, SSE y errores, está en
 - La limitación de `$VAR` en `models.json` para un Runner aislado sigue abierta.
 - El contrato publicado no ofrece replay durable de SSE ni idempotencia tras un
   reinicio del Manager.
+- La imagen publicada `v0.7.0` sigue siendo legacy para Providers. La rama
+  `feature/providers-module` añade `/providers`, `/managed/providers` y custom
+  Providers; requiere una release candidata separada antes de actualizar el
+  digest del dashboard.
 
 Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md).
 

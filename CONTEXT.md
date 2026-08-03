@@ -8,6 +8,20 @@ Plataforma autoalojada para levantar y orquestar múltiples agentes de IA, cada 
 Una entidad con su propia persona, modelo, recursos y memoria que se puede arrancar y parar. Persiste como configuración entre reinicios y, cuando está arrancada, razona y actúa por sí misma.
 _Avoid_: perfil, bot, asistente
 
+**Provider**:
+Una definición de conexión que aporta uno o varios Models al catálogo efectivo
+de un Runtime. Puede ser built-in, proceder de `models.json`, estar gestionada
+por el dashboard o registrarse desde una Extension; su estado observado nunca
+incluye secretos ni paths internos.
+_Avoid_: proveedor global del dashboard, credencial, modelo
+
+**Runtime Provider Connection**:
+La conexión efectiva de un Provider dentro de un User Runtime. Es estado local
+de pihub y puede sobrevivir a una nueva proyección managed cuando procede de
+OAuth o de una configuración standalone. No entra automáticamente en el
+catálogo global del dashboard ni evita sus Roles, Model Policy o Model Kind.
+_Avoid_: Provider global, conexión del dashboard, API key
+
 ## Orquestación
 
 **Loop**:

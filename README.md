@@ -251,11 +251,19 @@ herramientas de red adicionales. Consulta las limitaciones vigentes en
 - Copia `models.example.json` a `models.json` para Providers custom. Ese
   archivo no se versiona porque puede describir secretos.
 - Añade las API keys referenciadas por `models.json` al entorno o al Env Store
-  correspondiente. Los `$VAR` de `models.json` tienen una limitación conocida
-  para Runners aislados; consulta `docs/PENDIENTE.md` antes de actualizar una
-  instalación existente.
+  correspondiente. En la rama `feature/providers-module`, `RuntimeProviders`
+  resuelve `$VAR` desde el Env Store sin heredar el entorno completo del Manager.
+- `GET /api/v1/providers` publica el catálogo observado y redactado. El panel
+  standalone puede gestionar custom Providers; el control plane usa
+  `PUT /api/v1/managed/providers`, que conserva OAuth y Providers standalone.
+  Estas rutas pertenecen a una release posterior y no están en el digest
+  publicado v0.7.0.
 - `PIHUB_OAUTH_PROVIDERS=anthropic,openai-codex` habilita OAuth en el panel y en
-  `/api/v1/auth/*`. Los IDs son los que entiende AuthStorage; `openai` no es un ID OAuth válido.
+  `/api/v1/auth/*`. El Module valida estos IDs contra AuthStorage y publica un
+  warning tipado para configuraciones desconocidas; `openai` no es un ID OAuth válido.
+- Providers registrados por Extensions se cargan únicamente dentro del Runner.
+  Se observan como `origin: extension`, no se convierten automáticamente en
+  Models seleccionables desde el dashboard y nunca se cargan en el Manager.
 - `PIHUB_TELEGRAM_ALLOWED_USERS` limita los IDs de Telegram; vacío permite
   cualquiera, por lo que no es apropiado para una instalación expuesta.
 - Configura `PIHUB_SPEECH_URL`, `PIHUB_STT_MODEL` y opcionalmente
