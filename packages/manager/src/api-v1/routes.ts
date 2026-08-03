@@ -32,7 +32,7 @@ import { createRuntimeProviders, type RuntimeProviders } from "@pihub/providers"
 import type { Supervisor } from "../supervisor.js";
 import type { OAuthService } from "../oauth.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
-import { classifyApiV1Auth, cookieValue, CSRF_COOKIE } from "./auth.js";
+import { classifyApiV1Auth, classifyServiceAuth, cookieValue, CSRF_COOKIE } from "./auth.js";
 import {
   agentRuntimeFingerprint,
   decideRuntimeAction,
@@ -54,6 +54,7 @@ import {
   createSessionV1Schema,
   createTurnV1Schema,
   customProviderV1Schema,
+  managedProviderProjectionV1Schema,
   packageItemV1Schema,
   replaceEnvV1Schema,
   skillContentV1Schema,
@@ -261,6 +262,24 @@ export function createApiV1Router(
       return c.json({ ok: true });
     } catch {
       return fail(c, "BAD_REQUEST", "Custom Provider could not be deleted");
+    }
+  });
+
+  app.put("/managed/providers", async (c) => {
+    const serviceAuth = classifyServiceAuth(c.req.header("authorization"), env.apiToken);
+    if (serviceAuth !== "ok") return fail(c, serviceAuth, "Service credential required");
+    const parsed = managedProviderProjectionV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid managed Provider projection");
+    try {
+      const change = await providers.apply({
+        type: "replace-managed-providers",
+        providers: parsed.data.providers,
+      });
+      return c.json({
+        providers: change.snapshot.providers.filter((provider) => provider.origin === "managed"),
+      });
+    } catch {
+      return fail(c, "BAD_REQUEST", "Managed Provider projection could not be applied");
     }
   });
 

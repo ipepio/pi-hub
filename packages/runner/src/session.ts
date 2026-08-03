@@ -38,6 +38,7 @@ export class SessionFactory {
   private readonly globalDir: string;
 
   private readonly env: PihubEnv;
+  private extensionProvidersPrepared = false;
   public readonly config: AgentConfig;
 
   constructor(env: PihubEnv, config: AgentConfig, sessionKey?: string) {
@@ -59,7 +60,19 @@ export class SessionFactory {
     return new SessionFactory(this.env, this.config, sessionKey);
   }
 
+  private async ensureExtensionProviders(): Promise<void> {
+    if (this.extensionProvidersPrepared) return;
+    const loader = new DefaultResourceLoader({
+      cwd: this.paths.workspaceDir,
+      agentDir: this.globalDir,
+    });
+    await loader.reload();
+    await this.runtimeProviders.registerExtensionProviders(loader);
+    this.extensionProvidersPrepared = true;
+  }
+
   async resolveModel(spec?: string): Promise<ResolvedModel | undefined> {
+    await this.ensureExtensionProviders();
     const raw = spec ?? this.config.model;
     if (!raw) return undefined;
     return this.runtimeProviders.resolveModel(raw);
@@ -90,6 +103,7 @@ export class SessionFactory {
 
   /** Modelos disponibles (models.json + built-ins de pi) con su estado de credenciales. */
   async listModels(): Promise<ModelInfo[]> {
+    await this.ensureExtensionProviders();
     return (await this.runtimeProviders.snapshot()).models;
   }
 
@@ -127,6 +141,8 @@ export class SessionFactory {
           .join("\n\n"),
     });
     await loader.reload();
+    await this.runtimeProviders.registerExtensionProviders(loader);
+    this.extensionProvidersPrepared = true;
 
     const model = overrideModel ?? (await this.resolveModel());
     return this.runtimeProviders.createSession({

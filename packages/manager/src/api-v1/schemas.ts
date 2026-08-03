@@ -85,6 +85,18 @@ export const customProviderV1Schema = z.object({
   apiKey: z.string().optional(),
 });
 
+/** Proyección completa administrada por el control plane; las credenciales solo cruzan la mutación. */
+export const managedProviderProjectionV1Schema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.string().min(1),
+      baseUrl: z.string().min(1),
+      models: z.array(z.object({ id: z.string().min(1), name: z.string().min(1) })).min(1),
+      apiKey: z.string().optional(),
+    }),
+  ),
+});
+
 /** Skill declarativa que el dashboard ya posee: pihub recibe su UUID estable
  * y ficheros relativos a la raíz de esa Skill (`SKILL.md` es obligatorio). */
 export const skillContentV1Schema = z.object({

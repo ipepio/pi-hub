@@ -7,6 +7,7 @@ import {
   createAgentSession,
   type AgentSession,
   type CreateAgentSessionOptions,
+  type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import { dataPaths, readEnvStore, type ModelInfo } from "@pihub/shared";
 
@@ -22,7 +23,10 @@ export interface RuntimeProvidersConfig {
 }
 
 export interface RuntimeProviderConfigurationIssue {
-  code: "UNKNOWN_OAUTH_PROVIDER" | "INVALID_MODELS_CONFIGURATION";
+  code:
+    | "UNKNOWN_OAUTH_PROVIDER"
+    | "INVALID_MODELS_CONFIGURATION"
+    | "EXTENSION_PROVIDER_INVALID";
   providerId?: string;
 }
 
@@ -85,6 +89,13 @@ export interface RuntimeCustomProviderDefinition {
   models: RuntimeCustomProviderModelDefinition[];
 }
 
+export interface ManagedRuntimeProvider {
+  id: string;
+  baseUrl: string;
+  models: RuntimeCustomProviderModelDefinition[];
+  apiKey?: string;
+}
+
 export type RuntimeProviderCommand =
   | { type: "refresh" }
   | { type: "logout-oauth"; providerId: string }
@@ -96,11 +107,13 @@ export type RuntimeProviderCommand =
       definition: RuntimeCustomProviderDefinition;
       apiKey?: string;
     }
-  | { type: "delete-custom-provider"; providerId: string };
+  | { type: "delete-custom-provider"; providerId: string }
+  | { type: "replace-managed-providers"; providers: ManagedRuntimeProvider[] };
 
 export type RuntimeProviderChange =
   | { kind: "refreshed"; snapshot: RuntimeProviderSnapshot }
   | { kind: "custom_provider_applied" | "custom_provider_deleted"; snapshot: RuntimeProviderSnapshot }
+  | { kind: "managed_projection_applied"; snapshot: RuntimeProviderSnapshot }
   | { kind: "oauth_logged_out"; snapshot: RuntimeProviderSnapshot }
   | {
       kind: "oauth_flow_started" | "oauth_flow_updated";
@@ -130,6 +143,7 @@ export interface RuntimeProviders {
   resolveModel(spec: string): Promise<ResolvedRuntimeModel | undefined>;
   createSession(options?: Omit<CreateAgentSessionOptions, "authStorage" | "modelRegistry">): Promise<AgentSession>;
   oauthFlow(id: string): RuntimeOAuthFlowState | undefined;
+  registerExtensionProviders(resourceLoader: ResourceLoader): Promise<void>;
   initialize(): Promise<void>;
   onChange(listener: (mutation: RuntimeProviderMutation) => void): () => void;
 }
@@ -165,6 +179,10 @@ function modelSnapshot(registry: ModelRegistry): ModelInfo[] {
 interface ModelsFile {
   providers: Record<string, Record<string, unknown>>;
   [key: string]: unknown;
+}
+
+interface ManagedOwnership {
+  providerIds: string[];
 }
 
 function validProviderId(providerId: string): boolean {
@@ -210,6 +228,23 @@ async function readModelsFile(modelsPath: string): Promise<ModelsFile> {
   }
 }
 
+async function readManagedOwnership(file: string): Promise<ManagedOwnership> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, "utf8")) as Partial<ManagedOwnership>;
+    if (!Array.isArray(parsed.providerIds) || parsed.providerIds.some((id) => typeof id !== "string")) {
+      throw new Error("invalid");
+    }
+    return { providerIds: [...new Set(parsed.providerIds)] };
+  } catch {
+    try {
+      await fs.access(file);
+    } catch {
+      return { providerIds: [] };
+    }
+    throw new Error("Managed Provider ownership unavailable");
+  }
+}
+
 async function writeJsonAtomically(file: string, value: unknown): Promise<void> {
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
@@ -226,6 +261,9 @@ async function providerSnapshot(
   modelsPath: string,
   models: ModelInfo[],
   requestedOauth: readonly string[],
+  managedProviderIds: ReadonlySet<string>,
+  extensionProviderIds: ReadonlySet<string>,
+  extensionIssues: ReadonlySet<string>,
 ): Promise<{
   providers: RuntimeProviderSummary[];
   configurationIssues: RuntimeProviderConfigurationIssue[];
@@ -275,7 +313,13 @@ async function providerSnapshot(
     return {
       id,
       name: oauthProvider?.name || registry.getProviderDisplayName(id) || id,
-      origin: customProviderIds.has(id) ? "models_json" : "built_in",
+      origin: managedProviderIds.has(id)
+        ? "managed"
+        : extensionProviderIds.has(id)
+          ? "extension"
+          : customProviderIds.has(id)
+            ? "models_json"
+            : "built_in",
       authMethods,
       status,
       models: providerModels,
@@ -290,12 +334,17 @@ async function providerSnapshot(
   for (const providerId of requestedOauth) {
     if (!oauth.has(providerId)) configurationIssues.push({ code: "UNKNOWN_OAUTH_PROVIDER", providerId });
   }
+  for (const providerId of extensionIssues) {
+    configurationIssues.push({ code: "EXTENSION_PROVIDER_INVALID", providerId });
+  }
   return { providers, configurationIssues };
 }
 
 /** Adapter filesystem real de RuntimeProviders para un User Runtime. */
 export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeProviders {
   const requestedOAuth = config.oauthProviders ?? [];
+  const extensionProviderIds = new Set<string>();
+  const extensionIssues = new Set<string>();
   let resources:
     | { authStorage: AuthStorage; modelRegistry: ModelRegistry }
     | undefined;
@@ -355,12 +404,16 @@ export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeP
     const { authStorage, modelRegistry } = await refresh();
     const models = modelSnapshot(modelRegistry);
     const oauth = oauthSnapshot(authStorage, requestedOAuth);
+    const ownership = await readManagedOwnership(managedOwnershipPath());
     const firstClass = await providerSnapshot(
       authStorage,
       modelRegistry,
-      path.join(dataPaths(config.dataDir).globalDir, "models.json"),
+      modelsPath(),
       models,
       requestedOAuth,
+      new Set(ownership.providerIds),
+      extensionProviderIds,
+      extensionIssues,
     );
     return {
       models,
@@ -397,6 +450,8 @@ export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeP
   };
 
   const modelsPath = (): string => path.join(dataPaths(config.dataDir).globalDir, "models.json");
+  const managedOwnershipPath = (): string =>
+    path.join(dataPaths(config.dataDir).globalDir, "managed-providers.json");
 
   const restoreCredential = (authStorage: AuthStorage, providerId: string, credential: unknown): void => {
     if (credential && typeof credential === "object") {
@@ -483,6 +538,117 @@ export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeP
 
     notify({ kind: "definition_changed", providerId: command.providerId, operation: "definition" });
     return { kind: "custom_provider_deleted", snapshot: await snapshot() };
+  };
+
+  const replaceManagedProviders = async (
+    command: Extract<RuntimeProviderCommand, { type: "replace-managed-providers" }>,
+  ): Promise<RuntimeProviderChange> => {
+    const ids = command.providers.map((provider) => provider.id);
+    if (
+      new Set(ids).size !== ids.length ||
+      command.providers.some(
+        (provider) =>
+          !validProviderId(provider.id) ||
+          !validProviderDefinition({ baseUrl: provider.baseUrl, models: provider.models }) ||
+          (provider.apiKey !== undefined && provider.apiKey.length === 0),
+      )
+    ) {
+      throw new Error("Invalid managed Provider projection");
+    }
+
+    const { authStorage, modelRegistry } = await refresh();
+    const modelsFile = modelsPath();
+    const ownershipFile = managedOwnershipPath();
+    const previousModels = await readModelsFile(modelsFile);
+    const previousOwnership = await readManagedOwnership(ownershipFile);
+    const previousCredentials = new Map(
+      [...new Set([...previousOwnership.providerIds, ...ids])].map((providerId) => [
+        providerId,
+        authStorage.get(providerId),
+      ]),
+    );
+    const previousManaged = new Set(previousOwnership.providerIds);
+    const desired = new Set(ids);
+
+    for (const provider of command.providers) {
+      const isExistingManaged = previousManaged.has(provider.id);
+      if (!isExistingManaged && modelRegistry.getAll().some((model) => model.provider === provider.id)) {
+        throw new Error("Managed Provider collides with an existing Provider");
+      }
+    }
+
+    const nextProviders = { ...previousModels.providers };
+    for (const providerId of previousManaged) {
+      if (!desired.has(providerId)) delete nextProviders[providerId];
+    }
+    for (const provider of command.providers) {
+      nextProviders[provider.id] = {
+        baseUrl: provider.baseUrl,
+        api: "openai-completions",
+        models: provider.models.map((model) => ({
+          id: model.id,
+          name: model.name,
+          api: "openai-completions",
+        })),
+      };
+    }
+    const nextModels: ModelsFile = { ...previousModels, providers: nextProviders };
+    const nextOwnership: ManagedOwnership = { providerIds: ids };
+
+    const restoreAll = (): void => {
+      for (const [providerId, credential] of previousCredentials) {
+        restoreCredential(authStorage, providerId, credential);
+      }
+      modelRegistry.refresh();
+    };
+
+    try {
+      await writeJsonAtomically(modelsFile, nextModels);
+      for (const providerId of previousManaged) {
+        if (!desired.has(providerId)) {
+          const credential = previousCredentials.get(providerId);
+          if (credential?.type === "api_key") authStorage.remove(providerId);
+        }
+      }
+      for (const provider of command.providers) {
+        const credential = previousCredentials.get(provider.id);
+        if (provider.apiKey !== undefined) {
+          authStorage.set(provider.id, { type: "api_key", key: provider.apiKey });
+        } else if (credential?.type === "api_key") {
+          // The desired managed state has no API key; OAuth credentials survive.
+          authStorage.remove(provider.id);
+        }
+      }
+      await writeJsonAtomically(ownershipFile, nextOwnership);
+      modelRegistry.refresh();
+      if (modelRegistry.getError()) throw new Error("invalid");
+    } catch {
+      await writeJsonAtomically(modelsFile, previousModels).catch(() => {});
+      await writeJsonAtomically(ownershipFile, previousOwnership).catch(() => {});
+      restoreAll();
+      throw new Error("Managed Provider projection could not be applied");
+    }
+
+    notify({ kind: "definition_changed", providerId: "managed", operation: "definition" });
+    return { kind: "managed_projection_applied", snapshot: await snapshot() };
+  };
+
+  const registerExtensionProviders = async (resourceLoader: ResourceLoader): Promise<void> => {
+    const { modelRegistry } = await refresh();
+    const pending = resourceLoader.getExtensions().runtime.pendingProviderRegistrations as Array<{
+      name: string;
+      config: Parameters<ModelRegistry["registerProvider"]>[1];
+    }>;
+    for (const registration of pending) {
+      try {
+        modelRegistry.registerProvider(registration.name, registration.config);
+        extensionProviderIds.add(registration.name);
+        extensionIssues.delete(registration.name);
+      } catch {
+        extensionIssues.add(registration.name);
+      }
+    }
+    resourceLoader.getExtensions().runtime.pendingProviderRegistrations = [];
   };
 
   const initialize = async (): Promise<void> => {
@@ -579,6 +745,7 @@ export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeP
       }
       if (command.type === "upsert-custom-provider") return upsertCustomProvider(command);
       if (command.type === "delete-custom-provider") return deleteCustomProvider(command);
+      if (command.type === "replace-managed-providers") return replaceManagedProviders(command);
       if (command.type === "start-oauth-login") return startOAuthLogin(command.providerId);
       if (command.type === "submit-oauth-input") {
         const flow = flows.get(command.flowId);
@@ -617,6 +784,7 @@ export function createRuntimeProviders(config: RuntimeProvidersConfig): RuntimeP
       return flow ? { ...flow.state } : undefined;
     },
 
+    registerExtensionProviders,
     initialize,
 
     onChange(listener): () => void {

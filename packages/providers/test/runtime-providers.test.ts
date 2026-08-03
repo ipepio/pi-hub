@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { scaffoldGlobalDirs } from "@pihub/shared";
+import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 import { createRuntimeProviders } from "../src/index.ts";
 
 async function fixture() {
@@ -23,6 +24,37 @@ async function fixture() {
   );
   return dataDir;
 }
+
+test("RuntimeProviders registra Providers de Extension solo detrás del seam del Runner", async () => {
+  const dataDir = await fixture();
+  try {
+    const providers = createRuntimeProviders({ dataDir, oauthProviders: [] });
+    const loader = new DefaultResourceLoader({
+      cwd: dataDir,
+      agentDir: path.join(dataDir, "global"),
+      extensionFactories: [
+        (pi) => {
+          pi.registerProvider("extension-provider", {
+            baseUrl: "http://127.0.0.1:9996/v1",
+            api: "openai-completions",
+            apiKey: "extension-secret",
+            models: [{ id: "extension-model", name: "Extension Model", api: "openai-completions" }],
+          });
+        },
+      ],
+    });
+    await loader.reload();
+    await providers.registerExtensionProviders(loader);
+
+    const snapshot = await providers.snapshot();
+    const extension = snapshot.providers.find((provider) => provider.id === "extension-provider");
+    assert.equal(extension?.origin, "extension");
+    assert.equal(extension?.status, "connected");
+    assert.equal(JSON.stringify(snapshot).includes("extension-secret"), false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
 
 test("RuntimeProviders publica un snapshot seguro y resuelve Models desde el catálogo efectivo", async () => {
   const dataDir = await fixture();
@@ -111,6 +143,37 @@ test("RuntimeProviders guarda definición y credencial de un Provider custom por
     const authJson = await fs.readFile(path.join(dataDir, "global", "auth.json"), "utf8");
     assert.equal(modelsJson.includes("custom-secret"), false);
     assert.equal(authJson.includes("custom-secret"), true);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeProviders reemplaza solo la proyección managed y preserva Providers standalone", async () => {
+  const dataDir = await fixture();
+  try {
+    const providers = createRuntimeProviders({ dataDir, oauthProviders: [] });
+    const applied = await providers.apply({
+      type: "replace-managed-providers",
+      providers: [{
+        id: "managed",
+        baseUrl: "http://127.0.0.1:9997/v1",
+        models: [{ id: "managed-model", name: "Managed Model" }],
+        apiKey: "managed-secret",
+      }],
+    });
+
+    assert.equal(applied.kind, "managed_projection_applied");
+    assert.equal(applied.snapshot.providers.find((provider) => provider.id === "managed")?.origin, "managed");
+    assert.equal(applied.snapshot.providers.some((provider) => provider.id === "local"), true);
+    assert.equal(JSON.stringify(applied.snapshot).includes("managed-secret"), false);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(dataDir, "global", "managed-providers.json"), "utf8")), {
+      providerIds: ["managed"],
+    });
+
+    const removed = await providers.apply({ type: "replace-managed-providers", providers: [] });
+    assert.equal(removed.snapshot.providers.some((provider) => provider.id === "managed"), false);
+    assert.equal(removed.snapshot.providers.some((provider) => provider.id === "local"), true);
+    assert.equal(JSON.parse(await fs.readFile(path.join(dataDir, "global", "auth.json"), "utf8")).managed, undefined);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }

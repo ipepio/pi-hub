@@ -136,6 +136,58 @@ test("custom Provider se actualiza y borra por la Interface HTTP sin devolver su
   }
 });
 
+test("PUT /managed/providers exige Bearer de servicio y preserva Providers standalone", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-managed-providers-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+    const payload = {
+      providers: [{
+        id: "managed",
+        baseUrl: "http://127.0.0.1:9997/v1",
+        models: [{ id: "managed-model", name: "Managed Model" }],
+        apiKey: "managed-secret",
+      }],
+    };
+    const cookieAttempt = await app.request("http://pihub.test/managed/providers", {
+      method: "PUT",
+      headers: {
+        cookie: "pihub_token=service-token; pihub_csrf=csrf",
+        "x-csrf-token": "csrf",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(cookieAttempt.status, 401);
+    assert.equal((await cookieAttempt.json()).code, "MISSING_AUTH");
+
+    const serviceAttempt = await app.request("http://pihub.test/managed/providers", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(serviceAttempt.status, 200);
+    const observed = await serviceAttempt.json();
+    assert.equal(observed.providers[0].origin, "managed");
+    assert.equal(JSON.stringify(observed).includes("managed-secret"), false);
+
+    const removed = await app.request("http://pihub.test/managed/providers", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ providers: [] }),
+    });
+    assert.deepEqual(await removed.json(), { providers: [] });
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("GET /status devuelve version/agents/panel y NUNCA portRange", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-status-"));
   try {
