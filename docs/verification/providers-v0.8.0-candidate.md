@@ -8,14 +8,17 @@
 **Fix reload:** `add6a88`  
 **Commit candidate de código/versionado:** `c16333120cddad4a0a051214610570b549d72c9b`
 
+**Commit de documentación/checkpoint:** `6f71a5bbdca06b089423c19b5ed4f500809233c0` (la actualización de imagen es documentación-only)
+
 ## Imagen
 
 - Tag local desechable: `pihub:v0.8.0-candidate`.
-- Imagen construida desde `c163331`: `sha256:7acd750d64f9f7f62af3410baff241a1d3512add1d372eb448c1f50ac65fbf28`.
+- Imagen inicial construida desde `c163331`: `sha256:7acd750d64f9f7f62af3410baff241a1d3512add1d372eb448c1f50ac65fbf28`.
 - OCI version: `pihub:0.8.0`; OCI revision: `c163331`.
 - Contiene `@pihub/providers`, Skills v0.7 y el fix `add6a88`.
-- Se reconstruirá desde el commit final que incluya estos informes antes del
-  punto de autorización. No se usó `latest`.
+- Reconstrucción final local: `pihub:v0.8.0-candidate-final`, image ID
+  `sha256:d79c20f30e0ba4db630bff2701bb5aeb6b49e7a328ff2eb0ff07c6bb95080f96`,
+  OCI revision `6f71a5b`. No se usó `latest`.
 
 ## Contratos probados
 
