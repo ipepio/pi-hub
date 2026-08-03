@@ -1,7 +1,8 @@
 # Estado de pihub
 
 > Última verificación: **2026-08-03** · versión **v0.7.0** · release candidate
-> construido desde el feature commit `04a2be1` y validado localmente.
+> de Providers construido desde `21a25e3` y validado localmente. El digest
+> publicado `v0.7.0` sigue siendo el baseline sin Providers.
 
 ## Verificado
 
@@ -21,7 +22,13 @@
 ```text
 npm run typecheck  # limpio
 npm test           # 219 tests passed
+# imagen local pihub:providers-candidate: sha256:1d359796d0d3dfaff8c746ad996192e1cc07971ccb313231d30cc7e5146d4e34
 ```
+
+La imagen candidata también se verificó contra Manager y Runners reales: una
+proyección managed configuró un Model, dos Agents observaron un Provider de
+Extension sin que el Manager lo expusiera, el logout recargó credenciales sin
+secreto en la respuesta y un restart conservó el Provider del Runner.
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
 verificación separada contra un Manager real; no forma parte de `npm test`.

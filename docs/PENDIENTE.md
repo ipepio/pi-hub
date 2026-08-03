@@ -93,11 +93,19 @@ El Module profundo, el catálogo first-class, custom Providers, la proyección
 managed y el registro de Providers de Extensions están implementados en la rama
 `feature/providers-module`, con `npm test` y `npm run typecheck` verdes.
 
-**Pendiente:** construir una imagen candidata, ejecutar Manager/Runner reales y
-verificar OAuth, dos Agents del mismo Runtime, turnos vivos durante login/logout,
-proyección idempotente y ausencia de secretos antes de publicar una nueva
-release. El dashboard debe mantener su camino legacy hasta que esa matriz esté
-verde; no se cambia el digest v0.7.0 en este trabajo.
+**Verificado localmente:** la imagen `pihub:providers-candidate` se construyó
+con el árbol limpio (`sha256:1d359796d0d3dfaff8c746ad996192e1cc07971ccb313231d30cc7e5146d4e34`)
+y pasó contra Manager y Runners reales: proyección managed, dos Agents con un
+Provider registrado por Extension, logout con recarga de credenciales, restart
+del Runner, persistencia y ausencia de secretos/paths en las respuestas. La
+matriz unitaria cubre además atomicidad, rollback, OAuth y proyección idempotente.
+
+**Pendiente:** verificar el intercambio OAuth completo contra un Provider real y
+la mutación de credenciales mientras un turno real está vivo; ambos requieren
+credenciales/callback y un Provider de inferencia disponible. Después hay que
+publicar una release separada y actualizar explícitamente el digest del
+dashboard. Hasta entonces el dashboard mantiene su camino legacy y no se cambia
+el digest publicado v0.7.0.
 
 ## 8. Diagnóstico de errores de Provider en turnos
 
