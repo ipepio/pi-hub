@@ -161,6 +161,10 @@ export class SessionHubRegistry {
     return hub;
   }
 
+  get isStreaming(): boolean {
+    return [...this.hubs.values()].some((hub) => hub.isStreaming);
+  }
+
   reset(): void {
     for (const hub of this.hubs.values()) hub.reset();
     this.hubs.clear();

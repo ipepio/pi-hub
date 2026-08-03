@@ -75,7 +75,7 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
   );
 
   app.post("/api/providers/reload", async (c) => {
-    if (hub.isStreaming) return c.json({ status: "deferred" }, 202);
+    if (sessions.isStreaming) return c.json({ status: "deferred" }, 202);
     await factory.runtimeProviders.apply({ type: "refresh" });
     return c.json({ status: "reloaded" });
   });

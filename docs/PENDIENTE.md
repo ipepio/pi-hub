@@ -94,11 +94,12 @@ managed y el registro de Providers de Extensions están implementados en la rama
 `feature/providers-module`, con `npm test` y `npm run typecheck` verdes.
 
 **Verificado localmente:** la imagen `pihub:providers-candidate` se construyó
-con el árbol limpio (`sha256:1d359796d0d3dfaff8c746ad996192e1cc07971ccb313231d30cc7e5146d4e34`)
+con el árbol limpio (`sha256:903a195206c4979443ffa3ebc3313bbf2875b99a605fdfd32425395f2a51720f`)
 y pasó contra Manager y Runners reales: proyección managed, dos Agents con un
-Provider registrado por Extension, logout con recarga de credenciales, restart
-del Runner, persistencia y ausencia de secretos/paths en las respuestas. La
-matriz unitaria cubre además atomicidad, rollback, OAuth y proyección idempotente.
+Provider registrado por Extension, logout con recarga de credenciales, logout
+durante un turno con recarga diferida, restart del Runner, persistencia y
+ausencia de secretos/paths en las respuestas. La matriz unitaria cubre además
+atomicidad, rollback, OAuth y proyección idempotente.
 
 **Pendiente:** verificar el intercambio OAuth completo contra un Provider real y
 la mutación de credenciales mientras un turno real está vivo; ambos requieren

@@ -43,3 +43,35 @@ test("cada sessionKey obtiene un ChatHub aislado y conserva el mismo hub al reab
     { sessionKey: "channel-b", text: "mensaje B" },
   ]);
 });
+
+test("isStreaming detecta un turno vivo en cualquier Channel Session", async () => {
+  let streaming = false;
+  const factory = {
+    forSession() {
+      return {
+        async create() {
+          return {
+            get isStreaming() {
+              return streaming;
+            },
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+            async abort() {},
+            dispose() {},
+          };
+        },
+      };
+    },
+  };
+  const registry = new SessionHubRegistry(factory as never);
+  const channel = registry.forKey("telegram");
+
+  await channel.ensureSession();
+  assert.equal(registry.isStreaming, false);
+  streaming = true;
+  assert.equal(registry.isStreaming, true);
+  streaming = false;
+  assert.equal(registry.isStreaming, false);
+});

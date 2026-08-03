@@ -21,14 +21,15 @@
 
 ```text
 npm run typecheck  # limpio
-npm test           # 219 tests passed
-# imagen local pihub:providers-candidate: sha256:1d359796d0d3dfaff8c746ad996192e1cc07971ccb313231d30cc7e5146d4e34
+npm test           # 220 tests passed
+# imagen local pihub:providers-candidate: sha256:903a195206c4979443ffa3ebc3313bbf2875b99a605fdfd32425395f2a51720f
 ```
 
 La imagen candidata también se verificó contra Manager y Runners reales: una
 proyección managed configuró un Model, dos Agents observaron un Provider de
 Extension sin que el Manager lo expusiera, el logout recargó credenciales sin
-secreto en la respuesta y un restart conservó el Provider del Runner.
+secreto en la respuesta, un logout durante un turno devolvió una recarga diferida
+y un restart conservó el Provider del Runner.
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
 verificación separada contra un Manager real; no forma parte de `npm test`.
