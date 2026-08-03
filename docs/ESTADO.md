@@ -1,7 +1,7 @@
 # Estado de pihub
 
 > Última verificación: **2026-08-03** · versión **v0.7.0** · release candidate
-> de Providers construido desde `21a25e3` y validado localmente. El digest
+> de Providers construido desde `add6a88` y validado localmente. El digest
 > publicado `v0.7.0` sigue siendo el baseline sin Providers.
 
 ## Verificado
