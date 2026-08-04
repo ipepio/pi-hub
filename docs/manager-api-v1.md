@@ -101,8 +101,8 @@ en sus propios errores de flujo; no exponen detalles de Runner.
 | `GET` | `/health` | Liveness del Manager |
 | `GET` | `/readiness` | Comprueba acceso al directorio de datos |
 | `GET` | `/status` | Versión, pi, número de Agents y si el panel está montado |
-| `GET` | `/models` | Catálogo de Models y disponibilidad de credenciales |
-| `GET` | `/providers` | Catálogo observado de Runtime Provider Connections |
+| `GET` | `/models` | Catálogo de Models y disponibilidad de credenciales; fallo de lectura: `503 RESOURCE_UNAVAILABLE` |
+| `GET` | `/providers` | Catálogo observado de Runtime Provider Connections; fallo de lectura: `503 RESOURCE_UNAVAILABLE` |
 | `PUT` | `/managed/providers` | Reemplaza la proyección managed (solo Bearer de servicio) |
 | `PUT` | `/providers/custom/:providerId` | Define/actualiza un Provider custom |
 | `DELETE` | `/providers/custom/:providerId` | Revoca y elimina un Provider custom |
@@ -148,6 +148,13 @@ Una **Runtime Provider Connection** es la conexión efectiva de un Provider
 para este User Runtime; no crea un Model global ni evita las políticas del
 Dashboard. `managed` es propiedad del estado deseado enviado por el dashboard;
 `built_in`, `models_json` y `extension` pertenecen al Runtime standalone.
+
+El contrato de lectura de `/models` y `/providers` es binario: `200` significa
+que el catálogo se leyó correctamente, y una lista vacía significa siempre que
+el catálogo está vacío de verdad, nunca un fallo. Un `503 RESOURCE_UNAVAILABLE`
+significa que no se pudo leer el catálogo; el envelope es el estándar
+`{ code, message, correlationId }`, y el detalle real del fallo va al log del
+Manager, nunca al caller.
 
 `PUT /managed/providers` recibe el reemplazo completo:
 

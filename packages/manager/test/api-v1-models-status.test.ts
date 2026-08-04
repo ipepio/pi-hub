@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { scaffoldGlobalDirs } from "@pihub/shared";
 import { createApiV1Router } from "../dist/api-v1/routes.js";
+import type { RuntimeProviders } from "@pihub/providers";
+import type { OAuthService } from "../src/oauth.ts";
 import type { Supervisor } from "../src/supervisor.ts";
 
 // §1.3 del plan: GET /models (catálogo con `configured`) y GET /status
@@ -13,6 +15,42 @@ import type { Supervisor } from "../src/supervisor.ts";
 
 function fakeSupervisor(): Supervisor {
   return { state: () => ({ state: "stopped" }) } as unknown as Supervisor;
+}
+
+// Providers cuyo catálogo NO se puede leer: snapshot() siempre lanza.
+// Las rutas GET /models y GET /providers solo llaman a snapshot(), así
+// que el resto de métodos pueden no existir (cast estructural).
+function brokenProviders(): RuntimeProviders {
+  return {
+    snapshot: async () => {
+      throw new Error("boom");
+    },
+  } as unknown as RuntimeProviders;
+}
+
+// Variante con mensaje de error controlable: permite simular un ENOENT real
+// cuyo texto lleva rutas internas del filesystem, para verificar que el
+// envelope de error nunca las filtra al cliente.
+function brokenProvidersWith(message: string): RuntimeProviders {
+  return {
+    snapshot: async () => {
+      throw new Error(message);
+    },
+  } as unknown as RuntimeProviders;
+}
+
+// Catálogo legítimamente vacío: snapshot() resuelve (no lanza) con arrays
+// vacíos. Es el otro lado del contrato: 200 con lista vacía debe seguir
+// significando "catálogo vacío de verdad", no un fallo disfrazado.
+function emptyProviders(): RuntimeProviders {
+  return {
+    snapshot: async () => ({
+      models: [],
+      providers: [],
+      oauthProviders: [],
+      configurationIssues: [],
+    }),
+  } as unknown as RuntimeProviders;
 }
 
 test("GET /models devuelve un catálogo (array), incluso sin credenciales configuradas", async () => {
@@ -220,6 +258,122 @@ test("GET /status exige la credencial de servicio", async () => {
     const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
     const response = await app.request("http://pihub.test/status", { method: "GET" });
     assert.equal(response.status, 401);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("GET /models devuelve 503 RESOURCE_UNAVAILABLE si el catalogo de Providers no se puede leer (no un array vacio disfrazado)", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-models-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    // oauth no participa en GET /models: `undefined` es seguro y permite
+    // inyectar el providers roto como 4º argumento.
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      undefined as unknown as OAuthService,
+      brokenProviders(),
+    );
+
+    const response = await app.request("http://pihub.test/models", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.code, "RESOURCE_UNAVAILABLE");
+    assert.equal(typeof body.correlationId, "string");
+    // El envelope de error NO puede colarse con un array vacío disfrazado:
+    // si snapshot() falla, la clave "models" no debe existir en absoluto.
+    assert.equal("models" in body, false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("GET /providers devuelve 503 RESOURCE_UNAVAILABLE si el catalogo de Providers no se puede leer", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-providers-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    // oauth no participa en GET /providers: `undefined` es seguro y permite
+    // inyectar el providers roto como 4º argumento.
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      undefined as unknown as OAuthService,
+      brokenProviders(),
+    );
+
+    const response = await app.request("http://pihub.test/providers", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.code, "RESOURCE_UNAVAILABLE");
+    assert.equal(typeof body.correlationId, "string");
+    // Igual que en /models: un error real no debe viajar con `providers: []`.
+    assert.equal("providers" in body, false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("un fallo de catalogo no filtra rutas internas en el envelope de error", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-models-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    // oauth no participa en GET /models: `undefined` es seguro y permite
+    // inyectar el providers roto como 4º argumento.
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      undefined as unknown as OAuthService,
+      brokenProvidersWith(`ENOENT: no such file or directory, open ${dataDir}/global/models.json`),
+    );
+
+    const response = await app.request("http://pihub.test/models", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.code, "RESOURCE_UNAVAILABLE");
+    assert.equal(typeof body.correlationId, "string");
+    // El envelope de error NO puede colarse con rutas internas: ni el mensaje
+    // del error (que contiene el dataDir) ni el dataDir temporal pueden
+    // aparecer en el body serializado.
+    assert.equal(JSON.stringify(body).includes(dataDir), false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("un catalogo legitimamente vacio devuelve 200 con models vacio, no un error", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-models-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    // oauth no participa en GET /models: `undefined` es seguro y permite
+    // inyectar el providers vacío como 4º argumento.
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      undefined as unknown as OAuthService,
+      emptyProviders(),
+    );
+
+    const response = await app.request("http://pihub.test/models", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.models, []);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }

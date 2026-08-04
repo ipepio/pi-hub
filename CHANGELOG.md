@@ -5,6 +5,14 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+### Changed
+
+- **Catálogo de modelos y providers**: `GET /api/v1/models` y `GET /api/v1/providers`
+  devuelven 503 con el envelope estándar y código `RESOURCE_UNAVAILABLE` cuando falla
+  la lectura del catálogo, en lugar de 200 con lista vacía. El contrato de éxito no
+  cambia: un catálogo leído correctamente sigue devolviendo 200 y una lista vacía
+  sigue significando catálogo vacío.
+
 ## [0.8.0] — 2026-08-03
 
 ### Added
@@ -16,7 +24,9 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ### Compatibility
 
-- `/api/v1/models`, OAuth, Agents y turnos conservan su contrato anterior.
+- `/api/v1/models`, OAuth, Agents y turnos conservan su contrato anterior de éxito.
+  El camino de error de `GET /api/v1/models` y `GET /api/v1/providers` cambia: pasa de
+  200 con lista vacía a 503 `RESOURCE_UNAVAILABLE`.
 - La imagen v0.8.0 es una release candidate local; no se ha publicado ni
   actualizado ningún digest externo.
 
@@ -33,7 +43,8 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 ### Compatibility
 
 - Se conservan sin cambios incompatibles `/api/v1/models`, OAuth, Agents, turnos,
-  `/packages` y las rutas legacy `/api/*`.
+  `/packages` y las rutas legacy `/api/*` (contrato de éxito; el camino de error de
+  `GET /api/v1/models` pasa de 200 con lista vacía a 503 `RESOURCE_UNAVAILABLE`).
 - OAuth de suscripción usa IDs explícitos de AuthStorage: `anthropic` y
   `openai-codex`; `openai` no es un ID OAuth válido.
 

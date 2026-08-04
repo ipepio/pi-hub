@@ -24,6 +24,7 @@ import {
   unsetEnv,
   type AgentConfig,
   type AgentStatus,
+  type ModelInfo,
   type PihubEnv,
 } from "@pihub/shared";
 import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
@@ -222,21 +223,27 @@ export function createApiV1Router(
   // --- §4.7 Modelos disponibles (solo lectura, Fase 1 §1.3 del plan) ---
 
   app.get("/models", async (c) => {
+    let models: ModelInfo[];
     try {
-      return c.json({ models: await listModels(providers) });
-    } catch {
-      return c.json({ models: [] });
+      models = await listModels(providers);
+    } catch (error) {
+      console.error("[api-v1] fallo listando modelos:", c.get("correlationId"), error);
+      return fail(c, "RESOURCE_UNAVAILABLE", "Model catalog unavailable");
     }
+    return c.json({ models });
   });
 
   // --- Providers first-class (aditivo; /models permanece intacto) ---
 
   app.get("/providers", async (c) => {
+    let snapshot: Awaited<ReturnType<typeof providers.snapshot>>;
     try {
-      return c.json({ providers: (await providers.snapshot()).providers });
-    } catch {
-      return c.json({ providers: [] });
+      snapshot = await providers.snapshot();
+    } catch (error) {
+      console.error("[api-v1] fallo listando providers:", c.get("correlationId"), error);
+      return fail(c, "RESOURCE_UNAVAILABLE", "Provider catalog unavailable");
     }
+    return c.json({ providers: snapshot.providers });
   });
 
   app.put("/providers/custom/:providerId", async (c) => {
