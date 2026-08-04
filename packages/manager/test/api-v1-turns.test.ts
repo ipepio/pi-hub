@@ -8,7 +8,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { isDuplicateTurn, rememberTurn, toTurnEvent } from "../src/api-v1/turns.ts";
+import { MAX_REMEMBERED_TURNS, isDuplicateTurn, rememberTurn, toTurnEvent } from "../src/api-v1/turns.ts";
 
 describe("idempotencia de turnos (spec §5)", () => {
   it("una idempotencyKey ya vista se detecta como duplicada", () => {
@@ -29,6 +29,49 @@ describe("idempotencia de turnos (spec §5)", () => {
     rememberTurn(visto, "idem-1", "turn-1");
     rememberTurn(visto, "idem-1", "turn-2");
     assert.strictEqual(isDuplicateTurn(visto, "idem-1"), "turn-1");
+  });
+
+  it("el registro no crece sin limite: al superar el maximo expulsa las entradas mas antiguas", () => {
+    // El Map vive lo que el router: sin tope, un Manager de larga vida
+    // acumularia entradas sin cota. Con maxEntries 3 y 4 claves, la mas
+    // antigua (la primera insertada) debe salir del registro.
+    const visto = new Map<string, string>();
+    rememberTurn(visto, "idem-1", "turn-1", 3);
+    assert.ok(visto.size <= 3);
+    rememberTurn(visto, "idem-2", "turn-2", 3);
+    assert.ok(visto.size <= 3);
+    rememberTurn(visto, "idem-3", "turn-3", 3);
+    assert.ok(visto.size <= 3);
+    rememberTurn(visto, "idem-4", "turn-4", 3);
+    assert.ok(visto.size <= 3);
+
+    // La primera clave insertada ya no se detecta como duplicada...
+    assert.strictEqual(isDuplicateTurn(visto, "idem-1"), undefined);
+    // ...y la ultima si, con su turnId correcto.
+    assert.strictEqual(isDuplicateTurn(visto, "idem-4"), "turn-4");
+  });
+
+  it("las entradas dentro del limite se conservan intactas", () => {
+    // Guarda contra una expulsión de mas: con maxEntries 3 y 3 claves,
+    // ninguna debe salir del registro.
+    const visto = new Map<string, string>();
+    rememberTurn(visto, "idem-1", "turn-1", 3);
+    rememberTurn(visto, "idem-2", "turn-2", 3);
+    rememberTurn(visto, "idem-3", "turn-3", 3);
+    assert.strictEqual(visto.size, 3);
+    assert.strictEqual(isDuplicateTurn(visto, "idem-1"), "turn-1");
+    assert.strictEqual(isDuplicateTurn(visto, "idem-2"), "turn-2");
+    assert.strictEqual(isDuplicateTurn(visto, "idem-3"), "turn-3");
+  });
+
+  it("el limite por defecto esta acotado y es el exportado", () => {
+    // Contrato: existe un limite por defecto, finito y positivo. El valor
+    // concreto no es sagrado; la existencia del tope si.
+    assert.ok(
+      Number.isFinite(MAX_REMEMBERED_TURNS),
+      "MAX_REMEMBERED_TURNS debe ser un numero finito",
+    );
+    assert.ok(MAX_REMEMBERED_TURNS > 0, "MAX_REMEMBERED_TURNS debe ser mayor que cero");
   });
 });
 

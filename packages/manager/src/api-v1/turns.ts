@@ -4,13 +4,28 @@
  * despacha; persistirlo exigiría un almacén que hoy no aporta nada. Si
  * el Manager reinicia, un reintento posterior ejecuta de nuevo —
  * aceptable y documentado.
+ *
+ * El registro está además acotado a `MAX_REMEMBERED_TURNS` entradas, con
+ * expulsión de las más antiguas (FIFO por orden de inserción): sin esa
+ * cota el Map crecería sin límite en un proceso de vida larga. La
+ * consecuencia honesta es que una key expulsada por antigüedad se
+ * comporta como una key nueva, igual que tras un reinicio.
  */
+export const MAX_REMEMBERED_TURNS = 10_000;
+
 export function rememberTurn(
   seen: Map<string, string>,
   idempotencyKey: string,
   turnId: string,
+  maxEntries: number = MAX_REMEMBERED_TURNS,
 ): void {
-  if (!seen.has(idempotencyKey)) seen.set(idempotencyKey, turnId);
+  if (seen.has(idempotencyKey)) return;
+  seen.set(idempotencyKey, turnId);
+  while (seen.size > maxEntries) {
+    const oldest = seen.keys().next().value;
+    if (oldest === undefined) break;
+    seen.delete(oldest);
+  }
 }
 
 export function isDuplicateTurn(
