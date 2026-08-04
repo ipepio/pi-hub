@@ -40,6 +40,20 @@ function headers() {
   return { authorization: "Bearer service-token", "content-type": "application/json" };
 }
 
+function fakeOAuthQueFalla(mensaje: string): OAuthService {
+  return {
+    providers: () => [{ id: "anthropic", name: "Anthropic", loggedIn: false }],
+    startLogin: () => {
+      throw new Error(mensaje);
+    },
+    getFlow: () => undefined,
+    submitInput: () => {
+      throw new Error(mensaje);
+    },
+    logout: () => {},
+  } as unknown as OAuthService;
+}
+
 test("/api/v1/auth/providers conserva el catálogo del OAuthService", async () => {
   const dataDir = await setup();
   try {
@@ -101,6 +115,51 @@ test("/api/v1/auth/flows inexistente conserva 404", async () => {
     });
     assert.equal(response.status, 404);
     assert.deepEqual(await response.json(), { error: "No existe" });
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("/api/v1/auth/login/:provider devuelve el envelope estándar y no filtra rutas internas cuando falla", async () => {
+  const dataDir = await setup();
+  try {
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      fakeOAuthQueFalla(`ENOENT: no such file or directory, open ${dataDir}/global/auth.json`),
+    );
+    const response = await app.request("http://pihub.test/auth/login/anthropic", {
+      method: "POST",
+      headers: headers(),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.code, "BAD_REQUEST");
+    assert.equal(typeof body.correlationId, "string");
+    assert.equal(JSON.stringify(body).includes(dataDir), false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("/api/v1/auth/flows/:id/input devuelve el envelope estándar y no filtra rutas internas cuando falla", async () => {
+  const dataDir = await setup();
+  try {
+    const app = createApiV1Router(
+      { dataDir, apiToken: "service-token" },
+      fakeSupervisor(),
+      fakeOAuthQueFalla(`ENOENT: no such file or directory, open ${dataDir}/global/auth.json`),
+    );
+    const response = await app.request("http://pihub.test/auth/flows/flow-1/input", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ value: "123" }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.code, "BAD_REQUEST");
+    assert.equal(typeof body.correlationId, "string");
+    assert.equal(JSON.stringify(body).includes(dataDir), false);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }

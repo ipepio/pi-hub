@@ -163,7 +163,8 @@ export function createApiV1Router(
     try {
       return c.json(await oauth.startLogin(c.req.param("provider")));
     } catch (error) {
-      return c.json({ error: (error as Error).message }, 400);
+      console.error("[api-v1] fallo iniciando login OAuth:", c.get("correlationId"), error);
+      return fail(c, "BAD_REQUEST", "OAuth login could not be started");
     }
   });
 
@@ -177,7 +178,8 @@ export function createApiV1Router(
     try {
       return c.json(await oauth.submitInput(c.req.param("id"), body.value ?? ""));
     } catch (error) {
-      return c.json({ error: (error as Error).message }, 400);
+      console.error("[api-v1] fallo enviando input al flujo OAuth:", c.get("correlationId"), error);
+      return fail(c, "BAD_REQUEST", "OAuth flow input was rejected");
     }
   });
 
