@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # Loop de orquestación central en el manager
 
 La autonomía y la interacción entre agentes vive en un loop de orquestación central en el manager, como infraestructura de plataforma (código, sin LLM), que agenda y enruta iniciativas. Los agentes siguen siendo procesos y sesiones individuales que el loop despierta. La proactividad es propiedad de la plataforma, no de un agente especial.
@@ -17,3 +21,7 @@ pihub hoy es estrictamente reactivo: un agente solo actúa cuando un humano le m
 - Mantiene a cada agente como su propia identidad y proceso, que es lo que se confirmó del concepto de Agent.
 - La interacción entre agentes es trivial: encolar en la agenda de otro, porque el manager ya los conoce a todos.
 - Permite control de concurrencia y presupuesto centralizado (ver ADR-0004).
+
+## Contexto posterior
+
+Se escribió contra el pihub de hoy, que sigue siendo estrictamente reactivo: el Manager solo supervisa Runners y atiende la API/SSE (`docs/ESTADO.md:11-18,82-90`). La proactividad como infraestructura de plataforma sigue siendo el objetivo del roadmap (`docs/PENDIENTE.md:17-19`), pero no es una capacidad disponible: el Loop de autonomía no existe todavía.

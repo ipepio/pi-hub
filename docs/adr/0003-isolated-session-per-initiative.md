@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # Sesión aislada por iniciativa
 
 Cada iniciativa autónoma abre su propia `AgentSession`, separada del chat web y de Telegram. El agente trabaja en segundo plano; el resultado se entrega por callback a otro agente o se anota en memoria.
@@ -17,3 +21,7 @@ Hoy un agente tiene sesiones separadas (el web en `ChatHub`, una por chat de Tel
 - Contexto limpio: una iniciativa no hereda el historial de una conversación ajena.
 - El agente no "recuerda" entre iniciativas salvo por su memoria — y eso es deseable: la autonomía se apoya en memoria persistente, no en historial de chat efímero.
 - Generaliza el patrón existente de Telegram (sesión por chat) a las iniciativas del loop.
+
+## Contexto posterior
+
+El Runner ya puede separar sesiones por `sessionKey` sin compartir el chat, así que una Initiative podría usar una key propia, pero no hay todavía un endpoint que la cree ni una entidad Initiative que la enlace: la parte "por iniciativa" sigue sin implementar (`docs/PENDIENTE.md:8-19`).

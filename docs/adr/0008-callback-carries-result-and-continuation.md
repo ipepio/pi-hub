@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # El callback lleva resultado y continuación juntas
 
 Cuando un agente B termina un trabajo que A le encomendó, encola en A una iniciativa de tipo callback que lleva a la vez el resultado ("ya hice X, aquí está lo que encontré") y la continuación ("ahora te toca a ti"). El callback referencia, vía `parent`, la iniciativa de A que lo originó; el loop reactiva esa iniciativa (que estaba `waiting`) en su misma sesión aislada y le inyecta el resultado como contexto.
@@ -20,3 +24,7 @@ Viajan juntos. El callback es a la vez resultado y continuación: un único mens
 - El `parent` es la clave que resuelve "¿a qué sesión de A devolver?" — el loop reactiva la iniciativa referenciada.
 - La iniciativa que espera un callback debe persistir su contexto (lo que hacía y por qué esperaba) para retomarlo; vive en la agenda durable y puede apoyarse en la memoria del agente.
 - No hace falta inventar un buzón de resultados ni un mecanismo de lectura aparte: el callback es la entrega.
+
+## Contexto posterior
+
+No existe hoy el mensaje callback con `parent` + `result`: el protocolo público solo tiene mensajes de chat y eventos de turno con `turnId`, delta y estado terminal (`packages/shared/src/types.ts:55-74`; `packages/manager/src/api-v1/turns.ts:41-53,81-134`). La forma exacta del callback queda pendiente de decidir persistencia, deduplicación y reactivación.
