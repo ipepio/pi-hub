@@ -7,6 +7,7 @@ import { Supervisor } from "./supervisor.js";
 import { OAuthService } from "./oauth.js";
 import { createRuntimeProviders } from "@pihub/providers";
 import { modelsSeedFile } from "./paths.js";
+import { openManagerStore } from "./storage/sqlite.js";
 
 const env = loadEnv();
 
@@ -21,6 +22,7 @@ const runtimeProviders = createRuntimeProviders({
   oauthProviders: env.oauthProviders,
 });
 await bootstrap(env);
+const managerStore = await openManagerStore(env.dataDir);
 await runtimeProviders.initialize();
 await provisionAgents(env);
 
@@ -39,6 +41,7 @@ const server = serve({ fetch: app.fetch, port: env.managerPort, hostname: "0.0.0
 async function shutdown(): Promise<void> {
   console.log("[pihub] parando agentes...");
   await supervisor.stopAll();
+  managerStore.close();
   server.close();
   process.exit(0);
 }
