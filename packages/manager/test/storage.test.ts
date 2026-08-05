@@ -4,6 +4,11 @@
 // ubicación del fichero, pragmas, versionado de migraciones y las restricciones
 // `CHECK` y de integridad referencial que el diseño fija en las tablas
 // `triggers`, `initiatives`, `callbacks` y `turns`.
+//
+// Desde la Fase 2.0, `ManagerStore` no expone `db` (Paso 0): los tests de DDL
+// inspeccionan el esquema a través del fixture de solo-test `openTestDb`, que
+// devuelve el `SqliteDb` crudo; los tests de comportamiento de Fase 2 cruzarán
+// la interfaz del repositorio (`store.agenda`), nunca `db`.
 
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -11,11 +16,17 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { openManagerStore, type ManagerStore } from "../src/storage/sqlite.ts";
+import {
+  openManagerStore,
+  openTestDb,
+  type ManagerStore,
+  type SqliteDb,
+} from "../src/storage/sqlite.ts";
 import { runMigrations, SCHEMA_VERSION, type Migration } from "../src/storage/migrations.ts";
 
 const tempDirs: string[] = [];
 const openStores: ManagerStore[] = [];
+const openRawDbs: SqliteDb[] = [];
 
 async function tmpDataDir(): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-storage-"));
@@ -25,6 +36,7 @@ async function tmpDataDir(): Promise<string> {
 
 afterEach(async () => {
   for (const store of openStores.splice(0)) store.close();
+  for (const db of openRawDbs.splice(0)) db.close();
   for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -32,6 +44,13 @@ async function openStore(dataDir: string): Promise<ManagerStore> {
   const store = await openManagerStore(dataDir);
   openStores.push(store);
   return store;
+}
+
+/** Fixture de solo-test: `SqliteDb` crudo para inspeccionar pragmas, índices y `user_version`. */
+async function openRaw(dataDir: string): Promise<SqliteDb> {
+  const db = await openTestDb(dataDir);
+  openRawDbs.push(db);
+  return db;
 }
 
 interface TriggerRow {
@@ -52,7 +71,7 @@ interface TriggerRow {
   updated_at: number;
 }
 
-function insertTrigger(store: ManagerStore, overrides: Partial<TriggerRow> = {}): void {
+function insertTrigger(db: SqliteDb, overrides: Partial<TriggerRow> = {}): void {
   const row: TriggerRow = {
     id: "trg-1",
     agent_name: "alice",
@@ -71,18 +90,16 @@ function insertTrigger(store: ManagerStore, overrides: Partial<TriggerRow> = {})
     updated_at: 1000,
     ...overrides,
   };
-  store.db
-    .prepare(
-      `INSERT INTO triggers
-         (id, agent_name, kind, definition_json, intent, mode, suggested_skill,
-          created_by, authority, proposal_state, enabled, next_fire_at, last_fired_at, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    )
-    .run(
-      row.id, row.agent_name, row.kind, row.definition_json, row.intent, row.mode,
-      row.suggested_skill, row.created_by, row.authority, row.proposal_state, row.enabled,
-      row.next_fire_at, row.last_fired_at, row.created_at, row.updated_at,
-    );
+  db.prepare(
+    `INSERT INTO triggers
+       (id, agent_name, kind, definition_json, intent, mode, suggested_skill,
+        created_by, authority, proposal_state, enabled, next_fire_at, last_fired_at, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    row.id, row.agent_name, row.kind, row.definition_json, row.intent, row.mode,
+    row.suggested_skill, row.created_by, row.authority, row.proposal_state, row.enabled,
+    row.next_fire_at, row.last_fired_at, row.created_at, row.updated_at,
+  );
 }
 
 interface InitiativeRow {
@@ -110,7 +127,7 @@ interface InitiativeRow {
   finished_at: number | null;
 }
 
-function insertInitiative(store: ManagerStore, overrides: Partial<InitiativeRow> = {}): void {
+function insertInitiative(db: SqliteDb, overrides: Partial<InitiativeRow> = {}): void {
   const row: InitiativeRow = {
     id: "ini-1",
     agent_name: "alice",
@@ -136,21 +153,19 @@ function insertInitiative(store: ManagerStore, overrides: Partial<InitiativeRow>
     finished_at: null,
     ...overrides,
   };
-  store.db
-    .prepare(
-      `INSERT INTO initiatives
-         (id, agent_name, state, origin, trigger_id, intent, mode, session_key, available_at,
-          bound_model, turn_id, chain_depth, chain_deadline_at, visible_effects_declared, summary,
-          ask_correlation, failure_reason, result, created_at, state_changed_at, started_at, finished_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    )
-    .run(
-      row.id, row.agent_name, row.state, row.origin, row.trigger_id, row.intent, row.mode,
-      row.session_key, row.available_at, row.bound_model, row.turn_id, row.chain_depth,
-      row.chain_deadline_at, row.visible_effects_declared, row.summary, row.ask_correlation,
-      row.failure_reason, row.result, row.created_at, row.state_changed_at, row.started_at,
-      row.finished_at,
-    );
+  db.prepare(
+    `INSERT INTO initiatives
+       (id, agent_name, state, origin, trigger_id, intent, mode, session_key, available_at,
+        bound_model, turn_id, chain_depth, chain_deadline_at, visible_effects_declared, summary,
+        ask_correlation, failure_reason, result, created_at, state_changed_at, started_at, finished_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    row.id, row.agent_name, row.state, row.origin, row.trigger_id, row.intent, row.mode,
+    row.session_key, row.available_at, row.bound_model, row.turn_id, row.chain_depth,
+    row.chain_deadline_at, row.visible_effects_declared, row.summary, row.ask_correlation,
+    row.failure_reason, row.result, row.created_at, row.state_changed_at, row.started_at,
+    row.finished_at,
+  );
 }
 
 interface CallbackRow {
@@ -160,9 +175,9 @@ interface CallbackRow {
   created_at: number;
 }
 
-function insertCallback(store: ManagerStore, overrides: Partial<CallbackRow> = {}): void {
+function insertCallback(db: SqliteDb, overrides: Partial<CallbackRow> = {}): void {
   const row: CallbackRow = { id: "cb-1", parent_id: "parent-1", result: "{}", created_at: 1000, ...overrides };
-  store.db.prepare("INSERT INTO callbacks (id, parent_id, result, created_at) VALUES (?,?,?,?)").run(
+  db.prepare("INSERT INTO callbacks (id, parent_id, result, created_at) VALUES (?,?,?,?)").run(
     row.id, row.parent_id, row.result, row.created_at,
   );
 }
@@ -177,7 +192,7 @@ interface TurnRow {
   finished_at: number | null;
 }
 
-function insertTurn(store: ManagerStore, overrides: Partial<TurnRow> = {}): void {
+function insertTurn(db: SqliteDb, overrides: Partial<TurnRow> = {}): void {
   const row: TurnRow = {
     agent_name: "alice",
     turn_id: "turn-1",
@@ -188,17 +203,17 @@ function insertTurn(store: ManagerStore, overrides: Partial<TurnRow> = {}): void
     finished_at: null,
     ...overrides,
   };
-  store.db
-    .prepare("INSERT INTO turns (agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at) VALUES (?,?,?,?,?,?,?)")
-    .run(row.agent_name, row.turn_id, row.idempotency_key, row.final_state, row.result, row.claimed_at, row.finished_at);
+  db.prepare(
+    "INSERT INTO turns (agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at) VALUES (?,?,?,?,?,?,?)",
+  ).run(row.agent_name, row.turn_id, row.idempotency_key, row.final_state, row.result, row.claimed_at, row.finished_at);
 }
 
-function userVersion(store: ManagerStore): number {
-  return Number((store.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+function userVersion(db: SqliteDb): number {
+  return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
 }
 
-function indexSql(store: ManagerStore, name: string): string {
-  const row = store.db
+function indexSql(db: SqliteDb, name: string): string {
+  const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
     .get(name) as { sql: string } | undefined;
   assert.ok(row, `índice ${name} presente con DDL`);
@@ -216,22 +231,22 @@ describe("almacén SQLite del Manager", () => {
   });
 
   it("aplica los pragmas obligatorios (foreign_keys y WAL)", async () => {
-    const store = await openStore(await tmpDataDir());
-    const fk = store.db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
+    const db = await openRaw(await tmpDataDir());
+    const fk = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
     assert.strictEqual(fk.foreign_keys, 1);
-    const journal = store.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+    const journal = db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
     assert.strictEqual(journal.journal_mode, "wal");
   });
 
   it("crea las cuatro tablas y los índices declarados", async () => {
-    const store = await openStore(await tmpDataDir());
-    const tables = store.db
+    const db = await openRaw(await tmpDataDir());
+    const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all() as Array<{ name: string }>;
     for (const name of ["triggers", "initiatives", "callbacks", "turns"]) {
       assert.ok(tables.some((t) => t.name === name), `tabla ${name} presente`);
     }
-    const indexes = store.db
+    const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
       .all() as Array<{ name: string }>;
     const expected = [
@@ -249,7 +264,7 @@ describe("almacén SQLite del Manager", () => {
   });
 
   it("los índices parciales llevan el predicado WHERE del diseño", async () => {
-    const store = await openStore(await tmpDataDir());
+    const db = await openRaw(await tmpDataDir());
     const predicates: Record<string, string> = {
       schedule_triggers_due:
         "WHERE enabled = 1 AND kind = 'schedule' AND (proposal_state IS NULL OR proposal_state = 'approved')",
@@ -259,7 +274,7 @@ describe("almacén SQLite del Manager", () => {
       initiatives_by_turn: "WHERE turn_id IS NOT NULL",
     };
     for (const [name, predicate] of Object.entries(predicates)) {
-      const sql = normaliseSql(indexSql(store, name));
+      const sql = normaliseSql(indexSql(db, name));
       assert.ok(
         sql.includes(predicate),
         `índice ${name} con predicado \`${predicate}\`, era \`${sql}\``,
@@ -269,15 +284,15 @@ describe("almacén SQLite del Manager", () => {
 
   it("aplica la migración una vez y es idempotente al reabrir", async () => {
     const dataDir = await tmpDataDir();
-    const first = await openStore(dataDir);
+    const first = await openRaw(dataDir);
     assert.strictEqual(userVersion(first), SCHEMA_VERSION);
     insertTrigger(first, { id: "trg-persistente" });
     first.close();
-    openStores.splice(openStores.indexOf(first), 1);
+    openRawDbs.splice(openRawDbs.indexOf(first), 1);
 
-    const second = await openStore(dataDir);
+    const second = await openRaw(dataDir);
     assert.strictEqual(userVersion(second), SCHEMA_VERSION);
-    const rows = second.db
+    const rows = second
       .prepare("SELECT id FROM triggers WHERE id = ?")
       .all("trg-persistente") as Array<{ id: string }>;
     assert.strictEqual(rows.length, 1);
@@ -334,126 +349,126 @@ describe("almacén SQLite del Manager", () => {
 
   describe("CHECK de `triggers`", () => {
     it("rechaza un mode fuera del catálogo", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTrigger(store, { mode: "auto" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTrigger(db, { mode: "auto" }));
     });
 
     it("rechaza created_by inválido y authority inválida", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTrigger(store, { created_by: "grupo" }));
-      assert.throws(() => insertTrigger(store, { authority: "root" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTrigger(db, { created_by: "grupo" }));
+      assert.throws(() => insertTrigger(db, { authority: "root" }));
     });
 
     it("rechaza un booleano enabled que no es 0 ni 1", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTrigger(store, { enabled: 2 }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTrigger(db, { enabled: 2 }));
     });
 
     it("rechaza que el Agent cree sin propuesta pendiente", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTrigger(store, { created_by: "agent" }));
-      assert.throws(() => insertTrigger(store, { created_by: "agent", proposal_state: "bogus" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTrigger(db, { created_by: "agent" }));
+      assert.throws(() => insertTrigger(db, { created_by: "agent", proposal_state: "bogus" }));
     });
 
     it("rechaza que owner/control_plane creen como propuesta", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTrigger(store, { created_by: "owner", proposal_state: "proposed" }));
-      assert.throws(() => insertTrigger(store, { created_by: "control_plane", proposal_state: "proposed" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTrigger(db, { created_by: "owner", proposal_state: "proposed" }));
+      assert.throws(() => insertTrigger(db, { created_by: "control_plane", proposal_state: "proposed" }));
     });
 
     it("acepta las combinaciones válidas de autoría y propuesta", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertTrigger(store, { id: "a", created_by: "owner" });
-      insertTrigger(store, { id: "b", created_by: "control_plane" });
-      insertTrigger(store, { id: "c", created_by: "agent", proposal_state: "proposed" });
-      insertTrigger(store, { id: "d", created_by: "agent", proposal_state: "approved" });
+      const db = await openRaw(await tmpDataDir());
+      insertTrigger(db, { id: "a", created_by: "owner" });
+      insertTrigger(db, { id: "b", created_by: "control_plane" });
+      insertTrigger(db, { id: "c", created_by: "agent", proposal_state: "proposed" });
+      insertTrigger(db, { id: "d", created_by: "agent", proposal_state: "approved" });
     });
   });
 
   describe("CHECK e invariantes de `initiatives`", () => {
     it("rechaza un state fuera de los ocho de Initiative State", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertInitiative(store, { state: "pending" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertInitiative(db, { state: "pending" }));
     });
 
     it("rechaza un mode fuera del catálogo (solo/ask)", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertInitiative(store, { mode: "auto" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertInitiative(db, { mode: "auto" }));
     });
 
     it("rechaza un origin fuera del catálogo (trigger/callback/human)", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertInitiative(store, { origin: "system" }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertInitiative(db, { origin: "system" }));
     });
 
     it("invariante 1: el origen trigger exige trigger_id y los demás lo prohíben", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertTrigger(store, { id: "trg-ref" });
-      assert.throws(() => insertInitiative(store, { origin: "trigger" }));
-      assert.throws(() => insertInitiative(store, { origin: "trigger", trigger_id: null }));
-      assert.throws(() => insertInitiative(store, { origin: "callback", trigger_id: "trg-ref" }));
-      assert.throws(() => insertInitiative(store, { origin: "human", trigger_id: "trg-ref" }));
-      insertInitiative(store, { id: "ok-trigger", origin: "trigger", trigger_id: "trg-ref" });
-      insertInitiative(store, { id: "ok-callback", origin: "callback" });
-      insertInitiative(store, { id: "ok-human", origin: "human" });
+      const db = await openRaw(await tmpDataDir());
+      insertTrigger(db, { id: "trg-ref" });
+      assert.throws(() => insertInitiative(db, { origin: "trigger" }));
+      assert.throws(() => insertInitiative(db, { origin: "trigger", trigger_id: null }));
+      assert.throws(() => insertInitiative(db, { origin: "callback", trigger_id: "trg-ref" }));
+      assert.throws(() => insertInitiative(db, { origin: "human", trigger_id: "trg-ref" }));
+      insertInitiative(db, { id: "ok-trigger", origin: "trigger", trigger_id: "trg-ref" });
+      insertInitiative(db, { id: "ok-callback", origin: "callback" });
+      insertInitiative(db, { id: "ok-human", origin: "human" });
     });
 
     it("invariante 2: estado terminal exige finished_at y los vivos lo prohíben", async () => {
-      const store = await openStore(await tmpDataDir());
+      const db = await openRaw(await tmpDataDir());
       for (const terminal of ["succeeded", "failed", "expired", "cancelled"]) {
-        assert.throws(() => insertInitiative(store, { state: terminal }));
+        assert.throws(() => insertInitiative(db, { state: terminal }));
       }
       for (const vivo of ["queued", "running", "waiting_human", "waiting_agent"]) {
-        assert.throws(() => insertInitiative(store, { state: vivo, finished_at: 1 }));
+        assert.throws(() => insertInitiative(db, { state: vivo, finished_at: 1 }));
       }
-      insertInitiative(store, { id: "ok-terminal", state: "succeeded", finished_at: 2000 });
-      insertInitiative(store, { id: "ok-vivo", state: "waiting_human", summary: "resumen" });
+      insertInitiative(db, { id: "ok-terminal", state: "succeeded", finished_at: 2000 });
+      insertInitiative(db, { id: "ok-vivo", state: "waiting_human", summary: "resumen" });
     });
 
     it("waiting_human exige summary para conservarlo si caduca", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertInitiative(store, { state: "waiting_human" }));
-      insertInitiative(store, { id: "ok", state: "waiting_human", summary: "resumen" });
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertInitiative(db, { state: "waiting_human" }));
+      insertInitiative(db, { id: "ok", state: "waiting_human", summary: "resumen" });
     });
 
     it("rechaza chain_depth negativo y un booleano no binario", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertInitiative(store, { chain_depth: -1 }));
-      assert.throws(() => insertInitiative(store, { visible_effects_declared: 2 }));
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertInitiative(db, { chain_depth: -1 }));
+      assert.throws(() => insertInitiative(db, { visible_effects_declared: 2 }));
     });
 
     it("la FK a triggers usa ON DELETE RESTRICT", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertTrigger(store, { id: "trg-fk" });
-      insertInitiative(store, { id: "ini-fk", origin: "trigger", trigger_id: "trg-fk" });
-      assert.throws(() => store.db.exec("DELETE FROM triggers WHERE id = 'trg-fk'"));
+      const db = await openRaw(await tmpDataDir());
+      insertTrigger(db, { id: "trg-fk" });
+      insertInitiative(db, { id: "ini-fk", origin: "trigger", trigger_id: "trg-fk" });
+      assert.throws(() => db.exec("DELETE FROM triggers WHERE id = 'trg-fk'"));
     });
   });
 
   describe("`callbacks` como especialización 1:1", () => {
     it("rechaza que el Callback sea su propio parent (CHECK parent_id <> id)", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertInitiative(store, { id: "cb-self", origin: "callback" });
-      assert.throws(() => insertCallback(store, { id: "cb-self", parent_id: "cb-self" }));
+      const db = await openRaw(await tmpDataDir());
+      insertInitiative(db, { id: "cb-self", origin: "callback" });
+      assert.throws(() => insertCallback(db, { id: "cb-self", parent_id: "cb-self" }));
     });
 
     it("la FK a initiatives valida id y parent_id", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertInitiative(store, { id: "cb-1", origin: "callback" });
-      insertInitiative(store, { id: "parent-1" });
-      assert.throws(() => insertCallback(store, { id: "inexistente", parent_id: "parent-1" }));
-      assert.throws(() => insertCallback(store, { id: "cb-1", parent_id: "inexistente" }));
-      insertCallback(store, { id: "cb-1", parent_id: "parent-1" });
+      const db = await openRaw(await tmpDataDir());
+      insertInitiative(db, { id: "cb-1", origin: "callback" });
+      insertInitiative(db, { id: "parent-1" });
+      assert.throws(() => insertCallback(db, { id: "inexistente", parent_id: "parent-1" }));
+      assert.throws(() => insertCallback(db, { id: "cb-1", parent_id: "inexistente" }));
+      insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
     });
 
     it("borrar el parent está RESTRICT y borrar la Initiative del Callback CASCADEA su fila", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertInitiative(store, { id: "cb-1", origin: "callback" });
-      insertInitiative(store, { id: "parent-1" });
-      insertCallback(store, { id: "cb-1", parent_id: "parent-1" });
-      assert.throws(() => store.db.exec("DELETE FROM initiatives WHERE id = 'parent-1'"));
-      store.db.exec("DELETE FROM initiatives WHERE id = 'cb-1'");
-      const restantes = store.db
+      const db = await openRaw(await tmpDataDir());
+      insertInitiative(db, { id: "cb-1", origin: "callback" });
+      insertInitiative(db, { id: "parent-1" });
+      insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
+      assert.throws(() => db.exec("DELETE FROM initiatives WHERE id = 'parent-1'"));
+      db.exec("DELETE FROM initiatives WHERE id = 'cb-1'");
+      const restantes = db
         .prepare("SELECT COUNT(*) AS n FROM callbacks WHERE id = 'cb-1'")
         .get() as { n: number };
       assert.strictEqual(restantes.n, 0);
@@ -462,21 +477,21 @@ describe("almacén SQLite del Manager", () => {
 
   describe("`turns` como reserva de idempotencia", () => {
     it("rechaza un final_state fuera de succeeded/failed/cancelled", async () => {
-      const store = await openStore(await tmpDataDir());
-      assert.throws(() => insertTurn(store, { final_state: "running" }));
-      insertTurn(store, { final_state: "succeeded", finished_at: 2000 });
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => insertTurn(db, { final_state: "running" }));
+      insertTurn(db, { final_state: "succeeded", finished_at: 2000 });
     });
 
     it("idempotency_key es única globalmente, cruzando Agents", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertTurn(store, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
-      assert.throws(() => insertTurn(store, { agent_name: "bob", turn_id: "turn-2", idempotency_key: "idem-1" }));
+      const db = await openRaw(await tmpDataDir());
+      insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
+      assert.throws(() => insertTurn(db, { agent_name: "bob", turn_id: "turn-2", idempotency_key: "idem-1" }));
     });
 
     it("la PK compuesta (agent_name, turn_id) rechaza duplicados", async () => {
-      const store = await openStore(await tmpDataDir());
-      insertTurn(store, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
-      assert.throws(() => insertTurn(store, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-2" }));
+      const db = await openRaw(await tmpDataDir());
+      insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
+      assert.throws(() => insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-2" }));
     });
   });
 });

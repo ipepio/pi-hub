@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runMigrations } from "./migrations.ts";
+import { AgendaRepository } from "../agenda/index.ts";
 
 // Todo el acceso a SQLite del Manager pasa por este módulo. El driver es
 // `node:sqlite`, el módulo integrado de Node: pihub se instala como servicio
@@ -24,10 +25,22 @@ export interface SqliteDb {
 }
 
 export interface ManagerStore {
-  readonly db: SqliteDb;
+  /** Repositorio de Agenda (barrel de `agenda/`). No expone el driver. */
+  readonly agenda: AgendaRepository;
   /** Ruta completa del fichero `.db` (los ficheros WAL/SHM viven a su lado). */
   readonly file: string;
   close(): void;
+}
+
+/** Pragmas obligatorios del almacén. Solo `storage/` la usa. */
+function configurePragmas(db: SqliteDb): void {
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("PRAGMA journal_mode = WAL");
+  // §5.1 del diseño: se configura un `busy_timeout` para absorber contención
+  // breve. 5000 ms es un valor conservador; la calibración exacta con la
+  // librería elegida sigue pendiente. `synchronous` y la política de checkpoint
+  // se omiten a propósito: el diseño los deja sin fijar hasta tener medición.
+  db.exec("PRAGMA busy_timeout = 5000");
 }
 
 /**
@@ -46,13 +59,24 @@ export async function openManagerStore(dataDir: string): Promise<ManagerStore> {
   await fs.chmod(dir, mode & 0o777);
   const file = path.join(dir, "agenda.sqlite3");
   const db = new DatabaseSync(file);
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA journal_mode = WAL");
-  // §5.1 del diseño: se configura un `busy_timeout` para absorber contención
-  // breve. 5000 ms es un valor conservador; la calibración exacta con la
-  // librería elegida sigue pendiente. `synchronous` y la política de checkpoint
-  // se omiten a propósito: el diseño los deja sin fijar hasta tener medición.
-  db.exec("PRAGMA busy_timeout = 5000");
+  configurePragmas(db);
   runMigrations(db);
-  return { db, file, close: () => db.close() };
+  return { agenda: new AgendaRepository(db), file, close: () => db.close() };
+}
+
+/**
+ * Fixture de solo-test: abre la base del Manager en `${dataDir}/manager/agenda.sqlite3`
+ * y devuelve el `SqliteDb` crudo para que los tests de DDL inspeccionen pragmas,
+ * índices y `user_version` y fuercen `CHECK`s directamente. Producción no importa
+ * este export: `agenda/` encapsula el driver y `openManagerStore` es la única
+ * puerta de producción.
+ */
+export async function openTestDb(dataDir: string): Promise<SqliteDb> {
+  const dir = path.join(dataDir, "manager");
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, "agenda.sqlite3");
+  const db = new DatabaseSync(file);
+  configurePragmas(db);
+  runMigrations(db);
+  return db;
 }
