@@ -50,6 +50,20 @@ interface TriggerRow {
   next_fire_at: number | null;
 }
 
+/** Fila cruda del barrido `schedule_triggers_due` (snake_case). */
+interface DueScheduleRow {
+  id: string;
+  agent_name: string;
+  next_fire_at: number;
+}
+
+/** Trigger `schedule` vencido ahora, tal y como lo expone `listDueSchedule`. */
+export interface DueScheduleTrigger {
+  readonly id: string;
+  readonly agentName: string;
+  readonly nextFireAt: number;
+}
+
 /** Forma mínima de `definition_json` que v1 dispara (pendiente 1, ver docstring). */
 interface IntervalSchedule {
   readonly version: 1;
@@ -102,6 +116,31 @@ export class TriggerRepository {
   constructor(sqlite: SqliteDb, initiatives: InitiativeRepository) {
     this.sqlite = sqlite;
     this.initiatives = initiatives;
+  }
+
+  /**
+   * Fase 3.3 (§3.1 del plan) — qué Triggers `schedule` vencen en `now`. Es el
+   * predicado literal del índice parcial `schedule_triggers_due`
+   * (`migrations.ts:32-33`): `enabled`, `kind='schedule'`, no `proposed` y
+   * `next_fire_at <= now`. **Frontera: lectura** — no abre transacción de
+   * escritura; el disparo (`fireTrigger`) es quien escribe, en su propia tx.
+   * Devuelto por `(next_fire_at, id)`.
+   */
+  listDueSchedule(now: number): readonly DueScheduleTrigger[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT id, agent_name, next_fire_at FROM triggers
+          WHERE enabled = 1 AND kind = 'schedule'
+            AND (proposal_state IS NULL OR proposal_state = 'approved')
+            AND next_fire_at IS NOT NULL AND next_fire_at <= ?
+          ORDER BY next_fire_at, id`,
+      )
+      .all(now) as DueScheduleRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      agentName: row.agent_name,
+      nextFireAt: row.next_fire_at,
+    }));
   }
 
   /**

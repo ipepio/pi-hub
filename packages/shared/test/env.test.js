@@ -33,3 +33,37 @@ test("resolveSharedMemoryAccess: sin override aplica el default de runtime", () 
   assert.equal(resolveSharedMemoryAccess({}, { sharedMemoryDefault: "read" }), "read");
   assert.equal(resolveSharedMemoryAccess({ memory: {} }, { sharedMemoryDefault: "none" }), "none");
 });
+
+test("loadEnv: defaults del Loop (Fase 3.7, §9.7)", () => {
+  const env = loadEnv({});
+  assert.equal(env.loopConcurrency, 1);
+  assert.equal(env.loopPollMs, 1000);
+  assert.equal(env.loopGraceMs, 5000);
+  assert.equal(env.loopPostAbortMarginMs, 1000);
+  // Punto crítico de la sub-fase: `dispatchTimeoutMs` debe tener un default
+  // real y NO cero desde env (`0` significa watchdog desactivado).
+  assert.ok(env.turnDispatchTimeoutMs > 0);
+});
+
+test("loadEnv: PIHUB_LOOP_* y PIHUB_TURN_DISPATCH_TIMEOUT_MS se leen", () => {
+  const env = loadEnv({
+    PIHUB_LOOP_CONCURRENCY: "3",
+    PIHUB_LOOP_POLL_MS: "250",
+    PIHUB_LOOP_GRACE_MS: "0",
+    PIHUB_LOOP_POST_ABORT_MARGIN_MS: "500",
+    PIHUB_TURN_DISPATCH_TIMEOUT_MS: "120000",
+  });
+  assert.equal(env.loopConcurrency, 3);
+  assert.equal(env.loopPollMs, 250);
+  assert.equal(env.loopGraceMs, 0);
+  assert.equal(env.loopPostAbortMarginMs, 500);
+  assert.equal(env.turnDispatchTimeoutMs, 120000);
+});
+
+test("loadEnv: valores de Loop inválidos lanzan", () => {
+  assert.throws(() => loadEnv({ PIHUB_LOOP_CONCURRENCY: "0" }), /PIHUB_LOOP_CONCURRENCY inválido/);
+  assert.throws(() => loadEnv({ PIHUB_LOOP_CONCURRENCY: "abc" }), /PIHUB_LOOP_CONCURRENCY inválido/);
+  assert.throws(() => loadEnv({ PIHUB_LOOP_POLL_MS: "0" }), /PIHUB_LOOP_POLL_MS inválido/);
+  assert.throws(() => loadEnv({ PIHUB_LOOP_GRACE_MS: "-1" }), /PIHUB_LOOP_GRACE_MS inválido/);
+  assert.throws(() => loadEnv({ PIHUB_TURN_DISPATCH_TIMEOUT_MS: "x" }), /PIHUB_TURN_DISPATCH_TIMEOUT_MS inválido/);
+});

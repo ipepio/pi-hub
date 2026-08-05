@@ -20,7 +20,7 @@ import { runMigrations } from "../src/storage/migrations.ts";
 import { AgendaRepository } from "../src/agenda/index.ts";
 import type { StartupRecoveryResult } from "../src/agenda/index.ts";
 import { DomainError } from "../src/agenda/errors.ts";
-import { runStartup, type StartupStore } from "../src/startup.ts";
+import { runStartup, shutdownRuntime, type StartupStore } from "../src/startup.ts";
 
 const openDbs: SqliteDb[] = [];
 
@@ -95,16 +95,32 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
           },
         };
       },
+      createTurns: () => {
+        calls.push("createTurns");
+        return { marker: "turns" };
+      },
       createOAuth: () => {
         calls.push("createOAuth");
         return {};
       },
-      createApp: ({ supervisor, oauth, providers }) => {
+      createApp: ({ supervisor, oauth, providers, turns }) => {
         calls.push("createApp");
         assert.ok(supervisor); // el Supervisor ya arrancado
         assert.ok(oauth);
         assert.ok(providers);
+        assert.ok(turns); // el TurnExecution compartido ya existe (Fase 3.5, D8)
         return {};
+      },
+      createLoop: ({ supervisor, turns }) => {
+        calls.push("createLoop");
+        assert.ok(supervisor);
+        assert.ok(turns); // el mismo TurnExecution compartido
+        return {
+          start(): void {
+            calls.push("loopStart");
+          },
+          async stop(): Promise<void> {},
+        };
       },
       serve: () => {
         calls.push("serve");
@@ -112,7 +128,9 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
       },
     });
 
-    // La secuencia completa, en el orden que fija el plan (§7.1, §10.3).
+    // La secuencia completa, en el orden que fija el plan (§7.1, §10.3 + §9.5):
+    // `createTurns` antes de `createApp` (D2/D8) y `createLoop`/`loopStart`
+    // después de `serve` (el Loop no despacha antes de que el HTTP esté listo).
     assert.deepEqual(calls, [
       "openStore",
       "initialize",
@@ -120,9 +138,12 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
       "recover",
       "createSupervisor",
       "startAll",
+      "createTurns",
       "createOAuth",
       "createApp",
       "serve",
+      "createLoop",
+      "loopStart",
     ]);
     // El orden crítico, explícito: recuperar → arrancar agentes → servir.
     assert.ok(calls.indexOf("recover") < calls.indexOf("startAll"));
@@ -143,6 +164,12 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
     // posteriores lo consumirán desde aquí (sin consumidor todavía).
     assert.equal(runtime.store, store);
     assert.equal(typeof runtime.store.agenda.recoverRunningOnStartup, "function");
+
+    // Fase 3.5 (D2/D8): el TurnExecution compartido y el Loop arrancado quedan
+    // disponibles para las fases posteriores y el shutdown.
+    assert.deepEqual(runtime.turns, { marker: "turns" });
+    assert.equal(typeof runtime.loop.stop, "function");
+    assert.equal(typeof runtime.loop.start, "function");
   });
 
   it("si la recuperación lanza STARTUP_RECOVERY_FAILED, ni startAll ni serve se ejecutan (§7.4)", async () => {
@@ -179,6 +206,10 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
             },
           };
         },
+        createTurns: () => {
+          calls.push("createTurns");
+          return {};
+        },
         createOAuth: () => {
           calls.push("createOAuth");
           return {};
@@ -186,6 +217,10 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
         createApp: () => {
           calls.push("createApp");
           return {};
+        },
+        createLoop: () => {
+          calls.push("createLoop");
+          return { start(): void {}, async stop(): Promise<void> {} };
         },
         serve: () => {
           calls.push("serve");
@@ -198,5 +233,39 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
     // Aborta sin arrancar agentes ni publicar HTTP: el Manager quedaría sin
     // Supervisor ni `serve`, y systemd reintentaría (§7.4).
     assert.deepEqual(calls, ["openStore", "initialize", "provision", "recover"]);
+  });
+});
+
+describe("startup.ts — shutdownRuntime, el orden del apagado (Fase 3.7, §9.7)", () => {
+  it("el orden crítico es loop.stop → stopAll → store.close → server.close", async () => {
+    const calls: string[] = [];
+    await shutdownRuntime({
+      loop: {
+        start(): void {},
+        async stop(): Promise<void> {
+          calls.push("loop.stop");
+        },
+      },
+      supervisor: {
+        async stopAll(): Promise<void> {
+          calls.push("stopAll");
+        },
+      },
+      store: {
+        close(): void {
+          calls.push("store.close");
+        },
+      },
+      server: {
+        close(): void {
+          calls.push("server.close");
+        },
+      },
+    });
+
+    // `loop.stop` PRIMERO (§1.3, D3): es lo que evita que un apagado marque
+    // como `failed` turnos que solo fueron interrumpidos. El store SQLite se
+    // cierra antes que el socket HTTP, igual que en `index.ts`.
+    assert.deepEqual(calls, ["loop.stop", "stopAll", "store.close", "server.close"]);
   });
 });

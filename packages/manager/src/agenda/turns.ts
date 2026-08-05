@@ -35,6 +35,19 @@ import { DomainError } from "./errors.ts";
 /** Terminal de turno (§8.1): `turn-complete/error/aborted` → `succeeded/failed/cancelled`. */
 export type TurnFinalState = "succeeded" | "failed" | "cancelled";
 
+/**
+ * Causa del terminal `failed` (plan de Fase 3 §5.2, Fase 3.2): el catálogo
+ * que `turns.complete` acepta sin dividir la transacción de T6. Sustituye el
+ * literal `'turn_failed'` de Fase 2:
+ * - `turn_failed`: el Runner emitió `turn-error` (`error`).
+ * - `runner_unavailable`: cierre del Runner sin terminal, error de conexión
+ *   o timeout de despacho.
+ * - `dispatch_failed`: el Manager falló al despachar tras el claim.
+ * `agent_errored` se escribe **antes** del claim (transición `queued→failed`),
+ * no vía T6, y por eso no pertenece a este catálogo (§5.2).
+ */
+export type FailureCause = "turn_failed" | "runner_unavailable" | "dispatch_failed";
+
 /** Resultado de reservar idempotencia (§8.2): con `duplicate: true`, `turnId` es el original. */
 export interface ReserveResult {
   readonly turnId: string;
@@ -45,9 +58,10 @@ export interface ReserveResult {
  * Extrae el `errcode` SQLite de un error del driver, si lo tiene. `node:sqlite`
  * expone `errcode` (2067 = UNIQUE, 1555 = PRIMARY KEY, 787 = FK, 275 = CHECK).
  * Solo se usa para distinguir los errores de unicidad de `turns`; cualquier
- * otro error se re-propaga tal cual.
+ * otro error se re-propaga tal cual. Exportado para que el claim unificado
+ * (Fase 3.4, `index.ts`) reutilice la misma distinción dentro de su tx.
  */
-function sqliteErrcode(error: unknown): number | undefined {
+export function sqliteErrcode(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null) return undefined;
   const errcode = (error as { errcode?: unknown }).errcode;
   return typeof errcode === "number" ? errcode : undefined;
@@ -126,6 +140,11 @@ export class TurnRepository {
    * `TURN_ALREADY_TERMINAL` en el siguiente `complete`) y la Initiative ya es
    * terminal por otra vía — no se reabre. `TURN_NOT_FOUND` si el turno nunca
    * se reservó, `TURN_ALREADY_TERMINAL` si ya lo está.
+   *
+   * Fase 3.2 — el `failure_reason` de un `failed` deja de ser el literal
+   * `'turn_failed'`: `complete` acepta una causa del catálogo (`FailureCause`)
+   * y la escribe en la misma transacción (fila T6 no dividida). El valor por
+   * defecto conserva el comportamiento de Fase 2 para los callers previos.
    */
   complete(
     agentName: string,
@@ -133,6 +152,7 @@ export class TurnRepository {
     finalState: TurnFinalState,
     result: string | null,
     now: number,
+    failureCause: FailureCause = "turn_failed",
   ): void {
     // Autoridad declarativa (§5.1): el UPDATE de la Initiative es una
     // transición `running → finalState` y pasa por la función pura antes de
@@ -173,14 +193,15 @@ export class TurnRepository {
           `turno (${agentName}, ${turnId}): el CAS del terminal no cambió exactamente una fila`,
         );
       }
-      // `failure_reason='turn_failed'` es un dato estable del catálogo (§9.1).
+      // `failure_reason` es un dato estable del catálogo (§5.2); la causa
+      // viaja como parámetro sin dividir la transacción de T6.
       if (finalState === "failed") {
         db.prepare(
           `UPDATE initiatives
-              SET state = 'failed', failure_reason = 'turn_failed',
+              SET state = 'failed', failure_reason = ?,
                   result = ?, finished_at = ?, state_changed_at = ?
             WHERE agent_name = ? AND turn_id = ? AND state = 'running'`,
-        ).run(result, now, now, agentName, turnId);
+        ).run(failureCause, result, now, now, agentName, turnId);
       } else {
         db.prepare(
           `UPDATE initiatives

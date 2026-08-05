@@ -54,6 +54,8 @@ export function runnerEnvFor(
 
 interface Managed {
   proc: ChildProcess;
+  /** Puerto del Runner (`config.port`): el Loop lo necesita para abrir el WS del turno. */
+  port: number;
   intentionalStop: boolean;
   restarts: number;
   lastStart: number;
@@ -112,6 +114,7 @@ export class Supervisor {
 
     const managed: Managed = {
       proc,
+      port: config.port,
       intentionalStop: false,
       restarts: this.withinWindow(config.name) ? (this.processes.get(config.name)?.restarts ?? 0) + 1 : 0,
       lastStart: Date.now(),
@@ -215,6 +218,17 @@ export class Supervisor {
     if (!managed) return { state: "stopped" };
     if (!managed.exited) return { state: "running", pid: managed.proc.pid };
     return { state: managed.errored ? "errored" : "stopped" };
+  }
+
+  /**
+   * Puerto del Runner de un Agent en marcha (Fase 3.5, plan §6): el Loop lo
+   * necesita para abrir el WS del turno con `TurnExecution.startTurn`. Es la
+   * misma condición que `state()==='running'` — si el Agent está en marcha, el
+   * puerto existe; `undefined` en cualquier otro caso.
+   */
+  runnerPortOf(name: string): number | undefined {
+    const managed = this.processes.get(name);
+    return managed && !managed.exited ? managed.port : undefined;
   }
 
   async statusOf(config: AgentConfig): Promise<AgentStatus> {

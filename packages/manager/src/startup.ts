@@ -33,6 +33,12 @@ export interface SupervisorLike {
   startAll(): Promise<void>;
 }
 
+/** Superficie mínima del Loop (Fase 3.5) que la composición toca (`start`/`stop`). */
+export interface LoopLike {
+  start(): void;
+  stop(options?: { graceMs?: number }): Promise<void>;
+}
+
 /** Superficie mínima del servidor HTTP que devuelve `serve` (`close`). */
 export interface ServerLike {
   close(): void;
@@ -52,12 +58,19 @@ export interface StartupStore {
   close(): void;
 }
 
-/** Dependencias inyectables de la composición (fakes en test, reales en `index.ts`). */
+/**
+ * Dependencias inyectables de la composición (fakes en test, reales en `index.ts`).
+ * Fase 3.5 (§9.5, D2/D8): el `TurnExecution` compartido se crea **antes** de
+ * `createApp` (la ruta HTTP y el Loop comparten la misma instancia) y el Loop
+ * se compone y arranca **después** de `serve`.
+ */
 export interface StartupDeps<
   S extends StartupStore,
   P extends ProviderLike,
   Sup extends SupervisorLike,
   O,
+  T,
+  Loop extends LoopLike,
   A,
 > {
   /** Abre el almacén (`openManagerStore`): pragmas + migraciones. */
@@ -68,23 +81,49 @@ export interface StartupDeps<
   provision: () => Promise<void>;
   /** Construye el Supervisor (`new Supervisor(env)`). */
   createSupervisor: () => Sup;
+  /** Construye el `TurnExecution` compartido antes de `createApp` (D2); `store.agenda` queda disponible. */
+  createTurns: (deps: { store: S }) => T;
   /** Construye el OAuthService con los providers. */
   createOAuth: (providers: P) => O;
-  /** Construye la app HTTP (`createApi`). */
-  createApp: (deps: { providers: P; supervisor: Sup; oauth: O }) => A;
+  /** Construye la app HTTP (`createApi`); recibe el `TurnExecution` compartido (D8). */
+  createApp: (deps: { providers: P; supervisor: Sup; oauth: O; turns: T }) => A;
+  /** Construye el `AgendaLoop` con el repo, el Supervisor y el `TurnExecution` compartidos. */
+  createLoop: (deps: { store: S; supervisor: Sup; turns: T }) => Loop;
   /** Publica HTTP (`serve`) — el último paso: nada despacha antes de recuperar. */
   serve: (app: A) => ServerLike;
 }
 
 /** Piezas del arranque que `index.ts` conserva para shutdown y fases posteriores. */
-export interface StartupRuntime<S extends StartupStore, Sup extends SupervisorLike, A> {
+export interface StartupRuntime<
+  S extends StartupStore,
+  Sup extends SupervisorLike,
+  T,
+  Loop extends LoopLike,
+  A,
+> {
   /** Almacén abierto; `store.agenda` queda inyectable (sin consumidor todavía). */
   readonly store: S;
   readonly supervisor: Sup;
+  /** `TurnExecution` compartido (ruta HTTP y Loop, D8). */
+  readonly turns: T;
+  /** `AgendaLoop` arrancado tras `serve` (Fase 3.5, D2); `shutdown` lo para antes de `stopAll`. */
+  readonly loop: Loop;
   readonly app: A;
   readonly server: ServerLike;
   /** Resultado observable de la recuperación (log §7.3). */
   readonly recovery: StartupRecoveryResult;
+}
+
+/**
+ * Superficie del shutdown (Fase 3.7, §9.7): las cuatro piezas que se cierran en
+ * orden. Estructural a propósito: el test pasa fakes sin el arranque y `index.ts`
+ * pasa el `StartupRuntime` real (el `store` solo necesita `close` aquí).
+ */
+export interface ShutdownRuntime {
+  readonly loop: LoopLike;
+  readonly supervisor: { stopAll(): Promise<void> };
+  readonly store: { close(): void };
+  readonly server: ServerLike;
 }
 
 /** Log estructurado del resultado de la recuperación (§7.3). */
@@ -102,14 +141,23 @@ function logRecovery(result: StartupRecoveryResult): void {
  * Ejecuta la secuencia de arranque completa en el orden del §7.1. No importa
  * ni ejecuta `index.ts`: los tests pasan fakes por la misma interfaz que
  * producción (plan §10.3).
+ *
+ * Fase 3.5 (§9.5): el `TurnExecution` compartido se crea **antes** de
+ * `createApp` (D2; la ruta HTTP y el Loop comparten la instancia, D8) y el
+ * `AgendaLoop` se compone y arranca **después** de `serve` (D2) — la
+ * autonomía no se ata al socket HTTP, pero el Loop no despacha antes de que
+ * el estado durable sea consistente ni antes de que los Runners estén en
+ * marcha.
  */
 export async function runStartup<
   S extends StartupStore,
   P extends ProviderLike,
   Sup extends SupervisorLike,
   O,
+  T,
+  Loop extends LoopLike,
   A,
->(deps: StartupDeps<S, P, Sup, O, A>): Promise<StartupRuntime<S, Sup, A>> {
+>(deps: StartupDeps<S, P, Sup, O, T, Loop, A>): Promise<StartupRuntime<S, Sup, T, Loop, A>> {
   const store = await deps.openStore(); // 1. openManagerStore (migraciones)
   await deps.providers.initialize(); //    2. Providers.initialize
   await deps.provision(); //              3. provisionAgents
@@ -124,9 +172,32 @@ export async function runStartup<
   const supervisor = deps.createSupervisor(); // 5. new Supervisor
   await supervisor.startAll(); //              6. Supervisor.startAll
 
-  const oauth = deps.createOAuth(deps.providers); // 7. OAuthService
-  const app = deps.createApp({ providers: deps.providers, supervisor, oauth }); // 8. createApi
-  const server = deps.serve(app); //               9. serve — HTTP público
+  // 7. TurnExecution compartido (Fase 3.5, D2): ANTES de createApp para que la
+  //    ruta HTTP y el Loop consuman la misma instancia (D8, §6.3).
+  const turns = deps.createTurns({ store });
+  const oauth = deps.createOAuth(deps.providers); // 8. OAuthService
+  const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns }); // 9. createApi
+  const server = deps.serve(app); //               10. serve — HTTP público
 
-  return { store, supervisor, app, server, recovery };
+  // 11. Fase 3.5 (§1.2, D2): el Loop se compone y arranca DESPUÉS de `serve`.
+  const loop = deps.createLoop({ store, supervisor, turns });
+  loop.start();
+
+  return { store, supervisor, turns, loop, app, server, recovery };
+}
+
+/**
+ * Orden del apagado (§1.3, D3; criterio verificable de Fase 3.7):
+ * `loop.stop` PRIMERO — gracia acotada + abort de los turnos en vuelo; nunca
+ * se escribe `failed` en shutdown — después `supervisor.stopAll()` (mata
+ * Runners), `store.close()` (SQLite) y `server.close()` (HTTP). `loop.stop`
+ * primero es lo que evita que un apagado marque como `failed` turnos que solo
+ * fueron interrumpidos. `index.ts` la llama desde SIGTERM/SIGINT y luego sale.
+ */
+export async function shutdownRuntime(runtime: ShutdownRuntime): Promise<void> {
+  await runtime.loop.stop();
+  console.log("[pihub] parando agentes...");
+  await runtime.supervisor.stopAll();
+  runtime.store.close();
+  runtime.server.close();
 }

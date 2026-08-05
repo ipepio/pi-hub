@@ -33,6 +33,7 @@ import {
   createApiV1Router,
   correlationIdOf,
 } from "./api-v1/routes.js";
+import type { TurnExecution } from "./agenda/turn-execution.js";
 import { csrfCookie, generateCsrfToken } from "./api-v1/auth.js";
 import { apiError } from "./api-v1/errors.js";
 import path from "node:path";
@@ -89,6 +90,7 @@ export function createApi(
   supervisor: Supervisor,
   oauth: OAuthService,
   runtimeProviders?: RuntimeProviders,
+  turns?: TurnExecution,
 ): Hono {
   const app = new Hono();
   const providers =
@@ -112,7 +114,7 @@ export function createApi(
   // resuelve en orden de registro, así que registrar el router primero deja
   // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
   // ruta `/api/*` del panel.
-  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers));
+  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers, turns));
 
   app.use("/api/*", async (c, next) => {
     const authorization = c.req.header("authorization");

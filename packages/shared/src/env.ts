@@ -28,6 +28,21 @@ export interface PihubEnv {
   ttsVoice?: string;
   /** Horas que se conservan los archivos subidos al workspace antes de borrarse */
   uploadsRetentionHours: number;
+  /** Dial del Loop: cuántas Initiatives vuelan a la vez (PIHUB_LOOP_CONCURRENCY, entero ≥1, ADR 0004). */
+  loopConcurrency: number;
+  /** Periodicidad del `tick` del Loop en ms (PIHUB_LOOP_POLL_MS, entero positivo; §2.4). */
+  loopPollMs: number;
+  /** Gracia del shutdown del Loop en ms (PIHUB_LOOP_GRACE_MS; 0 = abort inmediato; §1.3). */
+  loopGraceMs: number;
+  /** Margen post-abort del shutdown en ms (PIHUB_LOOP_POST_ABORT_MARGIN_MS; §1.3). */
+  loopPostAbortMarginMs: number;
+  /**
+   * Watchdog de apertura/silencio del turno en ms (PIHUB_TURN_DISPATCH_TIMEOUT_MS;
+   * §4.6): si el Runner no produce `agent_start`/actividad en ese plazo, el turno
+   * se aborta con `turn-error` (`runner_unavailable`). `0` lo desactiva. Calibración
+   * (§10): el default es real y NO cero — `0` significaría watchdog desactivado.
+   */
+  turnDispatchTimeoutMs: number;
 }
 
 function bool(value: string | undefined, fallback: boolean): boolean {
@@ -40,6 +55,20 @@ function list(value: string | undefined): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function positiveInt(value: string | undefined, fallback: number, name: string): number {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`${name} inválido: ${value} (entero positivo)`);
+  return n;
+}
+
+function nonNegativeInt(value: string | undefined, fallback: number, name: string): number {
+  if (value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${name} inválido: ${value} (entero ≥ 0)`);
+  return n;
 }
 
 export function parsePortRange(value: string | undefined): [number, number] {
@@ -79,5 +108,10 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     ttsModel: env.PIHUB_TTS_MODEL || undefined,
     ttsVoice: env.PIHUB_TTS_VOICE || undefined,
     uploadsRetentionHours: Number(env.PIHUB_UPLOADS_RETENTION_HOURS ?? 24) || 24,
+    loopConcurrency: positiveInt(env.PIHUB_LOOP_CONCURRENCY, 1, "PIHUB_LOOP_CONCURRENCY"),
+    loopPollMs: positiveInt(env.PIHUB_LOOP_POLL_MS, 1000, "PIHUB_LOOP_POLL_MS"),
+    loopGraceMs: nonNegativeInt(env.PIHUB_LOOP_GRACE_MS, 5000, "PIHUB_LOOP_GRACE_MS"),
+    loopPostAbortMarginMs: nonNegativeInt(env.PIHUB_LOOP_POST_ABORT_MARGIN_MS, 1000, "PIHUB_LOOP_POST_ABORT_MARGIN_MS"),
+    turnDispatchTimeoutMs: nonNegativeInt(env.PIHUB_TURN_DISPATCH_TIMEOUT_MS, 30_000, "PIHUB_TURN_DISPATCH_TIMEOUT_MS"),
   };
 }

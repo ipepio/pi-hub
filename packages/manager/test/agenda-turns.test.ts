@@ -240,6 +240,54 @@ describe("turns.ts — complete (T6, §6/§8)", () => {
     assert.equal(ini.finishedAt, 2000);
   });
 
+  it("Fase 3.2: complete acepta cada causa del catálogo y la escribe como failure_reason en la misma tx", () => {
+    const db = openMemoryDb();
+    const repo = new TurnRepository(db);
+    insertTurn(db, "alice", "turn-ru", "idem-ru");
+    insertRunningInitiative(db, "ini-ru", "alice", "turn-ru");
+    insertTurn(db, "alice", "turn-df", "idem-df");
+    insertRunningInitiative(db, "ini-df", "alice", "turn-df");
+
+    repo.complete("alice", "turn-ru", "failed", null, 2000, "runner_unavailable");
+    repo.complete("alice", "turn-df", "failed", null, 2000, "dispatch_failed");
+
+    assert.equal(getTurn(db, "alice", "turn-ru")?.final_state, "failed");
+    assert.equal(getTurn(db, "alice", "turn-df")?.final_state, "failed");
+    const ini = new AgendaRepository(db).initiatives;
+    assert.equal(ini.get("ini-ru").failureReason, "runner_unavailable");
+    assert.equal(ini.get("ini-df").failureReason, "dispatch_failed");
+  });
+
+  it("Fase 3.2: el terminal no dividido por la causa — turno e Initiative cambian en la misma tx", () => {
+    // Si el COMMIT falla a mitad, ni el turno ni la Initiative deben marcar
+    // terminal, sea cual sea la causa del catálogo.
+    const db = openMemoryDb();
+    insertTurn(db, "alice", "turn-atom-ru", "idem-atom-ru");
+    insertRunningInitiative(db, "ini-atom-ru", "alice", "turn-atom-ru");
+
+    let commitTried = false;
+    const flaky: SqliteDb = {
+      exec: (sql) => {
+        if (sql === "COMMIT") {
+          commitTried = true;
+          throw new Error("COMMIT simulado falla");
+        }
+        db.exec(sql);
+      },
+      prepare: (sql) => db.prepare(sql),
+      close: () => db.close(),
+    };
+    const repo = new TurnRepository(flaky);
+
+    assert.throws(() => repo.complete("alice", "turn-atom-ru", "failed", null, 2000, "runner_unavailable"));
+    assert.equal(commitTried, true);
+
+    const turn = getTurn(db, "alice", "turn-atom-ru");
+    assert.equal(turn?.final_state, null);
+    assert.equal(turn?.finished_at, null);
+    assert.equal(new AgendaRepository(db).initiatives.get("ini-atom-ru").state, "running");
+  });
+
   it("turn-aborted → cancelled", () => {
     const db = openMemoryDb();
     const repo = new TurnRepository(db);
