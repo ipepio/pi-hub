@@ -13,7 +13,7 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
   cambia: un catálogo leído correctamente sigue devolviendo 200 y una lista vacía
   sigue significando catálogo vacío.
 
-## [0.8.0] — 2026-08-03
+## [0.8.0-rc.1] — 2026-08-05
 
 ### Added
 
@@ -27,8 +27,10 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 - `/api/v1/models`, OAuth, Agents y turnos conservan su contrato anterior de éxito.
   El camino de error de `GET /api/v1/models` y `GET /api/v1/providers` cambia: pasa de
   200 con lista vacía a 503 `RESOURCE_UNAVAILABLE`.
-- La imagen v0.8.0 es una release candidate local; no se ha publicado ni
-  actualizado ningún digest externo.
+- La imagen se publicó como `v0.8.0-rc.1` con digest
+  `sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
+  El dashboard la fijó con `providerProjection: managed_http` y el drill M4 de
+  upgrade de flota pasó.
 
 ## [0.7.0] — 2026-08-03
 

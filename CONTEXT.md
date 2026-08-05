@@ -36,6 +36,10 @@ _Avoid_: tarea, job, mensaje
 La cola durable de iniciativas pendientes de un agente. Se llena cuando un trigger se dispara, llega un callback o se transfiere input humano; el loop la vacía despachando una a una.
 _Avoid_: lista de tareas, queue
 
+**Initiative State**:
+El estado de una Initiative: `queued` espera despacho; `running` se ejecuta; `waiting_human` espera input humano; `waiting_agent` espera el callback de otro Agent; `succeeded` terminó con éxito; `failed` terminó con error; `expired` agotó su espera; y `cancelled` fue cancelada. `waiting_human` caduca según Agent Policy —siete días por defecto—, pero esa caducidad no se aplica a `waiting_agent`.
+_Avoid_: estado de tarea, `pending`, `done`, `waiting`
+
 **Callback**:
 Una iniciativa que un agente encola en otro para devolverle el resultado de un trabajo previo y reactivar su continuación. No bloquea al emisor.
 _Avoid_: respuesta, reply, webhook
@@ -52,8 +56,12 @@ _Avoid_: prompt, instrucción, tarea
 La interfaz por la que un agente habla con su humano: el chat web o Telegram. Una iniciativa autónoma se traslada a un canal cuando necesita input del humano.
 _Avoid_: interfaz, medio, conexión
 
+**Primary Channel**:
+El Channel por el que un Agent hace sus preguntas autónomas al humano. Telegram tiene prioridad y el chat web actúa como respaldo cuando Telegram no está disponible.
+_Avoid_: canal preferido, canal por defecto, todos los canales
+
 **Solo mode**:
-El agente trabaja sin pedir input. Al terminar, la iniciativa pasa a `done`.
+El agente trabaja sin pedir input. Al terminar con éxito, la iniciativa pasa a `succeeded`.
 _Avoid_: automático, desatendido
 
 **Ask mode**:

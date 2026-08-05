@@ -1,8 +1,8 @@
 # Estado de pihub
 
-> Última verificación: **2026-08-03** · versión **v0.8.0** · release candidate
-> local de Providers construido desde `df1f533` sobre el ancestro Skills
-> `6008a7c`. No se ha creado tag ni publicado imagen.
+> Última verificación: **2026-08-05** · versión **v0.8.0-rc.1** · release
+> candidate de Providers publicada con digest
+> `sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
 
 ## Verificado
 
@@ -11,7 +11,7 @@
 | Manager HTTP (Hono), Supervisor y panel web | Funciona |
 | Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
 | API privada `/api/v1` | Funciona |
-| Runtime Providers Module (catálogo, OAuth, custom y managed projection) | Funciona en la rama `release/v0.8.0-providers-candidate`; OAuth real verificado en Runtime desechable, pendiente de autorización de publicación |
+| Runtime Providers Module (catálogo, OAuth, custom y managed projection) | Funciona en la imagen publicada `v0.8.0-rc.1`; OAuth real verificado en Runtime desechable |
 | Runtime Provider Connections de Extensions | Funciona detrás del Runner; Manager solo observa estado redactado |
 | Panel migrado a `/api/v1` | Funciona: cookie + CSRF, sin token Bearer en browser |
 | Chat del panel por HTTP/SSE | Funciona: Manager → WS interno del Runner |
@@ -25,11 +25,16 @@ npm test           # 220 tests passed
 # imagen local pihub:providers-candidate: sha256:903a195206c4979443ffa3ebc3313bbf2875b99a605fdfd32425395f2a51720f
 ```
 
-La imagen candidata también se verificó contra Manager y Runners reales: una
-proyección managed configuró un Model, dos Agents observaron un Provider de
-Extension sin que el Manager lo expusiera, el logout recargó credenciales sin
-secreto en la respuesta, un logout durante un turno devolvió una recarga diferida
-y un restart conservó el Provider del Runner.
+Antes de publicarse, la imagen candidata también se verificó contra Manager y
+Runners reales: una proyección managed configuró un Model, dos Agents observaron
+un Provider de Extension sin que el Manager lo expusiera, el logout recargó
+credenciales sin secreto en la respuesta, un logout durante un turno devolvió
+una recarga diferida y un restart conservó el Provider del Runner.
+
+El 2026-08-05 se publicó como `v0.8.0-rc.1` con digest
+`sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
+El dashboard fijó esa imagen con `providerProjection: managed_http` y el drill M4
+de upgrade de flota pasó.
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
 verificación separada contra un Manager real; no forma parte de `npm test`.
@@ -88,10 +93,6 @@ La referencia completa, incluidos métodos, payloads, SSE y errores, está en
 - La limitación de `$VAR` en `models.json` para un Runner aislado sigue abierta.
 - El contrato publicado no ofrece replay durable de SSE ni idempotencia tras un
   reinicio del Manager.
-- La imagen publicada `v0.7.0` sigue siendo legacy para Providers. La rama
-  `release/v0.8.0-providers-candidate` añade `/providers`, `/managed/providers` y
-  custom Providers; requiere autorización posterior para publicar y actualizar
-  el digest del dashboard.
 
 Checkpoint candidate: [`verification/providers-v0.8.0-candidate.md`](verification/providers-v0.8.0-candidate.md).
 

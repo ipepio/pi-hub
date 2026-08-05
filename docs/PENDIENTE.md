@@ -5,18 +5,18 @@
 > genérico: si el motivo deja de ser válido, la entrada debe eliminarse o
 > actualizarse.
 
-## 1. Motor de autonomía: diseño aceptado, sin implementación
+## 1. Motor de autonomía: diseñado, pendiente de implementar
 
-Los ocho ADRs de [`adr/`](adr/) describen Loop, Initiative, Agenda, Trigger,
-Callback, sesión aislada y recuperación al arrancar. No existen todavía los
-módulos que los materializan ni la persistencia que necesitarían.
+Los ADRs de autonomía [`0001`–`0008`](adr/), [`0013`](adr/0013-initiative-runs-as-turn-with-own-origin.md) y
+[`0014`](adr/0014-embedded-sqlite-for-agenda-and-terminal-turn-state.md) dejan diseñados Loop, Initiative, Agenda,
+Trigger, Callback, ejecución por turnos y persistencia SQLite. No existen todavía los módulos que los materializan.
 
 **Impacto:** el dashboard puede proyectar autonomía contra un fake, pero no hay
 una fuente real que ejecute Trigger → Initiative → `waiting_human`.
 
-**Desbloqueo:** implementar el diseño de los ADRs como trabajo de Runtime, sin
-reformular la decisión de arquitectura. No debe confundirse con el chat o con
-el bridge SSE ya operativo.
+**Desbloqueo:** implementar el diseño aceptado como trabajo de Runtime, incluido
+el almacén de ADR-0014 y la extensión del turno de ADR-0013. No debe confundirse
+con el chat ni con el bridge SSE ya operativo.
 
 ## 2. Hardening de Runtime standalone (H01.05/H01.07)
 
