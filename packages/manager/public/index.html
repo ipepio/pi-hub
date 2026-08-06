@@ -38,6 +38,7 @@
             <a class="sidebar-link active" data-screen="agents">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
               Agentes
+              <span id="agent-badge-autonomy" class="sidebar-badge hidden"></span>
             </a>
             <a class="sidebar-link" data-screen="packages">
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3v6l-6 3-6-3z"/><path d="M2 5l6 3m0 0l6-3m-6 3v6"/></svg>
@@ -133,6 +134,7 @@
           <div class="agent-tabs" role="tablist" aria-label="Vista del Agent">
             <button id="agent-tab-chat" class="agent-tab active" type="button" role="tab">Chat</button>
             <button id="agent-tab-resources" class="agent-tab" type="button" role="tab">Recursos</button>
+            <button id="agent-tab-autonomy" class="agent-tab" type="button" role="tab">Autonomía</button>
           </div>
 
           <div id="agent-panel-chat" class="agent-panel active">
@@ -156,6 +158,42 @@
                 </button>
               </form>
             </div>
+          </div>
+
+          <div id="agent-panel-autonomy" class="agent-panel">
+            <div class="autonomy-toolbar">
+              <h3 class="autonomy-toolbar-title">Autonomía</h3>
+              <button id="autonomy-refresh" class="btn btn-ghost btn-sm" type="button">↻ Refrescar</button>
+            </div>
+            <div id="autonomy-content" class="autonomy-content">Selecciona un agente para ver su autonomía.</div>
+
+            <!-- Crear trigger -->
+            <details class="autonomy-create-panel">
+              <summary class="autonomy-create-summary">+ Crear trigger</summary>
+              <form id="autonomy-create-form" class="autonomy-create-form">
+                <div class="autonomy-create-row">
+                  <select id="autonomy-create-definition" class="select">
+                    <option value="daily">Diario</option>
+                    <option value="weekly">Semanal</option>
+                  </select>
+                  <input id="autonomy-create-zone" class="input input-mono" placeholder="Zona IANA (ej: Europe/Madrid)" value="UTC" />
+                  <input id="autonomy-create-at" class="input input-mono" type="time" value="09:00" />
+                  <input id="autonomy-create-days" class="input input-mono" placeholder="días: mon,tue,wed" />
+                </div>
+                <div class="autonomy-create-row">
+                  <input id="autonomy-create-intent" class="input" placeholder="Intent (obligatorio)" required />
+                  <select id="autonomy-create-mode" class="select">
+                    <option value="solo">Solo</option>
+                    <option value="ask">Ask</option>
+                  </select>
+                  <input id="autonomy-create-skill" class="input input-mono" placeholder="Skill sugerida (opcional)" />
+                </div>
+                <div class="autonomy-create-actions">
+                  <button type="submit" class="btn btn-primary btn-sm">Crear</button>
+                  <span id="autonomy-create-status" class="list-item-sub"></span>
+                </div>
+              </form>
+            </details>
           </div>
 
           <div id="agent-panel-resources" class="agent-panel">

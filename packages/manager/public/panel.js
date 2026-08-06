@@ -56,9 +56,15 @@ function closeSidebar() {
 $("hamburger").addEventListener("click", openSidebar);
 $("sidebar-overlay").addEventListener("click", closeSidebar);
 
+// ---------- Autonomía ----------
+const autonomyPanel = createAutonomyPanel({ api: panelApi, onError: (error) => {
+  if (error instanceof PanelApiError && error.requiresLogin) showLogin();
+} });
+
 // ---------- navigation ----------
 function navigate(screen) {
   if (screen !== "agent" && currentTurn) void abortCurrentTurn({ silent: true });
+  if (screen !== "agent") autonomyPanel.deactivate();
   document.querySelectorAll(".screen").forEach((s) => s.classList.remove("active"));
   $(`screen-${screen}`)?.classList.add("active");
   document.querySelectorAll(".sidebar-link").forEach((l) =>
@@ -225,6 +231,11 @@ async function loadAgents() {
     card.append(conversation, actions);
     wrap.appendChild(card);
   }
+  // Badge refresh tras recargar agentes
+  setTimeout(() => {
+    const agentNames = Array.from(document.querySelectorAll(".card-title")).map((el) => el.textContent).filter(Boolean);
+    if (agentNames.length) autonomyPanel.refreshBadge(agentNames);
+  }, 100);
 }
 
 // ---------- Modelos disponibles ----------
@@ -272,6 +283,7 @@ function openAgent(agent) {
   navigate("agent");
   setAgentConnection(true, "Listo");
   void loadAgentCommands();
+  autonomyPanel.selectAgent(agent.name);
 }
 
 function setAgentConnection(connected, label = connected ? "Listo" : "Desconectado") {
@@ -377,12 +389,22 @@ function addAgentSystem(text) {
   scrollAgentChat();
 }
 
+const AGENT_TABS = ["chat", "resources", "autonomy"];
+
 function switchAgentPanel(panel) {
-  $("agent-panel-chat").classList.toggle("active", panel === "chat");
-  $("agent-panel-resources").classList.toggle("active", panel === "resources");
-  $("agent-tab-chat").classList.toggle("active", panel === "chat");
-  $("agent-tab-resources").classList.toggle("active", panel === "resources");
+  for (const tab of AGENT_TABS) {
+    const panelEl = $(`agent-panel-${tab}`);
+    const tabEl = $(`agent-tab-${tab}`);
+    if (panelEl) panelEl.classList.toggle("active", tab === panel);
+    if (tabEl) tabEl.classList.toggle("active", tab === panel);
+  }
   if (panel === "resources") void loadAgentResources();
+  if (panel === "autonomy") {
+    autonomyPanel.activate();
+    if (selectedAgent) autonomyPanel.selectAgent(selectedAgent.name);
+  } else {
+    autonomyPanel.deactivate();
+  }
 }
 
 $("agent-back").addEventListener("click", () => {
@@ -393,6 +415,8 @@ $("agent-back").addEventListener("click", () => {
 });
 $("agent-tab-chat").addEventListener("click", () => switchAgentPanel("chat"));
 $("agent-tab-resources").addEventListener("click", () => switchAgentPanel("resources"));
+$("agent-tab-autonomy").addEventListener("click", () => switchAgentPanel("autonomy"));
+$("autonomy-refresh")?.addEventListener("click", () => autonomyPanel.refresh());
 function autoGrowTextarea(el) {
   el.style.height = "auto";
   const max = parseFloat(getComputedStyle(el).maxHeight) || 320;
@@ -1094,6 +1118,29 @@ async function init() {
     void loadGlobalEnv();
     void loadProviders();
     setInterval(() => void loadAgents(), 10000);
+
+    // Autonomía: badge cada 30s con los agentes conocidos
+    function scheduleBadgeRefresh() {
+      const agentNames = Array.from(document.querySelectorAll(".card-title")).map((el) => el.textContent).filter(Boolean);
+      if (agentNames.length) autonomyPanel.startBadgeTimer(agentNames);
+    }
+    // Primer badge tras cargar agentes
+    setTimeout(scheduleBadgeRefresh, 500);
+    // También en cada ciclo de loadAgents
+    const origLoadAgents = loadAgents;
+    window.__autonomyBadgeRefresh = scheduleBadgeRefresh;
+
+    // Visibility / focus para polling de autonomía
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        const active = document.querySelector(".agent-tab.active");
+        if (active?.id === "agent-tab-autonomy") void autonomyPanel.refresh();
+      }
+    });
+    window.addEventListener("focus", () => {
+      const active = document.querySelector(".agent-tab.active");
+      if (active?.id === "agent-tab-autonomy") void autonomyPanel.refresh();
+    });
   } catch (error) {
     if (error instanceof PanelApiError && error.requiresLogin) showLogin();
   }

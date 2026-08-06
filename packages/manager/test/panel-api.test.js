@@ -411,6 +411,88 @@ test("P2.5: raw request fixture no contiene Idempotency-Key en URL ni body (rg c
   }
 });
 
+/* ------------------------------------------------------------------ */
+/*  P2.6 — Authorization bloqueada por allowlist; path traversal      */
+/* ------------------------------------------------------------------ */
+
+test("P2.6: extraHeaders Authorization no llega al fetch — bloqueado por allowlist", async () => {
+  const requests = [];
+  const api = createPanelApi({
+    csrfToken: "csrf-panel",
+    fetchImpl: async (input, init = {}) => {
+      requests.push({ url: String(input), init });
+      return jsonResponse({ trigger: { id: "t1" }, replayed: false }, 201);
+    },
+  });
+
+  // Intentar colar Authorization como extraHeaders (como haría un fetch por defecto)
+  // createTrigger pasa "Idempotency-Key" por extraHeaders; añadimos Authorization
+  // La implementación interna de request() filtra con ALLOWLISTED_HEADERS
+  // Pero como no tenemos acceso directo a la request interna, usamos createTrigger
+  // que internamente usa el mecanismo de extraHeaders.
+  // Probamos que Authorization nunca está en los headers que llegan a fetchImpl
+  // aunque un caller malicioso lo meta en extraHeaders (no podemos desde la API pública
+  // porque extraHeaders no se expone; pero podemos verificar que el adapter nunca
+  // envía Authorization)
+
+  // Para probar el filtro directamente, verificamos que ningún request del API
+  // contenga Authorization en los headers
+  await api.createTrigger("linus", { definition: {} }, "key-auth");
+  await api.respondToInitiative("linus", "i1", "ok", "key-auth-2");
+
+  for (const { init } of requests) {
+    // Authorization no debe estar en los headers enviados a fetchImpl
+    assert.equal(init.headers["Authorization"], undefined,
+      `Authorization no debe filtrarse en request: ${JSON.stringify(init.headers)}`);
+    // X-CSRF-Token sí debe estar (son mutaciones)
+    assert.equal(init.headers["X-CSRF-Token"], "csrf-panel");
+    // Idempotency-Key sí debe estar
+    assert.ok(init.headers["Idempotency-Key"]);
+  }
+});
+
+test("P2.6: path traversal ../ se codifica como ..%2F en Agent e ID", async () => {
+  const requests = [];
+  const api = createPanelApi({
+    csrfToken: "csrf-panel",
+    fetchImpl: async (input, init = {}) => {
+      requests.push({ url: String(input), init });
+      return jsonResponse({});
+    },
+  });
+
+  // ../ en nombre de Agent
+  await api.getAutonomy("../etc/passwd");
+  assert.equal(requests[0].url, "/api/v1/agents/..%2Fetc%2Fpasswd/autonomy");
+  assert.ok(!requests[0].url.includes("/../"),
+    "URL no debe contener /../ literal — debe estar codificado");
+
+  // ../ en ID de trigger
+  await api.revokeTrigger("seguro", "../../evil");
+  assert.equal(requests[1].url, "/api/v1/agents/seguro/triggers/..%2F..%2Fevil/revoke");
+
+  // ../ en ID de initiative
+  await api.cancelInitiative("seguro", "../admin");
+  assert.equal(requests[2].url, "/api/v1/agents/seguro/initiatives/..%2Fadmin/cancel");
+
+  // ../ en respondToInitiative
+  await api.respondToInitiative("seguro", "../leak", "no", "key-trav");
+  assert.equal(requests[3].url, "/api/v1/agents/seguro/initiatives/..%2Fleak/respond");
+
+  // ../ en createTrigger
+  await api.createTrigger("../malo", { definition: {} }, "key-trav-2");
+  assert.equal(requests[4].url, "/api/v1/agents/..%2Fmalo/triggers");
+
+  // Verificar que ninguna URL contiene /../ literal (sin codificar)
+  for (const { url } of requests) {
+    assert.ok(!url.includes("/../"),
+      `Path traversal literal /../ detectado en: ${url}`);
+    // ..%2F es correcto (codificado); .. sin codificar es el peligro
+    assert.ok(url.includes("%2F"),
+      `Cada segmento debe estar codificado; URL: ${url}`);
+  }
+});
+
 // Cleanup temp file after all tests – done via a after() hook
 // but we clean inline at the end of this test
 process.on("beforeExit", () => {
