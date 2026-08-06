@@ -59,9 +59,10 @@ const AT_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 /**
  * Forma versionada de `definition_json` que el repo sabe planificar (Fase 3.6;
  * cierra el pendiente 1). `version: 1` sigue vigente tal cual, sin `timeZone`;
- * no hay migración de datos.
+ * no hay migración de datos. Exportado desde P1.2 para que la proyección de
+ * Autonomy use el mismo parser cerrado, nunca una copia (§3.3).
  */
-type ParsedSchedule =
+export type ParsedSchedule =
   | { version: 1; kind: "interval"; intervalMs: number }
   | { version: 2; kind: "daily"; timeZone: string; at: string }
   | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
@@ -249,6 +250,18 @@ class ScheduleCalculator {
 
 /** Instancia module-privada; no se exporta ni entra en el barrel. */
 const CALC = new ScheduleCalculator();
+
+/**
+ * Parser cerrado de `definition_json` compartido (P1.2 §3.3): la proyección de
+ * Autonomy y el disparo leen la definición con la misma validación, de modo que
+ * una fila ilegible nunca se interpreta a medias. Lanza
+ * `TRIGGER_NOT_DISPARABLE` si la definición no es un schedule planificable; el
+ * caller decide el catálogo (el disparo re-propaga, la proyección lo convierte
+ * en `STORAGE_CORRUPT`).
+ */
+export function parseTriggerDefinition(definitionJson: string): ParsedSchedule {
+  return CALC.parse(definitionJson);
+}
 
 /**
  * Calcula el próximo `next_fire_at` desde la definición del Trigger. Conserva

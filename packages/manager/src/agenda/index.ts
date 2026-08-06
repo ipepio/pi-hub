@@ -11,6 +11,13 @@ import { sqliteErrcode } from "./turns.ts";
 import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
 import { DomainError } from "./errors.ts";
+import {
+  AutonomyProjection,
+  DEFAULT_HISTORY_LIMIT,
+  type InternalAutonomySnapshot,
+  type InternalInitiative,
+  type InternalTrigger,
+} from "./autonomy-projection.ts";
 
 /**
  * Comando estrecho de claim (plan de Fase 3 §4.5, Fase 3.4): el Loop despacha
@@ -55,15 +62,25 @@ export class AgendaRepository {
   /** Repositorio de turnos: idempotencia T7 y terminal T6. */
   readonly turns: TurnRepository;
 
+  /**
+   * Proyección de Autonomy (P1.2): la lectura única de la Agenda que
+   * compartirán `/api/v1` y el panel. Una sola transacción por snapshot y SQL
+   * agent-scoped en cada SELECT (plan P1 §3).
+   */
+  readonly projection: AutonomyProjection;
+
   /** Driver encapsulado; solo los repos de `agenda/` lo usan. */
   private readonly sqlite: SqliteDb;
 
-  constructor(sqlite: SqliteDb) {
+  constructor(sqlite: SqliteDb, options?: { autonomyHistoryLimit?: number }) {
     this.sqlite = sqlite;
     this.initiatives = new InitiativeRepository(sqlite);
     this.triggers = new TriggerRepository(sqlite, this.initiatives);
     this.callbacks = new CallbackRepository(sqlite, this.initiatives);
     this.turns = new TurnRepository(sqlite);
+    this.projection = new AutonomyProjection(sqlite, {
+      historyLimit: options?.autonomyHistoryLimit ?? DEFAULT_HISTORY_LIMIT,
+    });
   }
 
   /**
@@ -213,6 +230,7 @@ export {
   TriggerRepository,
   CallbackRepository,
   TurnRepository,
+  AutonomyProjection,
 };
 export type {
   Initiative,
@@ -222,4 +240,7 @@ export type {
   TurnFinalState,
   FailureCause,
   DueScheduleTrigger,
+  InternalAutonomySnapshot,
+  InternalInitiative,
+  InternalTrigger,
 };
