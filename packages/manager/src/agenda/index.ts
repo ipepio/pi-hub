@@ -4,13 +4,15 @@ import {
   type Initiative,
   type TransitionCommand,
 } from "./initiatives.ts";
-import { TriggerRepository, type DueScheduleTrigger } from "./triggers.ts";
+import { TriggerRepository, type DueScheduleTrigger, type Trigger } from "./triggers.ts";
 import { CallbackRepository } from "./callbacks.ts";
 import { TurnRepository, type ReserveResult, type TurnFinalState, type FailureCause } from "./turns.ts";
 import { sqliteErrcode } from "./turns.ts";
 import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
 import { DomainError } from "./errors.ts";
+import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult } from "./autonomy-control.ts";
+import type { EffectiveTriggerAuthority } from "./triggers.ts";
 import {
   AutonomyProjection,
   DEFAULT_HISTORY_LIMIT,
@@ -231,6 +233,7 @@ export {
   CallbackRepository,
   TurnRepository,
   AutonomyProjection,
+  AutonomyControl,
 };
 export type {
   Initiative,
@@ -240,6 +243,10 @@ export type {
   TurnFinalState,
   FailureCause,
   DueScheduleTrigger,
+  Trigger,
+  CreateTriggerCommand,
+  CreateTriggerResult,
+  EffectiveTriggerAuthority,
   InternalAutonomySnapshot,
   InternalInitiative,
   InternalTrigger,

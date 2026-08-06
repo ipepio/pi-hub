@@ -37,11 +37,13 @@
  * `next_fire_at IS NULL`; v1 solo dispara `kind='schedule'`).
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Temporal } from "@js-temporal/polyfill";
 import type { SqliteDb } from "../storage/sqlite.ts";
 import { InitiativeRepository, type Initiative } from "./initiatives.ts";
+import type { InitiativeMode } from "./state.ts";
 import { DomainError } from "./errors.ts";
+import { sqliteErrcode } from "./turns.ts";
 
 /** Catálogo de días de la semana (`mon`…`sun`), §3.3. */
 const WEEKDAY_NAMES: ReadonlySet<string> = new Set(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
@@ -66,6 +68,67 @@ export type ParsedSchedule =
   | { version: 1; kind: "interval"; intervalMs: number }
   | { version: 2; kind: "daily"; timeZone: string; at: string }
   | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
+
+/**
+ * Autoridad efectiva de un Trigger (plan P1 §4/§5). Se **inyecta** desde el
+ * modo del proceso (`env.panelEnabled`), nunca se infiere de bearer/cookie:
+ * un Bearer usado por el operador en Gobernador sigue actuando bajo `owner`.
+ */
+export type EffectiveTriggerAuthority = "owner" | "control_plane";
+
+/**
+ * Forma de schedule v2 que `createTrigger` admite (plan P1 §4.1): solo
+ * `daily`/`weekly`. `version: 1` es read/execute-only — se lee y se dispara,
+ * pero el panel/dashboard solo crean v2.
+ */
+export type ScheduleV2 =
+  | { version: 2; kind: "daily"; timeZone: string; at: string }
+  | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
+
+/** Modelo completo de Trigger tal y como lo expone el repositorio (P1.3). */
+export interface Trigger {
+  readonly id: string;
+  readonly agentName: string;
+  readonly kind: string;
+  readonly definition: ParsedSchedule;
+  readonly definitionJson: string;
+  readonly intent: string;
+  readonly mode: InitiativeMode;
+  readonly suggestedSkill: string | null;
+  readonly createdBy: "owner" | "control_plane" | "agent";
+  readonly authority: EffectiveTriggerAuthority;
+  readonly proposalState: "proposed" | "approved" | null;
+  readonly enabled: boolean;
+  readonly nextFireAt: number | null;
+  readonly lastFiredAt: number | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly createIdempotencyKey: string | null;
+  readonly createCommandHash: string | null;
+}
+
+/**
+ * Comando de `createTrigger` a nivel de repositorio (plan P1 §4.1). El caller
+ * **no aporta** `created_by`, `authority`, ID, `enabled` ni el próximo disparo:
+ * los materializa el sistema. `authority` es la inyectada por
+ * `AutonomyControl`; `created_by` se deriva de ella en el INSERT.
+ */
+export interface CreateTriggerCommand {
+  readonly agentName: string;
+  readonly definition: ScheduleV2;
+  readonly intent: string;
+  readonly mode: InitiativeMode;
+  readonly suggestedSkill: string | null;
+  readonly idempotencyKey: string;
+  readonly now: number;
+  readonly authority: EffectiveTriggerAuthority;
+}
+
+/** Resultado de `createTrigger`: el Trigger creado o reencontrado y si fue replay. */
+export interface CreateTriggerResult {
+  readonly trigger: Trigger;
+  readonly replayed: boolean;
+}
 
 /** Todo rechazo de schedule es `TRIGGER_NOT_DISPARABLE` (§3); el motivo es interno. */
 function notDisposableSchedule(reason: "json" | "shape" | "timeZone" | "calendar"): DomainError {
@@ -274,6 +337,100 @@ function nextFireAtFromDefinition(definitionJson: string, now: number): number {
   return CALC.nextFireAt(CALC.parse(definitionJson), now);
 }
 
+/** Fila cruda completa de `triggers` (snake_case), tal y como la devuelve el driver. */
+interface TriggerRowFull {
+  id: string;
+  agent_name: string;
+  kind: string;
+  definition_json: string;
+  intent: string;
+  mode: InitiativeMode;
+  suggested_skill: string | null;
+  created_by: "owner" | "control_plane" | "agent";
+  authority: EffectiveTriggerAuthority;
+  proposal_state: "proposed" | "approved" | null;
+  enabled: number;
+  next_fire_at: number | null;
+  last_fired_at: number | null;
+  created_at: number;
+  updated_at: number;
+  create_idempotency_key: string | null;
+  create_command_hash: string | null;
+}
+
+const SELECT_TRIGGER_FULL = `
+  SELECT id, agent_name, kind, definition_json, intent, mode, suggested_skill,
+         created_by, authority, proposal_state, enabled, next_fire_at,
+         last_fired_at, created_at, updated_at, create_idempotency_key,
+         create_command_hash
+    FROM triggers
+`;
+
+function mapTrigger(row: TriggerRowFull): Trigger {
+  return {
+    id: row.id,
+    agentName: row.agent_name,
+    kind: row.kind,
+    definition: CALC.parse(row.definition_json),
+    definitionJson: row.definition_json,
+    intent: row.intent,
+    mode: row.mode,
+    suggestedSkill: row.suggested_skill,
+    createdBy: row.created_by,
+    authority: row.authority,
+    proposalState: row.proposal_state,
+    enabled: row.enabled === 1,
+    nextFireAt: row.next_fire_at,
+    lastFiredAt: row.last_fired_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    createIdempotencyKey: row.create_idempotency_key,
+    createCommandHash: row.create_command_hash,
+  };
+}
+
+/**
+ * Forma canónica del schedule parseado (plan P1 §2.2): claves fijas y `days`
+ * ordenado, de modo que dos comandos equivalentes (p.ej. `days` en distinto
+ * orden) hasheen igual. Es la fuente del `definition_json` normalizado y del
+ * `create_command_hash` — nunca del JSON bruto del caller.
+ */
+function canonicalDefinition(parsed: ParsedSchedule): Record<string, unknown> {
+  if (parsed.version === 1) {
+    return { version: 1, kind: "interval", intervalMs: parsed.intervalMs };
+  }
+  if (parsed.kind === "daily") {
+    return { version: 2, kind: "daily", timeZone: parsed.timeZone, at: parsed.at };
+  }
+  return {
+    version: 2, kind: "weekly", timeZone: parsed.timeZone, at: parsed.at,
+    days: [...parsed.days].sort(),
+  };
+}
+
+/** JSON normalizado que se persiste en `definition_json`. */
+function canonicalDefinitionJson(parsed: ParsedSchedule): string {
+  return JSON.stringify(canonicalDefinition(parsed));
+}
+
+/**
+ * SHA-256 de la forma canónica del comando de create (plan P1 §2.2/§4.1): el
+ * hash incluye `definition`, `intent`, `mode` y `suggestedSkill`, pero no `id`,
+ * timestamps, `created_by` ni `authority`, que son resultados del proceso.
+ */
+function createCommandHash(
+  parsed: ParsedSchedule,
+  command: Pick<CreateTriggerCommand, "intent" | "mode" | "suggestedSkill">,
+): string {
+  const canonical = JSON.stringify({
+    definition: canonicalDefinition(parsed),
+    intent: command.intent,
+    mode: command.mode,
+    suggestedSkill: command.suggestedSkill,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
 export class TriggerRepository {
   private readonly sqlite: SqliteDb;
   private readonly initiatives: InitiativeRepository;
@@ -386,5 +543,129 @@ export class TriggerRepository {
       db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  /**
+   * Lee un Trigger por `id`, **scoped por Agent** (P1.3 §6.1): un ID
+   * perteneciente a otra Agenda devuelve `TRIGGER_NOT_FOUND`, exactamente
+   * igual que uno inexistente. Devuelve el modelo completo del Trigger.
+   */
+  getForAgent(agentName: string, triggerId: string): Trigger {
+    const row = this.sqlite
+      .prepare(`${SELECT_TRIGGER_FULL} WHERE id = ? AND agent_name = ?`)
+      .get(triggerId, agentName) as TriggerRowFull | undefined;
+    if (!row) {
+      throw new DomainError(
+        "TRIGGER_NOT_FOUND",
+        `trigger ${triggerId} no existe para el agent ${agentName}`,
+      );
+    }
+    return mapTrigger(row);
+  }
+
+  /**
+   * Create Trigger idempotente (plan P1 §4.1). Solo admite schedule v2
+   * `daily`/`weekly`; `version: 1` es read/execute-only y se rechaza aquí.
+   *
+   * El caller no aporta `created_by`, `authority`, ID, `enabled` ni el próximo
+   * disparo: `id`, JSON normalizado, `next_fire_at`, `created_at`/`updated_at`,
+   * `created_by` (derivado de `authority`), `authority`, `proposal_state=NULL`
+   * y `enabled=1` se fijan dentro del repositorio.
+   *
+   * Idempotencia agent-scoped: la key vive en `(agent_name, key)`; la misma
+   * key en otro Agent crea otro Trigger (correcto, no un bug). Transacción:
+   *
+   *   1. validar y canonicalizar **antes** de abrir tx; calcular hash;
+   *   2. `BEGIN IMMEDIATE`;
+   *   3. buscar `WHERE agent_name=? AND create_idempotency_key=?`;
+   *   4. si existe y hash coincide → `COMMIT` sin escribir, `replayed:true`;
+   *   5. si existe y hash difiere → rollback + `IDEMPOTENCY_CONFLICT`;
+   *   6. si no existe → `INSERT` completo; el índice único
+   *      `triggers_create_idempotency` es el CAS contra otro escritor;
+   *   7. si el INSERT pierde esa carrera → releer dentro de la tx y aplicar 4/5;
+   *   8. `COMMIT`, `replayed:false`.
+   */
+  createTrigger(command: CreateTriggerCommand): CreateTriggerResult {
+    const db = this.sqlite;
+    // Paso 1: validar y canonicalizar antes de abrir la tx. Se reutiliza el
+    // `ScheduleCalculator` cerrado (misma validación de keys, IANA, HH:mm,
+    // días únicos y DST que `fireTrigger`); no se copia validación en Control.
+    const parsed = CALC.parse(JSON.stringify(command.definition));
+    if (parsed.version !== 2) {
+      // v1 solo se lee/ejecuta; create solo materializa v2 (plan P1 §4.1).
+      throw notDisposableSchedule("shape");
+    }
+    const nextFireAt = CALC.nextFireAt(parsed, command.now);
+    const definitionJson = canonicalDefinitionJson(parsed);
+    const commandHash = createCommandHash(parsed, command);
+
+    const lookup = (): TriggerRowFull | undefined =>
+      db
+        .prepare(
+          `${SELECT_TRIGGER_FULL} WHERE agent_name = ? AND create_idempotency_key = ?`,
+        )
+        .get(command.agentName, command.idempotencyKey) as TriggerRowFull | undefined;
+
+    db.exec("BEGIN IMMEDIATE"); // paso 2
+    try {
+      // Paso 3: la fila ya existente dentro de la tx decide entre 4/5.
+      const existing = lookup();
+      if (existing) {
+        return this.finishCreate(existing, commandHash, command.agentName);
+      }
+
+      // Paso 6: INSERT completo; el índice único es el CAS contra otro escritor.
+      const triggerId = randomUUID();
+      try {
+        db.prepare(
+          `INSERT INTO triggers
+             (id, agent_name, kind, definition_json, intent, mode, suggested_skill,
+              created_by, authority, proposal_state, enabled, next_fire_at,
+              last_fired_at, created_at, updated_at, create_idempotency_key,
+              create_command_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          triggerId, command.agentName, "schedule", definitionJson, command.intent,
+          command.mode, command.suggestedSkill, command.authority,
+          command.authority, null, 1, nextFireAt, null, command.now, command.now,
+          command.idempotencyKey, commandHash,
+        );
+      } catch (error) {
+        // Paso 7: el INSERT perdió la carrera contra otro escritor; releer
+        // dentro de la tx y aplicar 4/5.
+        const errcode = sqliteErrcode(error);
+        if (errcode !== 2067 && errcode !== 1555) throw error;
+        const winner = lookup();
+        if (!winner) throw error;
+        return this.finishCreate(winner, commandHash, command.agentName);
+      }
+
+      db.exec("COMMIT"); // paso 8
+      return { trigger: this.getForAgent(command.agentName, triggerId), replayed: false };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Paso 4/5 de createTrigger: la fila encontrada por key decide entre replay
+   * exitoso (hash coincide) y `IDEMPOTENCY_CONFLICT` (hash distinto — no es un
+   * replay silencioso ni un segundo Trigger).
+   */
+  private finishCreate(
+    existing: TriggerRowFull,
+    commandHash: string,
+    agentName: string,
+  ): CreateTriggerResult {
+    if (existing.create_command_hash === commandHash) {
+      const trigger = mapTrigger(existing);
+      this.sqlite.exec("COMMIT");
+      return { trigger, replayed: true };
+    }
+    throw new DomainError(
+      "IDEMPOTENCY_CONFLICT",
+      `trigger (agent ${agentName}, key ${existing.create_idempotency_key}): misma key, comando distinto`,
+    );
   }
 }
