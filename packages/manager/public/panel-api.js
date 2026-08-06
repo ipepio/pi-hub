@@ -41,11 +41,21 @@ export function createPanelApi({ fetchImpl = globalThis.fetch, csrfToken = "" } 
     currentCsrfToken = token || "";
   }
 
-  async function request(path, { method = "GET", body, formData = false } = {}) {
+  /** Only headers in this set are allowed through `extraHeaders`. Never Authorization. */
+  const ALLOWLISTED_HEADERS = new Set(["Idempotency-Key"]);
+
+  async function request(path, { method = "GET", body, formData = false, extraHeaders } = {}) {
     const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
     const headers = { accept: "application/json" };
     if (mutating) headers["X-CSRF-Token"] = currentCsrfToken;
     if (body !== undefined && !formData) headers["content-type"] = "application/json";
+    if (extraHeaders) {
+      for (const [key, value] of Object.entries(extraHeaders)) {
+        if (ALLOWLISTED_HEADERS.has(key)) {
+          headers[key] = value;
+        }
+      }
+    }
 
     const response = await fetchImpl(path, {
       method,
@@ -107,6 +117,28 @@ export function createPanelApi({ fetchImpl = globalThis.fetch, csrfToken = "" } 
     setGlobalEnv: (key, value) =>
       request(`/api/v1/env/${encodeURIComponent(key)}`, { method: "PUT", body: { value } }),
     removeGlobalEnv: (key) => request(`/api/v1/env/${encodeURIComponent(key)}`, { method: "DELETE" }),
+
+    getAutonomy: (name) => request(agentPath(name, "/autonomy")),
+
+    createTrigger: (name, command, idempotencyKey) =>
+      request(agentPath(name, "/triggers"), {
+        method: "POST",
+        body: command,
+        extraHeaders: { "Idempotency-Key": idempotencyKey },
+      }),
+
+    revokeTrigger: (name, triggerId) =>
+      request(agentPath(name, `/triggers/${encodeURIComponent(triggerId)}/revoke`), { method: "POST" }),
+
+    cancelInitiative: (name, initiativeId) =>
+      request(agentPath(name, `/initiatives/${encodeURIComponent(initiativeId)}/cancel`), { method: "POST" }),
+
+    respondToInitiative: (name, initiativeId, answer, idempotencyKey) =>
+      request(agentPath(name, `/initiatives/${encodeURIComponent(initiativeId)}/respond`), {
+        method: "POST",
+        body: { answer },
+        extraHeaders: { "Idempotency-Key": idempotencyKey },
+      }),
 
     oauth: {
       providers: () => request("/api/v1/auth/providers"),
