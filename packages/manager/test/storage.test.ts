@@ -22,7 +22,7 @@ import {
   type ManagerStore,
   type SqliteDb,
 } from "../src/storage/sqlite.ts";
-import { runMigrations, SCHEMA_VERSION, type Migration } from "../src/storage/migrations.ts";
+import { runMigrations, MIGRATIONS, SCHEMA_VERSION, type Migration } from "../src/storage/migrations.ts";
 
 const tempDirs: string[] = [];
 const openStores: ManagerStore[] = [];
@@ -220,6 +220,47 @@ function indexSql(db: SqliteDb, name: string): string {
   return (row as { sql: string }).sql;
 }
 
+function tableColumns(db: SqliteDb, table: string): Array<{ name: string }> {
+  return db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+}
+
+function tableExists(db: SqliteDb, table: string): boolean {
+  return db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+}
+
+function indexExists(db: SqliteDb, name: string): boolean {
+  return db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").get(name) !== undefined;
+}
+
+function countRows(db: SqliteDb, table: string): number {
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
+  return row.n;
+}
+
+/** node:sqlite devuelve objetos con `null` prototype; `deepEqual` estricto compara prototypes. */
+const plain = <T extends object>(row: T): T => ({ ...row });
+
+/** Base v1 sembrada con las cuatro tablas y los ocho estados de Initiative State. */
+function seedV1Base(db: SqliteDb): void {
+  insertTrigger(db, { id: "trg-owner" });
+  insertTrigger(db, { id: "trg-control", created_by: "control_plane", authority: "control_plane" });
+  insertInitiative(db, { id: "i-queued", state: "queued" });
+  insertInitiative(db, { id: "i-running", state: "running" });
+  insertInitiative(db, { id: "i-waiting-human", state: "waiting_human", summary: "resumen", state_changed_at: 5000 });
+  insertInitiative(db, { id: "i-waiting-agent", state: "waiting_agent" });
+  insertInitiative(db, { id: "i-succeeded", state: "succeeded", finished_at: 2000 });
+  insertInitiative(db, { id: "i-failed", state: "failed", finished_at: 3000 });
+  insertInitiative(db, { id: "i-expired", state: "expired", finished_at: 4000 });
+  insertInitiative(db, { id: "i-cancelled", state: "cancelled", finished_at: 5000 });
+  insertInitiative(db, { id: "cb-1", origin: "callback" });
+  insertInitiative(db, { id: "parent-1", origin: "human" });
+  insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
+  insertTurn(db, { turn_id: "turn-a", idempotency_key: "idem-a", final_state: "succeeded", finished_at: 2000 });
+  insertTurn(db, { turn_id: "turn-b", idempotency_key: "idem-b" });
+}
+
+const HUMAN_EXPIRY_MS = 604800000;
+
 const normaliseSql = (sql: string): string => sql.replace(/\s+/g, " ").trim();
 
 describe("almacén SQLite del Manager", () => {
@@ -238,12 +279,12 @@ describe("almacén SQLite del Manager", () => {
     assert.strictEqual(journal.journal_mode, "wal");
   });
 
-  it("crea las cuatro tablas y los índices declarados", async () => {
+  it("crea las tablas y los índices declarados", async () => {
     const db = await openRaw(await tmpDataDir());
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all() as Array<{ name: string }>;
-    for (const name of ["triggers", "initiatives", "callbacks", "turns"]) {
+    for (const name of ["triggers", "initiatives", "callbacks", "turns", "human_request_deliveries", "runtime_admission"]) {
       assert.ok(tables.some((t) => t.name === name), `tabla ${name} presente`);
     }
     const indexes = db
@@ -257,6 +298,12 @@ describe("almacén SQLite del Manager", () => {
       "initiatives_running_at_startup",
       "initiatives_by_turn",
       "callbacks_by_parent",
+      "triggers_create_idempotency",
+      "triggers_by_agent",
+      "initiatives_human_request",
+      "initiatives_autonomy_live",
+      "initiatives_autonomy_history",
+      "human_request_deliveries_by_initiative",
     ];
     for (const name of expected) {
       assert.ok(indexes.some((i) => i.name === name), `índice ${name} presente`);
@@ -272,6 +319,12 @@ describe("almacén SQLite del Manager", () => {
       initiatives_chain_deadline_due:
         "WHERE state IN ('queued', 'running', 'waiting_agent', 'waiting_human')",
       initiatives_by_turn: "WHERE turn_id IS NOT NULL",
+      triggers_create_idempotency: "WHERE create_idempotency_key IS NOT NULL",
+      initiatives_human_request: "WHERE human_request_id IS NOT NULL",
+      initiatives_autonomy_live:
+        "WHERE state IN ('queued','running','waiting_human','waiting_agent')",
+      initiatives_autonomy_history:
+        "WHERE state IN ('succeeded','failed','expired','cancelled')",
     };
     for (const [name, predicate] of Object.entries(predicates)) {
       const sql = normaliseSql(indexSql(db, name));
@@ -345,6 +398,235 @@ describe("almacén SQLite del Manager", () => {
     const t2 = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't2'").get();
     assert.strictEqual(t2, undefined);
     db.close();
+  });
+
+  it("un Manager schema1 simulado rechaza un volumen ya migrado a schema2", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA user_version = 2");
+    assert.throws(() => runMigrations(db, MIGRATIONS, 1), /supera el soportado/);
+    db.close();
+  });
+
+  describe("migración v1 → v2", () => {
+    it("una instalación nueva termina en schema v2 con forma, índices y constraints v2", async () => {
+      const db = await openRaw(await tmpDataDir());
+      assert.strictEqual(SCHEMA_VERSION, 2);
+      assert.strictEqual(userVersion(db), 2);
+
+      const triggersCols = tableColumns(db, "triggers").map((c) => c.name);
+      for (const col of ["create_idempotency_key", "create_command_hash"]) {
+        assert.ok(triggersCols.includes(col), `columna triggers.${col} presente`);
+      }
+      const initiativesCols = tableColumns(db, "initiatives").map((c) => c.name);
+      for (const col of [
+        "human_question",
+        "human_expires_at",
+        "human_request_id",
+        "pending_human_input",
+        "human_response_idempotency_key",
+        "human_response_command_hash",
+      ]) {
+        assert.ok(initiativesCols.includes(col), `columna initiatives.${col} presente`);
+      }
+
+      for (const table of ["human_request_deliveries", "runtime_admission"]) {
+        assert.ok(tableExists(db, table), `tabla ${table} presente`);
+      }
+
+      const admission = db
+        .prepare("SELECT singleton, state, changed_at FROM runtime_admission")
+        .all() as Array<{ singleton: number; state: string; changed_at: number }>;
+      assert.deepEqual(admission.map(plain), [{ singleton: 1, state: "open", changed_at: 0 }]);
+    });
+
+    it("schema v2 conserva los CHECK de v1 y amplía turns a paused_for_human", async () => {
+      const db = await openRaw(await tmpDataDir());
+      insertTrigger(db, { id: "a", created_by: "agent", proposal_state: "proposed" });
+      assert.throws(() => insertTrigger(db, { id: "b", created_by: "grupo" }));
+      insertInitiative(db, { id: "wh", state: "waiting_human", summary: "resumen" });
+      assert.throws(() => insertInitiative(db, { id: "x", state: "pending" }));
+      insertTurn(db, { final_state: "paused_for_human" });
+      assert.throws(() => insertTurn(db, { turn_id: "t2", idempotency_key: "k2", final_state: "running" }));
+    });
+
+    it("human_request_deliveries aplica CHECK de canal, FKs y unicidades", async () => {
+      const db = await openRaw(await tmpDataDir());
+      insertInitiative(db, { id: "ini-1" });
+      const insert = db.prepare(
+        `INSERT INTO human_request_deliveries
+           (human_request_id, agent_name, initiative_id, channel, external_chat_id, external_message_id, created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      );
+      insert.run("hr-1", "alice", "ini-1", "telegram", "chat-1", "msg-1", 1000);
+      assert.throws(() => insert.run("hr-1", "alice", "ini-1", "telegram", "chat-2", "msg-2", 1000));
+      assert.throws(() => insert.run("hr-2", "alice", "ini-1", "telegram", "chat-1", "msg-1", 1000));
+      assert.throws(() => insert.run("hr-3", "alice", "ini-1", "slack", "chat-3", "msg-3", 1000));
+      assert.throws(() => insert.run("hr-4", "alice", "ini-inexistente", "telegram", "chat-4", "msg-4", 1000));
+    });
+
+    it("runtime_admission es singleton y rechaza estados fuera de open/draining", async () => {
+      const db = await openRaw(await tmpDataDir());
+      assert.throws(() => db.exec("INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (1,'open',1)"));
+      assert.throws(() => db.exec("INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (2,'open',1)"));
+      assert.throws(() => db.exec("UPDATE runtime_admission SET state = 'bogus'"));
+      db.exec("UPDATE runtime_admission SET state = 'draining'");
+    });
+
+    it("migra una base v1 conservando contenido, backfilleando human_expires_at y reconstruyendo turns", () => {
+      const db = new DatabaseSync(":memory:");
+      runMigrations(db, [MIGRATIONS[0]]);
+      assert.strictEqual(userVersion(db), 1);
+      seedV1Base(db);
+
+      const v2 = MIGRATIONS.find((m) => m.version === 2)!;
+      runMigrations(db, [v2]);
+      assert.strictEqual(userVersion(db), 2);
+
+      const trg = db
+        .prepare("SELECT id, created_by, authority, create_idempotency_key, create_command_hash FROM triggers WHERE id = ?")
+        .get("trg-owner") as { id: string; created_by: string; authority: string; create_idempotency_key: string | null; create_command_hash: string | null };
+      assert.deepEqual(plain(trg), {
+        id: "trg-owner",
+        created_by: "owner",
+        authority: "owner",
+        create_idempotency_key: null,
+        create_command_hash: null,
+      });
+
+      const expires = db
+        .prepare("SELECT human_expires_at FROM initiatives WHERE id = ?")
+        .get("i-waiting-human") as { human_expires_at: number | null };
+      assert.strictEqual(expires.human_expires_at, 5000 + HUMAN_EXPIRY_MS);
+      const noBackfill = db
+        .prepare("SELECT human_expires_at FROM initiatives WHERE id IN (?,?,?,?,?,?,?) ORDER BY id")
+        .all("i-queued", "i-running", "i-waiting-agent", "i-succeeded", "i-failed", "i-expired", "i-cancelled") as Array<{ human_expires_at: number | null }>;
+      assert.strictEqual(noBackfill.length, 7);
+      for (const row of noBackfill) assert.strictEqual(row.human_expires_at, null);
+
+      const wh = db
+        .prepare("SELECT human_question, human_request_id, pending_human_input, human_response_idempotency_key, human_response_command_hash FROM initiatives WHERE id = ?")
+        .get("i-waiting-human") as Record<string, null>;
+      assert.deepEqual(plain(wh), {
+        human_question: null,
+        human_request_id: null,
+        pending_human_input: null,
+        human_response_idempotency_key: null,
+        human_response_command_hash: null,
+      });
+
+      const run = db
+        .prepare("SELECT state, summary, state_changed_at, finished_at FROM initiatives WHERE id = ?")
+        .get("i-waiting-human") as { state: string; summary: string; state_changed_at: number; finished_at: number | null };
+      assert.deepEqual(plain(run), { state: "waiting_human", summary: "resumen", state_changed_at: 5000, finished_at: null });
+
+      const cb = db
+        .prepare("SELECT id, parent_id, result, created_at FROM callbacks WHERE id = ?")
+        .get("cb-1") as { id: string; parent_id: string; result: string; created_at: number };
+      assert.deepEqual(plain(cb), { id: "cb-1", parent_id: "parent-1", result: "{}", created_at: 1000 });
+
+      const turns = db
+        .prepare("SELECT agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at FROM turns ORDER BY turn_id")
+        .all() as Array<{ agent_name: string; turn_id: string; idempotency_key: string; final_state: string | null; result: string | null; claimed_at: number; finished_at: number | null }>;
+      assert.deepEqual(turns.map(plain), [
+        { agent_name: "alice", turn_id: "turn-a", idempotency_key: "idem-a", final_state: "succeeded", result: null, claimed_at: 1000, finished_at: 2000 },
+        { agent_name: "alice", turn_id: "turn-b", idempotency_key: "idem-b", final_state: null, result: null, claimed_at: 1000, finished_at: null },
+      ]);
+      assert.strictEqual(countRows(db, "runtime_admission"), 1);
+
+      db.close();
+    });
+
+    it("una sentencia fallida a mitad de v2 revierte a v1 sin columnas, tablas ni índices v2", () => {
+      const db = new DatabaseSync(":memory:");
+      runMigrations(db, [MIGRATIONS[0]]);
+      assert.strictEqual(userVersion(db), 1);
+      seedV1Base(db);
+
+      const realV2Up = MIGRATIONS.find((m) => m.version === 2)!.up;
+      const wrapped: Migration = {
+        version: 2,
+        up: (d) => {
+          realV2Up(d);
+          d.exec("ESTA SENTENCIA NO ES SQL");
+        },
+      };
+      assert.throws(() => runMigrations(db, [wrapped]));
+
+      assert.strictEqual(userVersion(db), 1);
+
+      const triggersCols = tableColumns(db, "triggers").map((c) => c.name);
+      assert.ok(!triggersCols.includes("create_idempotency_key"), "sin columna v2 en triggers");
+      assert.ok(!triggersCols.includes("create_command_hash"), "sin columna v2 en triggers");
+      const initiativesCols = tableColumns(db, "initiatives").map((c) => c.name);
+      for (const col of [
+        "human_question",
+        "human_expires_at",
+        "human_request_id",
+        "pending_human_input",
+        "human_response_idempotency_key",
+        "human_response_command_hash",
+      ]) {
+        assert.ok(!initiativesCols.includes(col), `sin columna v2 initiatives.${col}`);
+      }
+      for (const table of ["human_request_deliveries", "runtime_admission"]) {
+        assert.ok(!tableExists(db, table), `sin tabla v2 ${table}`);
+      }
+      for (const name of [
+        "triggers_create_idempotency",
+        "triggers_by_agent",
+        "initiatives_human_request",
+        "initiatives_autonomy_live",
+        "initiatives_autonomy_history",
+        "human_request_deliveries_by_initiative",
+      ]) {
+        assert.ok(!indexExists(db, name), `sin índice v2 ${name}`);
+      }
+
+      assert.throws(() => insertTurn(db, { turn_id: "t3", idempotency_key: "idem-c", final_state: "paused_for_human" }));
+
+      assert.strictEqual(countRows(db, "triggers"), 2);
+      assert.strictEqual(countRows(db, "initiatives"), 10);
+      assert.strictEqual(countRows(db, "callbacks"), 1);
+      assert.strictEqual(countRows(db, "turns"), 2);
+
+      db.close();
+    });
+
+    it("un fallo DESPUÉS de fijar user_version revierte la versión (atomicidad real)", () => {
+      const db = new DatabaseSync(":memory:");
+      db.exec("PRAGMA user_version = 1");
+      const m: Migration = {
+        version: 2,
+        up: (d) => {
+          d.exec("CREATE TABLE t (x INTEGER)");
+          d.exec("PRAGMA user_version = 2");
+          d.exec("ESTA SENTENCIA NO ES SQL");
+        },
+      };
+      assert.throws(() => runMigrations(db, [m]));
+      assert.strictEqual(userVersion(db), 1, "user_version revertido a 1: la versión es atómica con la tx");
+      assert.strictEqual(tableExists(db, "t"), false, "el DDL también se revierte");
+      db.close();
+    });
+
+    it("reabrir un volumen ya migrado a v2 no re-aplica la migración", async () => {
+      const dataDir = await tmpDataDir();
+      const first = await openRaw(dataDir);
+      assert.strictEqual(userVersion(first), 2);
+      insertTrigger(first, { id: "trg-keep" });
+      first.prepare("UPDATE triggers SET create_idempotency_key = ? WHERE id = ?").run("k-1", "trg-keep");
+      first.close();
+      openRawDbs.splice(openRawDbs.indexOf(first), 1);
+
+      const second = await openRaw(dataDir);
+      assert.strictEqual(userVersion(second), 2);
+      assert.ok(tableExists(second, "runtime_admission"));
+      assert.ok(tableExists(second, "human_request_deliveries"));
+      const kept = second
+        .prepare("SELECT id, create_idempotency_key FROM triggers WHERE id = ?")
+        .all("trg-keep") as Array<{ id: string; create_idempotency_key: string | null }>;
+      assert.deepEqual(kept.map(plain), [{ id: "trg-keep", create_idempotency_key: "k-1" }]);
+    });
   });
 
   describe("CHECK de `triggers`", () => {

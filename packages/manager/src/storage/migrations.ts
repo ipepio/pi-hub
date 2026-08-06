@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export interface Migration {
   version: number;
@@ -90,8 +90,108 @@ CREATE TABLE turns (
 );
 `;
 
+// Schema v2 (plan P1 §2): reserva durable para P3/P4, sin comportamiento.
+// - Columnas de idempotencia/gestión en `triggers` e `initiatives`, todas
+//   nullable para que las filas legacy sigan válidas.
+// - `human_expires_at` se backfillea para las filas ya en `waiting_human` con
+//   `state_changed_at + 604800000` (7 días). El barrido del Loop NO cambia en
+//   P1: la autoridad de expiración es decisión de P3.
+// - `human_request_deliveries` (correlación Telegram) y `runtime_admission`
+//   (admisión P4) se crean y quedan dormidas.
+// - `turns` se reconstruye para admitir `paused_for_human`; P3 la escribirá.
+const V2_ALTER_TRIGGERS = `
+ALTER TABLE triggers ADD COLUMN create_idempotency_key TEXT;
+ALTER TABLE triggers ADD COLUMN create_command_hash TEXT;
+CREATE UNIQUE INDEX triggers_create_idempotency
+  ON triggers(agent_name, create_idempotency_key)
+  WHERE create_idempotency_key IS NOT NULL;
+`;
+
+const V2_ALTER_INITIATIVES = `
+ALTER TABLE initiatives ADD COLUMN human_question TEXT;
+ALTER TABLE initiatives ADD COLUMN human_expires_at INTEGER;
+ALTER TABLE initiatives ADD COLUMN human_request_id TEXT;
+ALTER TABLE initiatives ADD COLUMN pending_human_input TEXT;
+ALTER TABLE initiatives ADD COLUMN human_response_idempotency_key TEXT;
+ALTER TABLE initiatives ADD COLUMN human_response_command_hash TEXT;
+CREATE UNIQUE INDEX initiatives_human_request
+  ON initiatives(human_request_id)
+  WHERE human_request_id IS NOT NULL;
+CREATE INDEX initiatives_autonomy_live
+  ON initiatives(agent_name, state, available_at, id)
+  WHERE state IN ('queued','running','waiting_human','waiting_agent');
+CREATE INDEX initiatives_autonomy_history
+  ON initiatives(agent_name, finished_at DESC, id DESC)
+  WHERE state IN ('succeeded','failed','expired','cancelled');
+`;
+
+const V2_BACKFILL_HUMAN_EXPIRES = `
+UPDATE initiatives
+SET human_expires_at = state_changed_at + 604800000
+WHERE state = 'waiting_human';
+`;
+
+const V2_TRIGGERS_BY_AGENT = `
+CREATE INDEX triggers_by_agent
+  ON triggers(agent_name, created_at, id);
+`;
+
+const V2_HUMAN_REQUEST_DELIVERIES = `
+CREATE TABLE human_request_deliveries (
+  human_request_id TEXT NOT NULL,
+  agent_name TEXT NOT NULL,
+  initiative_id TEXT NOT NULL REFERENCES initiatives (id) ON DELETE CASCADE,
+  channel TEXT NOT NULL CHECK (channel = 'telegram'),
+  external_chat_id TEXT NOT NULL,
+  external_message_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (channel, external_chat_id, external_message_id),
+  UNIQUE (human_request_id, channel)
+);
+CREATE INDEX human_request_deliveries_by_initiative
+  ON human_request_deliveries(initiative_id, created_at);
+`;
+
+const V2_RUNTIME_ADMISSION = `
+CREATE TABLE runtime_admission (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+  state TEXT NOT NULL CHECK (state IN ('open','draining')),
+  changed_at INTEGER NOT NULL
+);
+INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (1,'open',0);
+`;
+
+const V2_REBUILD_TURNS = `
+CREATE TABLE turns_v2 (
+  agent_name TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  final_state TEXT CHECK (final_state IN ('succeeded', 'failed', 'cancelled', 'paused_for_human')),
+  result TEXT,
+  claimed_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  PRIMARY KEY (agent_name, turn_id)
+);
+INSERT INTO turns_v2 (agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at)
+  SELECT agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at FROM turns;
+DROP TABLE turns;
+ALTER TABLE turns_v2 RENAME TO turns;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, up: (db) => db.exec(V1_DDL) },
+  {
+    version: 2,
+    up: (db) => {
+      db.exec(V2_ALTER_TRIGGERS);
+      db.exec(V2_ALTER_INITIATIVES);
+      db.exec(V2_BACKFILL_HUMAN_EXPIRES);
+      db.exec(V2_TRIGGERS_BY_AGENT);
+      db.exec(V2_HUMAN_REQUEST_DELIVERIES);
+      db.exec(V2_RUNTIME_ADMISSION);
+      db.exec(V2_REBUILD_TURNS);
+    },
+  },
 ];
 
 /**
@@ -101,12 +201,16 @@ export const MIGRATIONS: readonly Migration[] = [
  * hace `ROLLBACK` y ni los cambios de esa versión ni su versión quedan
  * confirmados; el siguiente arranque repite la migración completa.
  */
-export function runMigrations(db: SqliteDb, migrations: readonly Migration[] = MIGRATIONS): void {
+export function runMigrations(
+  db: SqliteDb,
+  migrations: readonly Migration[] = MIGRATIONS,
+  supportedVersion: number = SCHEMA_VERSION,
+): void {
   const row = db.prepare("PRAGMA user_version").get() as { user_version: number };
   const diskVersion = Number(row.user_version);
-  if (diskVersion > SCHEMA_VERSION) {
+  if (diskVersion > supportedVersion) {
     throw new Error(
-      `El esquema SQLite del Manager en disco (v${diskVersion}) supera el soportado (v${SCHEMA_VERSION}); abortando`,
+      `El esquema SQLite del Manager en disco (v${diskVersion}) supera el soportado (v${supportedVersion}); abortando`,
     );
   }
   for (const migration of migrations) {
