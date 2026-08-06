@@ -10,17 +10,22 @@
  * Initiative es imposible: misma tx").
  *
  * El repositorio encapsula el índice parcial `schedule_triggers_due`
- * (`migrations.ts:32`) y la forma de `definition_json` (pendiente 1 del
- * diseño: el versionado completo del schedule —zona horaria, recurrencia,
- * saltos— no está fijado). v1 dispara solo Triggers `kind='schedule'` con una
- * recurrencia por intervalo:
+ * (`migrations.ts:32`) y la forma versionada de `definition_json` (Fase 3.6):
+ * el `ScheduleCalculator` de este módulo la valida y materializa el siguiente
+ * vencimiento. Tres formas, sin migración de datos (`version: 1` sigue
+ * vigente tal cual, sin `timeZone`):
  *
  *   { "version": 1, "kind": "interval", "intervalMs": 3_600_000 }
+ *   { "version": 2, "kind": "daily",  "timeZone": "Europe/Madrid", "at": "09:00" }
+ *   { "version": 2, "kind": "weekly", "timeZone": "Europe/Madrid", "at": "09:00",
+ *     "days": ["mon", "wed", "fri"] }
  *
- * `next_fire_at` avanza a `now + intervalMs` (resincroniza desde `now`: no
- * encola disparos atrasados; cada `fireTrigger` crea exactamente una
- * Initiative). Cuando el pendiente 1 se resuelva, solo cambia este módulo: la
- * frontera transaccional de T1 no se mueve.
+ * `next_fire_at` avanza a la primera ocurrencia posterior a `now` en la zona
+ * (resincroniza desde `now`: no encola disparos atrasados; cada `fireTrigger`
+ * crea exactamente una Initiative). Para v1 es `now + intervalMs`; para v2 es
+ * la primera ocurrencia civil posterior según la política DST de §3.3. Cuando
+ * el planificador no sabe planificar la definición, el Trigger no es
+ * disparable y T1 hace ROLLBACK (cero Initiative, fechas intactas).
  *
  * Nota de contrato: `fireTrigger` no pasa por `canTransition` porque no es una
  * transición de estado — es el *nacimiento* de una Initiative en `queued` y el
@@ -33,9 +38,67 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { Temporal } from "@js-temporal/polyfill";
 import type { SqliteDb } from "../storage/sqlite.ts";
 import { InitiativeRepository, type Initiative } from "./initiatives.ts";
 import { DomainError } from "./errors.ts";
+
+/** Catálogo de días de la semana (`mon`…`sun`), §3.3. */
+const WEEKDAY_NAMES: ReadonlySet<string> = new Set(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
+
+type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+/** `PlainDate.dayOfWeek` ISO (mon=1 … sun=7) → nombre del día. */
+const WEEKDAY_BY_ISO: Readonly<Record<number, Weekday>> = {
+  1: "mon", 2: "tue", 3: "wed", 4: "thu", 5: "fri", 6: "sat", 7: "sun",
+};
+
+/** `HH:mm` estricto (`00:00`–`23:59`): se rechazan `9:00` y formas con segundos. */
+const AT_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+/**
+ * Forma versionada de `definition_json` que el repo sabe planificar (Fase 3.6;
+ * cierra el pendiente 1). `version: 1` sigue vigente tal cual, sin `timeZone`;
+ * no hay migración de datos.
+ */
+type ParsedSchedule =
+  | { version: 1; kind: "interval"; intervalMs: number }
+  | { version: 2; kind: "daily"; timeZone: string; at: string }
+  | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
+
+/** Todo rechazo de schedule es `TRIGGER_NOT_DISPARABLE` (§3); el motivo es interno. */
+function notDisposableSchedule(reason: "json" | "shape" | "timeZone" | "calendar"): DomainError {
+  return new DomainError(
+    "TRIGGER_NOT_DISPARABLE",
+    `definition_json no es un schedule planificable (${reason})`,
+  );
+}
+
+/** Fail-closed: el conjunto de claves debe ser exactamente `expected`, sin extra. */
+function hasExactlyKeys(obj: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(obj);
+  if (keys.length !== expected.length) return false;
+  const sortedKeys = [...keys].sort();
+  const sortedExpected = [...expected].sort();
+  return sortedKeys.every((key, index) => key === sortedExpected[index]);
+}
+
+/** Valida `days` de `weekly`: 1–7 valores del catálogo, sin duplicados. */
+function parseWeekdays(value: unknown): readonly Weekday[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 7) {
+    throw notDisposableSchedule("shape");
+  }
+  const seen = new Set<string>();
+  const days: Weekday[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !WEEKDAY_NAMES.has(entry) || seen.has(entry)) {
+      throw notDisposableSchedule("shape");
+    }
+    seen.add(entry);
+    days.push(entry as Weekday);
+  }
+  return days;
+}
 
 /** Fila cruda de `triggers` con lo que `fireTrigger` necesita (snake_case). */
 interface TriggerRow {
@@ -64,49 +127,138 @@ export interface DueScheduleTrigger {
   readonly nextFireAt: number;
 }
 
-/** Forma mínima de `definition_json` que v1 dispara (pendiente 1, ver docstring). */
-interface IntervalSchedule {
-  readonly version: 1;
-  readonly kind: "interval";
-  readonly intervalMs: number;
+/**
+ * Semántica DST de calendario (Fase 3.6). `parse` valida la forma versionada de
+ * `definition_json`; `nextFireAt` materializa el siguiente vencimiento en la
+ * zona IANA del Trigger. Vive encapsulado en este módulo y no se exporta: el
+ * repo lo consume dentro de la transacción de T1 (si lanza, el `catch` de
+ * `fireTrigger` hace ROLLBACK y no nace Initiative ni avanza el Trigger).
+ */
+class ScheduleCalculator {
+  parse(definitionJson: string): ParsedSchedule {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(definitionJson);
+    } catch {
+      throw notDisposableSchedule("json");
+    }
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      throw notDisposableSchedule("shape");
+    }
+    const obj = raw as Record<string, unknown>;
+    if (obj.version === 1 && obj.kind === "interval") {
+      if (!hasExactlyKeys(obj, ["version", "kind", "intervalMs"])) {
+        throw notDisposableSchedule("shape");
+      }
+      if (!Number.isSafeInteger(obj.intervalMs) || (obj.intervalMs as number) <= 0) {
+        throw notDisposableSchedule("shape");
+      }
+      return { version: 1, kind: "interval", intervalMs: obj.intervalMs as number };
+    }
+    if (obj.version === 2 && (obj.kind === "daily" || obj.kind === "weekly")) {
+      if (typeof obj.at !== "string" || !AT_PATTERN.test(obj.at)) {
+        throw notDisposableSchedule("shape");
+      }
+      const timeZone = this.validateTimeZone(obj.timeZone);
+      if (obj.kind === "daily") {
+        if (!hasExactlyKeys(obj, ["version", "kind", "timeZone", "at"])) {
+          throw notDisposableSchedule("shape");
+        }
+        return { version: 2, kind: "daily", timeZone, at: obj.at };
+      }
+      if (!hasExactlyKeys(obj, ["version", "kind", "timeZone", "at", "days"])) {
+        throw notDisposableSchedule("shape");
+      }
+      return { version: 2, kind: "weekly", timeZone, at: obj.at, days: parseWeekdays(obj.days) };
+    }
+    throw notDisposableSchedule("shape");
+  }
+
+  nextFireAt(parsed: ParsedSchedule, now: number): number {
+    if (parsed.kind === "interval") {
+      const next = now + parsed.intervalMs;
+      if (!Number.isSafeInteger(next)) {
+        throw notDisposableSchedule("shape");
+      }
+      return next;
+    }
+    const hour = Number(parsed.at.slice(0, 2));
+    const minute = Number(parsed.at.slice(3, 5));
+    // Convierte `now` a fecha civil en la zona y recorre fechas civiles — nunca
+    // suma 24 h en ms (arruinaría los saltos de reloj). `daily` prueba hoy y
+    // mañana; `weekly` prueba como máximo hoy + 7 días.
+    const civilToday = Temporal.Instant.fromEpochMilliseconds(now)
+      .toZonedDateTimeISO(parsed.timeZone)
+      .toPlainDate();
+    const maxOffset = parsed.kind === "weekly" ? 7 : 1;
+    for (let offset = 0; offset <= maxOffset; offset++) {
+      const day = offset === 0 ? civilToday : civilToday.add({ days: offset });
+      if (parsed.kind === "weekly" && !parsed.days.includes(WEEKDAY_BY_ISO[day.dayOfWeek])) {
+        continue;
+      }
+      const candidate = this.materialize(parsed.timeZone, day, hour, minute);
+      if (candidate.epochMilliseconds > now) {
+        return candidate.epochMilliseconds;
+      }
+    }
+    throw notDisposableSchedule("calendar");
+  }
+
+  /**
+   * Valida la zona IANA. `Temporal.TimeZone` NO existe en el polyfill 0.5.1
+   * (`typeof` da `undefined`), así que se valida construyendo un ZonedDateTime
+   * y convirtiendo el `RangeError` (§3.1). Temporal acepta offsets fijos, que
+   * este diseño rechaza expresamente: la zona debe tener reglas civiles.
+   */
+  private validateTimeZone(value: unknown): string {
+    if (typeof value !== "string" || value.length === 0) {
+      throw notDisposableSchedule("timeZone");
+    }
+    if (value.startsWith("+") || value.startsWith("-")) {
+      throw notDisposableSchedule("timeZone");
+    }
+    try {
+      Temporal.ZonedDateTime.from({ timeZone: value, year: 2024, month: 1, day: 1, hour: 12 });
+    } catch {
+      throw notDisposableSchedule("timeZone");
+    }
+    return value;
+  }
+
+  /**
+   * Materializa el candidato civil con `disambiguation: "compatible"`, que
+   * desplaza hacia delante por la duración del hueco (verificado en 0.5.1); no
+   * se escribe un clamp propio: eso exigiría aritmética DST manual, prohibida.
+   */
+  private materialize(
+    timeZone: string,
+    day: Temporal.PlainDate,
+    hour: number,
+    minute: number,
+  ): Temporal.ZonedDateTime {
+    try {
+      return Temporal.ZonedDateTime.from(
+        { timeZone, year: day.year, month: day.month, day: day.day, hour, minute },
+        { disambiguation: "compatible", overflow: "reject" },
+      );
+    } catch {
+      throw notDisposableSchedule("calendar");
+    }
+  }
 }
 
-/** ¿Es `value` un schedule de intervalo v1 (`{ version: 1, kind: "interval", intervalMs }`)? */
-function isIntervalSchedule(value: unknown): value is IntervalSchedule {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    candidate.version === 1 &&
-    candidate.kind === "interval" &&
-    typeof candidate.intervalMs === "number" &&
-    Number.isFinite(candidate.intervalMs) &&
-    candidate.intervalMs > 0
-  );
-}
+/** Instancia module-privada; no se exporta ni entra en el barrel. */
+const CALC = new ScheduleCalculator();
 
 /**
- * Calcula el próximo `next_fire_at` desde la definición del Trigger. El repo
- * encapsula la forma de `definition_json` (pendiente 1): si la definición no
- * es la que v1 sabe planificar, el Trigger no es disparable — mejor rechazar
- * el disparo que crear una Initiative sin poder avanzar el Trigger.
+ * Calcula el próximo `next_fire_at` desde la definición del Trigger. Conserva
+ * firma, retorno y sincronía (import estático, no `import()`): `fireTrigger`
+ * sigue siendo síncrono dentro de su transacción. Si la definición no es
+ * planificable, el Trigger no es disparable — mejor rechazar el disparo que
+ * crear una Initiative sin poder avanzar el Trigger.
  */
 function nextFireAtFromDefinition(definitionJson: string, now: number): number {
-  let definition: unknown;
-  try {
-    definition = JSON.parse(definitionJson);
-  } catch {
-    throw new DomainError(
-      "TRIGGER_NOT_DISPARABLE",
-      "definition_json no es JSON válido (la forma de `definition_json` es el pendiente 1 del diseño)",
-    );
-  }
-  if (!isIntervalSchedule(definition)) {
-    throw new DomainError(
-      "TRIGGER_NOT_DISPARABLE",
-      `definition_json no tiene la forma de intervalo que v1 dispara (pendiente 1)`,
-    );
-  }
-  return now + definition.intervalMs;
+  return CALC.nextFireAt(CALC.parse(definitionJson), now);
 }
 
 export class TriggerRepository {
@@ -148,7 +300,7 @@ export class TriggerRepository {
    * `origin='trigger'` y avanza el Trigger en la misma transacción. Devuelve
    * la Initiative creada. Lanza `TRIGGER_NOT_FOUND` si no existe,
    * `TRIGGER_NOT_DISPARABLE` si está `proposed`/`disabled`, no tiene
-   * `next_fire_at` o no es un `schedule` que v1 sepa planificar (§9.1).
+   * `next_fire_at` o no es un `schedule` que el repo sepa planificar (§9.1).
    *
    * No se valida `next_fire_at <= now`: el caller (Loop, Fase 3) es quien
    * decide qué disparar (índice `schedule_triggers_due`); este comando

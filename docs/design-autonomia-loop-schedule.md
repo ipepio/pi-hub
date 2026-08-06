@@ -297,12 +297,13 @@ sucesivos — no hay tormenta.
 > (que solo cubre el reintento del *mismo* turno caído). Pertenece al
 > Intent/skill del Agent, no al Loop.
 
-### 3.3 Zona horaria y horario de verano (semántica fijada; forma, no)
+### 3.3 Zona horaria y horario de verano (semántica y forma fijadas)
 
-La **forma JSON versionada** del schedule con calendario es el **pendiente 1**
-(`docs/design-autonomia-agenda-sqlite.md:35`; `packages/manager/src/agenda/triggers.ts:12-23`)
-y queda fuera de Fase 3. Lo que **sí** fija este plan es la **semántica** que
-esa forma futura deberá respetar, para que el Loop y `triggers.ts` sean correctos:
+La **forma JSON versionada** del schedule con calendario quedó fijada en la
+**Fase 3.6** como la unión cerrada `version: 1` (interval, sin cambios) /
+`version: 2` (`daily` y `weekly`, con `timeZone` IANA obligatoria y `at` HH:mm).
+La semántica de abajo es la que esa forma respeta, para que el Loop y
+`triggers.ts` sean correctos:
 
 - `next_fire_at` se almacena siempre como `INTEGER` ms UTC epoch
   (`docs/design-autonomia-agenda-sqlite.md` §0). Las comparaciones de
@@ -319,12 +320,14 @@ Política DST para calendario local (incorporada de `/tmp/fase3-sol.md` §4.2):
 
 | Caso | Decisión |
 |---|---|
-| Hora inexistente al adelantar reloj (gap, p. ej. 02:30 en el salto) | Ejecutar **una vez** en el **primer instante civil válido posterior** al hueco de ese día. |
+| Hora inexistente al adelantar reloj (gap, p. ej. 02:30 en el salto) | Ejecutar **una vez**, desplazando la hora civil hacia delante por la duración del hueco (comportamiento `compatible` de Temporal). |
 | Hora ambigua al atrasar reloj (overlap, 02:30 ocurre dos veces) | Ejecutar **una sola vez**, en la **primera** ocurrencia cronológica. |
 | Cambio de offset entre ocurrencias normales | Mantener la hora civil configurada; cambia el UTC correspondiente. |
 | Zona IANA desconocida o definición inválida | `TRIGGER_NOT_DISPARABLE` (`packages/manager/src/agenda/errors.ts`): no crea Initiative ni avanza T1 (rollback). |
 
-La librería concreta y el JSON son **no determinados** (pendiente 1).
+La librería concreta es `@js-temporal/polyfill@0.5.1` con `disambiguation:
+"compatible"`, elegida porque la política DST de esta sección es literalmente
+ese parámetro.
 
 ---
 
@@ -787,14 +790,11 @@ después de `serve` y en `shutdown` antes de `stopAll`.
 **Verificable:** la matriz de tests §7.2 con fakes (reloj, `TurnExecution`,
 `Supervisor`) y SQLite `:memory:`.
 
-### Fase 3.6 — Semántica DST de calendario (BLOQUEADA por pendiente 1)
-Cuando el pendiente 1 cierre la forma JSON versionada del schedule con
-calendario, implementar `ScheduleCalculator` en `triggers.ts` (gap→primer
-válido, overlap→primera ocurrencia, zona inválida→`TRIGGER_NOT_DISPARABLE`),
+### Fase 3.6 — Semántica DST de calendario
+Implementar `ScheduleCalculator` en `triggers.ts` (gap→desplazar por la duración
+del hueco, overlap→primera ocurrencia, zona inválida→`TRIGGER_NOT_DISPARABLE`),
 manteniendo la frontera transaccional de T1.
 **Verificable:** tests §7.3.4–§7.3.6 con la librería tzdb elegida.
-**Bloqueada por:** pendiente 1 (`docs/design-autonomia-agenda-sqlite.md:35`;
-`packages/manager/src/agenda/triggers.ts:12-23`). Puede deslizar fuera de Fase 3.
 
 ### Fase 3.7 — Configuración y arranque definitivo
 `PIHUB_LOOP_CONCURRENCY`, `PIHUB_LOOP_POLL_MS`, `graceMs` y `dispatchTimeoutMs`
@@ -811,7 +811,7 @@ server.close` y que no hay nuevos claims tras `stop`.
 
 | Pendiente | Qué es | Fase que bloquea / roza |
 |---|---|---|
-| **1** Forma versionada del schedule con tz/recurrencia/saltos (`docs/design-autonomia-agenda-sqlite.md:35`; `triggers.ts:12-23`) | Define el JSON de calendario. | **Bloquea Fase 3.6** (DST calendario). La semántica ya está fijada en §3.3. |
+| **1** Forma versionada del schedule con tz/recurrencia/saltos (`docs/design-autonomia-agenda-sqlite.md:35`; `triggers.ts:12-23`) | Define el JSON de calendario. | **Cerrada en Fase 3.6**: unión `version: 1` (interval) / `version: 2` (`daily`/`weekly`, `timeZone` IANA, `at`). Librería elegida: `@js-temporal/polyfill@0.5.1` con `disambiguation: "compatible"`. |
 | **4** Reserva de turno sin terminal (`docs/design-autonomia-agenda-sqlite.md:152`) | Qué `final_state` dar a una reserva cuyo proceso cayó antes del terminal. | **Rozado** por Fase 3.2/3.4. El claim unificado (3.4) evita crear reservas huérfanas, pero no resuelve el caso "Manager cae antes del terminal". |
 | **5** `bound_model` deja de estar disponible (`docs/design-autonomia-agenda-sqlite.md:270-274`) | Fallback si el modelo fijado desaparece en `waiting_human`/`waiting_agent`. | **Rozado** por Fase 3.5: v1 no fija `bound_model` desde el Loop; pasa `undefined`. |
 | **8** Contenedor append-only de auditoría (`docs/design-autonomia-agenda-sqlite.md:292`) | Dónde y cómo se escribe el evento de dominio. | **No bloquea Fase 3**; el catálogo de `failure_reason` (§5.2) lo alimenta. Bloquea fases 5/6. |
