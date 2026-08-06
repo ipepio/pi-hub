@@ -20,6 +20,7 @@ import {
   createTriggerBodySchema,
   respondBodySchema,
 } from "../src/api-v1/autonomy.ts";
+import type { AdmissionStateInternal } from "../src/api-v1/autonomy.ts";
 import type {
   InternalAutonomySnapshot,
   InternalInitiative,
@@ -664,5 +665,82 @@ describe("autonomy presenters — mutación de resultado crudo debe caer", () =>
       "el resultado crudo se filtró: presenter debe ser allowlist, no cast");
     assert.equal(json.includes("sessionKey"), false);
     assert.equal(json.includes("chainDepth"), false);
+  });
+});
+
+describe("autonomy presenters — admission (P2.4)", () => {
+  const EXPECTED_ADMISSION_KEYS = ["activeTurns", "changedAt", "idle", "runningInitiatives", "state"].sort();
+
+  it("SERVICE_AUTONOMY_PRESENTER tiene presentAdmission", () => {
+    assert.ok(typeof SERVICE_AUTONOMY_PRESENTER.presentAdmission === "function");
+  });
+
+  it("PANEL_AUTONOMY_PRESENTER tiene presentAdmission", () => {
+    assert.ok(typeof PANEL_AUTONOMY_PRESENTER.presentAdmission === "function");
+  });
+
+  it("AdmissionStateInternal se presenta como PublicAdmissionState (allowlist)", () => {
+    const state: AdmissionStateInternal = {
+      state: "open",
+      idle: false,
+      activeTurns: 2,
+      runningInitiatives: 3,
+      changedAt: 1_700_000_000_000,
+    };
+    const result = SERVICE_AUTONOMY_PRESENTER.presentAdmission(state);
+    assert.deepEqual(Object.keys(result).sort(), EXPECTED_ADMISSION_KEYS);
+    assert.equal(result.state, "open");
+    assert.equal(result.idle, false);
+    assert.equal(result.activeTurns, 2);
+    assert.equal(result.runningInitiatives, 3);
+    assert.equal(result.changedAt, 1_700_000_000_000);
+  });
+
+  it("service y panel producen el mismo admission state", () => {
+    const state: AdmissionStateInternal = {
+      state: "draining",
+      idle: true,
+      activeTurns: 0,
+      runningInitiatives: 0,
+      changedAt: 1_700_000_000_000,
+    };
+    const serviceResult = SERVICE_AUTONOMY_PRESENTER.presentAdmission(state);
+    const panelResult = PANEL_AUTONOMY_PRESENTER.presentAdmission(state);
+    assert.deepEqual(serviceResult, panelResult);
+  });
+
+  it("admission presenter rechaza spread interno (taint automático)", () => {
+    // Simular un objeto admission con campos internos extra que no deben filtrarse
+    const taintedState = {
+      state: "open" as const,
+      idle: false,
+      activeTurns: 1,
+      runningInitiatives: 1,
+      changedAt: 1_700_000_000_000,
+      sessionKey: "LEAK::sessionKey",
+      turnId: "LEAK::turnId",
+      token: "LEAK::token",
+    } as unknown as AdmissionStateInternal;
+
+    const result = SERVICE_AUTONOMY_PRESENTER.presentAdmission(taintedState);
+    const json = JSON.stringify(result);
+    assert.equal(json.includes("LEAK::"), false, "admission presenter no debe filtrar secretos");
+    assert.equal(json.includes("sessionKey"), false);
+    assert.equal(json.includes("turnId"), false);
+    assert.equal(json.includes("token"), false);
+  });
+
+  it("admission presenter devuelve solo las 5 claves exactas con value correcto para draining", () => {
+    const state: AdmissionStateInternal = {
+      state: "draining",
+      idle: true,
+      activeTurns: 0,
+      runningInitiatives: 0,
+      changedAt: 1_700_000_000_000,
+    };
+    const result = PANEL_AUTONOMY_PRESENTER.presentAdmission(state);
+    assert.deepEqual(Object.keys(result).sort(), EXPECTED_ADMISSION_KEYS);
+    assert.equal(result.state, "draining");
+    assert.equal(result.idle, true);
   });
 });

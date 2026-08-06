@@ -177,6 +177,43 @@ export interface PublicRespondInitiativeResult {
 }
 
 // ---------------------------------------------------------------------------
+// Admission pública (contrato congelado para P4)
+// ---------------------------------------------------------------------------
+
+/** Marca fantasma para frontera de tipos Internal/Public (ver fix P2.4b). */
+const __publicBrand: unique symbol = Symbol("__publicBrand");
+
+/** Estado de admisión público (P4 aporta la implementación real). */
+export interface PublicAdmissionState {
+  readonly [__publicBrand]: true;
+  readonly state: "open" | "draining";
+  readonly idle: boolean;
+  readonly activeTurns: number;
+  readonly runningInitiatives: number;
+  readonly changedAt: number;
+}
+
+/** Estado interno de admisión (P4 aporta la implementación real). */
+export interface AdmissionStateInternal {
+  readonly state: "open" | "draining";
+  readonly idle: boolean;
+  readonly activeTurns: number;
+  readonly runningInitiatives: number;
+  readonly changedAt: number;
+}
+
+/**
+ * Port contractual de admisión. En P2 producción no existe — las rutas
+ * devuelven 503 RESOURCE_UNAVAILABLE. Los tests pasan un fake que satisface
+ * este port. P4 aporta el adapter real y cambia las respuestas a 200 sin
+ * cambiar ruta, auth, schema, presenter ni envelope.
+ */
+export interface AdmissionPort {
+  getAdmission(): AdmissionStateInternal;
+  setAdmission(state: "open" | "draining"): AdmissionStateInternal;
+}
+
+// ---------------------------------------------------------------------------
 // Schemas strict de entrada (Zod)
 // ---------------------------------------------------------------------------
 
@@ -228,6 +265,13 @@ export const createTriggerBodySchema = z
 export const respondBodySchema = z
   .object({
     answer: z.string().min(1).max(MAX_HUMAN_ANSWER_LENGTH),
+  })
+  .strict();
+
+/** Schema del body de `PUT /runtime/admission`. */
+export const admissionBodySchema = z
+  .object({
+    state: z.enum(["open", "draining"]),
   })
   .strict();
 
@@ -371,6 +415,7 @@ export const SERVICE_AUTONOMY_PRESENTER = {
   },
   presentCancelInitiativeResult,
   presentRespondInitiativeResult,
+  presentAdmission: presentAdmissionState,
 } as const;
 
 /**
@@ -385,7 +430,24 @@ export const PANEL_AUTONOMY_PRESENTER = {
   },
   presentCancelInitiativeResult,
   presentRespondInitiativeResult,
+  presentAdmission: presentAdmissionState,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Presenter de admisión
+// ---------------------------------------------------------------------------
+
+function presentAdmissionState(state: AdmissionStateInternal): PublicAdmissionState {
+  return {
+    [__publicBrand]: true as const,
+    state: state.state,
+    idle: state.idle,
+    activeTurns: state.activeTurns,
+    runningInitiatives: state.runningInitiatives,
+    changedAt: state.changedAt,
+  };
+  // Prohibido: { ...state }, spread, blacklist
+}
 
 // ---------------------------------------------------------------------------
 // Traducción de DomainError a ApiErrorCode + HTTP
@@ -470,6 +532,11 @@ export interface AutonomyRouteDeps {
   readonly control: AutonomyControl;
   readonly agentExists: (name: string) => Promise<boolean>;
   readonly now: () => number;
+  /**
+   * Port opcional de admisión. En producción P2 no está presente → las rutas
+   * devuelven 503 RESOURCE_UNAVAILABLE. P4 aporta el adapter real.
+   */
+  readonly admission?: AdmissionPort;
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +607,93 @@ async function handleRevokeTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps)
 }
 
 // ---------------------------------------------------------------------------
+// Handlers P2.4 — cancel/respond y admisión
+// ---------------------------------------------------------------------------
+
+async function handleCancelInitiative(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+  const agentName = requiredParam(c, "name");
+  const initiativeId = requiredParam(c, "id");
+  return handleAgentNotFound(c, deps, agentName, async () => {
+    const now = deps.now();
+    try {
+      const result = deps.control.cancelInitiative({ agentName, initiativeId, now });
+      const presenter = presenterFor(c);
+      const publicResult = presenter.presentCancelInitiativeResult(result);
+      // running → 202 cancellation_requested; resto → 200 cancelled
+      const status = result.status === "cancellation_requested" ? 202 : 200;
+      return c.json(publicResult, status);
+    } catch (error) {
+      return handleDomainError(c, error);
+    }
+  });
+}
+
+async function handleRespondInitiative(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+  const agentName = requiredParam(c, "name");
+  const initiativeId = requiredParam(c, "id");
+  return handleAgentNotFound(c, deps, agentName, async () => {
+    const idempotencyKey = c.req.header("Idempotency-Key");
+    if (!idempotencyKey || idempotencyKey.trim() === "") {
+      return fail(c, "BAD_REQUEST", "Idempotency-Key header is required");
+    }
+    const body = await c.req.json().catch(() => undefined);
+    if (body === undefined) {
+      return fail(c, "BAD_REQUEST", "Invalid JSON body");
+    }
+    const parsed = respondBodySchema.safeParse(body);
+    if (!parsed.success) {
+      return fail(c, "BAD_REQUEST", "Invalid respond payload");
+    }
+    const { answer } = parsed.data;
+    const now = deps.now();
+    try {
+      const result = deps.control.respondToInitiative({
+        agentName,
+        initiativeId,
+        answer,
+        idempotencyKey: idempotencyKey.trim(),
+        now,
+      });
+      const presenter = presenterFor(c);
+      const publicResult = presenter.presentRespondInitiativeResult(result);
+      return c.json(publicResult, 200);
+    } catch (error) {
+      return handleDomainError(c, error);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Handlers de admisión (P2.4 shell contractual)
+// ---------------------------------------------------------------------------
+
+function handleGetAdmission(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Response {
+  if (!deps.admission) {
+    return fail(c, "RESOURCE_UNAVAILABLE", "Admission not yet available (P4)");
+  }
+  const state = deps.admission.getAdmission();
+  const presenter = presenterFor(c);
+  return c.json(presenter.presentAdmission(state));
+}
+
+async function handlePutAdmission(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+  if (!deps.admission) {
+    return fail(c, "RESOURCE_UNAVAILABLE", "Admission not yet available (P4)");
+  }
+  const body = await c.req.json().catch(() => undefined);
+  if (body === undefined) {
+    return fail(c, "BAD_REQUEST", "Invalid JSON body");
+  }
+  const parsed = admissionBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return fail(c, "BAD_REQUEST", "Invalid admission payload");
+  }
+  const state = deps.admission.setAdmission(parsed.data.state);
+  const presenter = presenterFor(c);
+  return c.json(presenter.presentAdmission(state));
+}
+
+// ---------------------------------------------------------------------------
 // Helpers de handler
 // ---------------------------------------------------------------------------
 
@@ -577,13 +731,17 @@ function handleDomainError(c: Context<AuthEnv>, error: unknown): Response {
 
 /**
  * Registra las rutas de autonomía (GET snapshot, POST create trigger,
- * POST revoke trigger) en la aplicación Hono.
+ * POST revoke trigger, POST cancel, POST respond y GET/PUT admission)
+ * en la aplicación Hono.
  *
  * La autorización del Agent (agentExists) corre antes de validar el body
  * o el comando: un Agent inexistente debe dar 404 aunque el body sea basura.
+ *
+ * Las rutas de admisión usan un port opcional: si no está presente (producción
+ * P2), responden 503 RESOURCE_UNAVAILABLE. P4 aporta el adapter real.
  */
 export function registerAutonomyRoutes(
-  app: { get: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; post: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void },
+  app: { get: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; post: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; put: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void },
   deps: AutonomyRouteDeps,
 ): void {
   // GET /agents/:name/autonomy — snapshot público
@@ -594,4 +752,16 @@ export function registerAutonomyRoutes(
 
   // POST /agents/:name/triggers/:id/revoke — revoke trigger
   app.post("/agents/:name/triggers/:id/revoke", (c) => handleRevokeTrigger(c, deps));
+
+  // POST /agents/:name/initiatives/:id/cancel — cancel initiative
+  app.post("/agents/:name/initiatives/:id/cancel", (c) => handleCancelInitiative(c, deps));
+
+  // POST /agents/:name/initiatives/:id/respond — respond to initiative
+  app.post("/agents/:name/initiatives/:id/respond", (c) => handleRespondInitiative(c, deps));
+
+  // GET /runtime/admission — shell contractual (P2: 503 sin port; P4: real)
+  app.get("/runtime/admission", (c) => handleGetAdmission(c, deps));
+
+  // PUT /runtime/admission — shell contractual (P2: 503 sin port; P4: real)
+  app.put("/runtime/admission", (c) => handlePutAdmission(c, deps));
 }
