@@ -197,7 +197,7 @@ test("PUT /managed/providers exige Bearer de servicio y preserva Providers stand
       body: JSON.stringify(payload),
     });
     assert.equal(cookieAttempt.status, 401);
-    assert.equal((await cookieAttempt.json()).code, "MISSING_AUTH");
+    assert.equal((await cookieAttempt.json()).code, "INVALID_AUTH");
 
     const serviceAttempt = await app.request("http://pihub.test/managed/providers", {
       method: "PUT",

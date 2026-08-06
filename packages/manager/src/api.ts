@@ -96,16 +96,21 @@ export function createApi(
   const providers =
     runtimeProviders ?? createRuntimeProviders({ dataDir: env.dataDir, oauthProviders: env.oauthProviders });
 
-  app.post("/auth/session", async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { token?: string };
-    if (env.apiToken && body.token !== env.apiToken) {
-      return c.json({ error: "Token incorrecto" }, 401);
-    }
-    const csrfToken = generateCsrfToken();
-    c.header("Set-Cookie", sessionCookie(env.apiToken));
-    c.header("Set-Cookie", csrfCookie(csrfToken), { append: true });
-    return c.json({ ok: true, csrfToken });
-  });
+  // La sesión del panel SOLO existe en modo Gobernador: en Gobernado el panel
+  // no debe poder emitir cookies (P2.1). Fuera de `if (env.panelEnabled)` la
+  // ruta ni se registra — 404 natural de Hono, cero Set-Cookie, cero CSRF.
+  if (env.panelEnabled) {
+    app.post("/auth/session", async (c) => {
+      const body = (await c.req.json().catch(() => ({}))) as { token?: string };
+      if (env.apiToken && body.token !== env.apiToken) {
+        return c.json({ error: "Token incorrecto" }, 401);
+      }
+      const csrfToken = generateCsrfToken();
+      c.header("Set-Cookie", sessionCookie(env.apiToken));
+      c.header("Set-Cookie", csrfCookie(csrfToken), { append: true });
+      return c.json({ ok: true, csrfToken });
+    });
+  }
 
   // La interfaz privada versionada se monta ANTES del guard del panel: el
   // patrón `/api/*` de abajo casa también con `/api/v1/*`, y si se montara

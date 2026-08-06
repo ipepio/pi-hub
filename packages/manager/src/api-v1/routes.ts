@@ -69,7 +69,13 @@ const MANAGER_VERSION = JSON.parse(
 ).version as string;
 
 /** Variables de contexto de `/api/v1`. El correlationId viaja en toda respuesta de error. */
-export type ApiV1Env = { Variables: { correlationId: string } };
+export type ApiV1Env = {
+  Variables: {
+    correlationId: string;
+    /** Principal autenticado: `service` vía Bearer, `panel` vía cookie. */
+    principal: { kind: "service" | "panel" };
+  };
+};
 
 /**
  * Correlation ID de una petición: entra del caller si lo trae (el
@@ -146,6 +152,12 @@ export function createApiV1Router(
     if (verdict.kind === "csrf_invalid") {
       const code = c.req.header("x-csrf-token") && csrfCookie ? "CSRF_INVALID" : "CSRF_REQUIRED";
       return fail(c, code, code === "CSRF_REQUIRED" ? "CSRF token required" : "CSRF token invalid");
+    }
+    // Guardar el principal autenticado para los handlers.
+    c.set("principal", { kind: verdict.kind });
+    // Gobernado rechaza cualquier cookie de panel, incluso si es válida.
+    if (verdict.kind === "panel" && !env.panelEnabled) {
+      return fail(c, "INVALID_AUTH", "Service credential required");
     }
     await next();
   });

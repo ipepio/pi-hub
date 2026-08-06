@@ -16,11 +16,19 @@ function fakeSupervisor(): Supervisor {
   return { state: () => ({ state: "stopped" }) } as unknown as Supervisor;
 }
 
-async function withRouter(run: (app: ReturnType<typeof createApiV1Router>) => Promise<void>): Promise<void> {
+async function withRouter(
+  run: (app: ReturnType<typeof createApiV1Router>) => Promise<void>,
+  options: { panelEnabled?: boolean } = {},
+): Promise<void> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-auth-"));
   try {
     await scaffoldGlobalDirs(dataDir);
-    await run(createApiV1Router({ dataDir, apiToken: "secreto" }, fakeSupervisor()));
+    await run(
+      createApiV1Router(
+        { dataDir, apiToken: "secreto", panelEnabled: options.panelEnabled ?? true } as PihubEnv,
+        fakeSupervisor(),
+      ),
+    );
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
@@ -139,9 +147,9 @@ describe("dual auth de /api/v1", () => {
 });
 
 describe("emisión de sesión del panel", () => {
-  it("rota y devuelve una cookie CSRF no HttpOnly junto a la sesión", async () => {
+  it("Gobernador rota y devuelve una cookie CSRF no HttpOnly junto a la sesión", async () => {
     const app = createApi(
-      { apiToken: "secreto", panelEnabled: false } as PihubEnv,
+      { apiToken: "secreto", panelEnabled: true } as PihubEnv,
       fakeSupervisor(),
       {} as OAuthService,
     );
@@ -159,6 +167,23 @@ describe("emisión de sesión del panel", () => {
     assert.match(setCookie, /pihub_token=secreto/);
     assert.match(setCookie, new RegExp(`pihub_csrf=${body.csrfToken}`));
     assert.doesNotMatch(setCookie, /pihub_csrf=[^;]+; HttpOnly/i);
+  });
+
+  it("Gobernado no monta /auth/session: 404 natural y cero Set-Cookie", async () => {
+    const app = createApi(
+      { apiToken: "secreto", panelEnabled: false } as PihubEnv,
+      fakeSupervisor(),
+      {} as OAuthService,
+    );
+    const response = await app.request("http://pihub.test/auth/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "secreto" }),
+    });
+    const setCookie = response.headers.get("set-cookie");
+
+    assert.strictEqual(response.status, 404);
+    assert.strictEqual(setCookie, null);
   });
 });
 
@@ -230,6 +255,80 @@ describe("middleware dual de /api/v1", () => {
       });
       assert.strictEqual(response.status, 401);
       assert.strictEqual((await response.json()).code, "INVALID_AUTH");
+    });
+  });
+});
+
+describe("Gobernado rechaza la cookie de panel en todo /api/v1", () => {
+  it("GET con cookie válida da 401 INVALID_AUTH", async () => {
+    await withRouter(
+      async (app) => {
+        const response = await app.request("http://pihub.test/status", {
+          headers: { cookie: "pihub_token=secreto" },
+        });
+        assert.strictEqual(response.status, 401);
+        assert.strictEqual((await response.json()).code, "INVALID_AUTH");
+      },
+      { panelEnabled: false },
+    );
+  });
+
+  it("POST con cookie válida y CSRF válido da 401 INVALID_AUTH sin invocar el handler", async () => {
+    await withRouter(
+      async (app) => {
+        let sentinelInvoked = false;
+        app.post("/sentinel", (c) => {
+          sentinelInvoked = true;
+          return c.json({ ok: true });
+        });
+        const response = await app.request("http://pihub.test/sentinel", {
+          method: "POST",
+          headers: {
+            cookie: "pihub_token=secreto; pihub_csrf=csrf-real",
+            "x-csrf-token": "csrf-real",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({}),
+        });
+        assert.strictEqual(response.status, 401);
+        assert.strictEqual((await response.json()).code, "INVALID_AUTH");
+        assert.strictEqual(sentinelInvoked, false);
+      },
+      { panelEnabled: false },
+    );
+  });
+
+  it("Gobernado sigue aceptando Bearer válido", async () => {
+    await withRouter(
+      async (app) => {
+        const response = await app.request("http://pihub.test/status", {
+          headers: { authorization: "Bearer secreto" },
+        });
+        assert.strictEqual(response.status, 200);
+      },
+      { panelEnabled: false },
+    );
+  });
+});
+
+describe("principal.kind llega a los handlers", () => {
+  it("Bearer válido presenta principal service", async () => {
+    await withRouter(async (app) => {
+      app.get("/whoami", (c) => c.json({ principal: c.get("principal") }));
+      const response = await app.request("http://pihub.test/whoami", {
+        headers: { authorization: "Bearer secreto" },
+      });
+      assert.deepStrictEqual(await response.json(), { principal: { kind: "service" } });
+    });
+  });
+
+  it("cookie válida presenta principal panel", async () => {
+    await withRouter(async (app) => {
+      app.get("/whoami", (c) => c.json({ principal: c.get("principal") }));
+      const response = await app.request("http://pihub.test/whoami", {
+        headers: { cookie: "pihub_token=secreto" },
+      });
+      assert.deepStrictEqual(await response.json(), { principal: { kind: "panel" } });
     });
   });
 });
