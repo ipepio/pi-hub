@@ -1,9 +1,6 @@
 /**
- * Módulo de Autonomía HTTP — P2.2. Tipos públicos, schemas estrictos,
- * presenters service/panel y traducción de DomainError.
- *
- * No registra rutas (eso es P2.3). Congela el contrato que sale por la API y
- * la barrera que evita que los objetos internos de P1 se filtren al exterior.
+ * Módulo de Autonomía HTTP — P2.2/P2.3. Tipos públicos, schemas estrictos,
+ * presenters service/panel, traducción de DomainError y registro de rutas.
  *
  * Reglas de construcción:
  *   - Allowlist positiva, nunca spread/blacklist/JSON.parse(JSON.stringify(...)).
@@ -14,21 +11,26 @@
  */
 
 import { z } from "zod";
+import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { InitiativeState, InitiativeMode } from "../agenda/state.ts";
 import type {
   InternalAutonomySnapshot,
   InternalInitiative,
   InternalTrigger,
   AgendaEntry,
+  AutonomyProjection,
 } from "../agenda/autonomy-projection.ts";
 import type { CreateTriggerResult } from "../agenda/triggers.ts";
 import type {
+  AutonomyControl,
   CancelInitiativeResult,
   RespondInitiativeResult,
 } from "../agenda/autonomy-control.ts";
 import type { DomainErrorCode } from "../agenda/errors.ts";
-import { toApiError } from "../agenda/errors.ts";
+import { DomainError, toApiError } from "../agenda/errors.ts";
 import type { ApiErrorCode } from "./errors.ts";
+import { apiError, HTTP_STATUS_BY_CODE } from "./errors.ts";
 import { MAX_HUMAN_ANSWER_LENGTH } from "../agenda/initiatives.ts";
 
 // ---------------------------------------------------------------------------
@@ -419,4 +421,177 @@ export function autonomyErrorMessage(code: ApiErrorCode): string {
     default:
       return "Internal error";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Type para el tipo ApiV1Env que routes.ts define
+// ---------------------------------------------------------------------------
+
+interface AuthEnv {
+  Variables: {
+    correlationId: string;
+    principal: { kind: "service" | "panel" };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers HTTP
+// ---------------------------------------------------------------------------
+
+function fail(c: Context<AuthEnv>, code: ApiErrorCode, message: string) {
+  return c.json(
+    apiError(code, message, c.get("correlationId")),
+    HTTP_STATUS_BY_CODE[code] as ContentfulStatusCode,
+  );
+}
+
+/** Recupera el presenter según el principal autenticado. */
+function presenterFor(c: Context<AuthEnv>) {
+  const principal = c.get("principal");
+  return principal.kind === "panel" ? PANEL_AUTONOMY_PRESENTER : SERVICE_AUTONOMY_PRESENTER;
+}
+
+/** Parámetro de ruta obligatorio; missing = 400. */
+function requiredParam(c: Context<AuthEnv>, name: string): string {
+  const val = c.req.param(name);
+  if (val === undefined || val === "") {
+    throw fail(c, "BAD_REQUEST", `Missing required parameter: ${name}`);
+  }
+  return val;
+}
+
+// ---------------------------------------------------------------------------
+// Dependencias del módulo de rutas
+// ---------------------------------------------------------------------------
+
+/** Dependencias necesarias para registrar las rutas de autonomía. */
+export interface AutonomyRouteDeps {
+  readonly projection: Pick<AutonomyProjection, "snapshotForAgent">;
+  readonly control: AutonomyControl;
+  readonly agentExists: (name: string) => Promise<boolean>;
+  readonly now: () => number;
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+function handleGetAutonomy(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Response | Promise<Response> {
+  const agentName = requiredParam(c, "name");
+  return handleAgentNotFound(c, deps, agentName, async () => {
+    const now = deps.now();
+    const snapshot = deps.projection.snapshotForAgent(agentName, now);
+    const presenter = presenterFor(c);
+    const publicSnapshot = presenter.presentSnapshot(snapshot);
+    return c.json(publicSnapshot);
+  });
+}
+
+async function handleCreateTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+  const agentName = requiredParam(c, "name");
+  return handleAgentNotFound(c, deps, agentName, async () => {
+    const idempotencyKey = c.req.header("Idempotency-Key");
+    if (!idempotencyKey || idempotencyKey.trim() === "") {
+      return fail(c, "BAD_REQUEST", "Idempotency-Key header is required");
+    }
+    const body = await c.req.json().catch(() => undefined);
+    if (body === undefined) {
+      return fail(c, "BAD_REQUEST", "Invalid JSON body");
+    }
+    const parsed = createTriggerBodySchema.safeParse(body);
+    if (!parsed.success) {
+      return fail(c, "BAD_REQUEST", "Invalid trigger payload");
+    }
+    const { definition, intent, mode, suggestedSkill } = parsed.data;
+    const now = deps.now();
+    try {
+      const result = deps.control.createTrigger({
+        agentName,
+        definition: definition as never,
+        intent,
+        mode,
+        suggestedSkill: suggestedSkill ?? null,
+        idempotencyKey: idempotencyKey.trim(),
+        now,
+      });
+      const presenter = presenterFor(c);
+      const publicResult = presenter.presentCreateTriggerResult(result);
+      return c.json(publicResult, result.replayed ? 200 : 201);
+    } catch (error) {
+      return handleDomainError(c, error);
+    }
+  });
+}
+
+async function handleRevokeTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+  const agentName = requiredParam(c, "name");
+  const triggerId = requiredParam(c, "id");
+  return handleAgentNotFound(c, deps, agentName, async () => {
+    const now = deps.now();
+    try {
+      const trigger = deps.control.revokeTrigger({ agentName, triggerId, now });
+      const presenter = presenterFor(c);
+      const publicResult = presenter.presentRevokeTriggerResult(trigger as unknown as InternalTrigger);
+      return c.json(publicResult, 200);
+    } catch (error) {
+      return handleDomainError(c, error);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers de handler
+// ---------------------------------------------------------------------------
+
+async function handleAgentNotFound(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+  agentName: string,
+  fn: () => Response | Promise<Response>,
+): Promise<Response> {
+  if (!(await deps.agentExists(agentName))) {
+    return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+  }
+  return fn();
+}
+
+function handleDomainError(c: Context<AuthEnv>, error: unknown): Response {
+  if (error instanceof Error && (error as DomainError).code !== undefined) {
+    const code = (error as DomainError).code;
+    const apiCode = toApiError(code as DomainErrorCode);
+    // Loggear el detalle interno con correlationId
+    console.error(
+      `[api-v1] autonomy error: ${apiCode} correlationId=${c.get("correlationId")} detail=${(error as Error).message}`,
+    );
+    return fail(c, apiCode, autonomyErrorMessage(apiCode));
+  }
+  console.error(
+    `[api-v1] autonomy unexpected error: correlationId=${c.get("correlationId")} detail=${(error as Error).message ?? error}`,
+  );
+  return fail(c, "INTERNAL_ERROR", "Internal error");
+}
+
+// ---------------------------------------------------------------------------
+// Registro de rutas (P2.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Registra las rutas de autonomía (GET snapshot, POST create trigger,
+ * POST revoke trigger) en la aplicación Hono.
+ *
+ * La autorización del Agent (agentExists) corre antes de validar el body
+ * o el comando: un Agent inexistente debe dar 404 aunque el body sea basura.
+ */
+export function registerAutonomyRoutes(
+  app: { get: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; post: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void },
+  deps: AutonomyRouteDeps,
+): void {
+  // GET /agents/:name/autonomy — snapshot público
+  app.get("/agents/:name/autonomy", (c) => handleGetAutonomy(c, deps));
+
+  // POST /agents/:name/triggers — create trigger
+  app.post("/agents/:name/triggers", (c) => handleCreateTrigger(c, deps));
+
+  // POST /agents/:name/triggers/:id/revoke — revoke trigger
+  app.post("/agents/:name/triggers/:id/revoke", (c) => handleRevokeTrigger(c, deps));
 }

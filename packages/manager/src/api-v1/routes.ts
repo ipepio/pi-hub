@@ -36,6 +36,12 @@ import type { OAuthService } from "../oauth.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
 import { classifyApiV1Auth, classifyServiceAuth, cookieValue, CSRF_COOKIE } from "./auth.js";
 import {
+  registerAutonomyRoutes,
+  type AutonomyRouteDeps,
+} from "./autonomy.js";
+import type { AutonomyProjection } from "../agenda/autonomy-projection.js";
+import type { AutonomyControl } from "../agenda/autonomy-control.js";
+import {
   agentRuntimeFingerprint,
   decideRuntimeAction,
   projectSystemPrompt,
@@ -106,6 +112,10 @@ export function createApiV1Router(
     oauthProviders: env.oauthProviders,
   }),
   turnsShared?: TurnExecution,
+  autonomy?: {
+    projection: Pick<AutonomyProjection, "snapshotForAgent">;
+    control: AutonomyControl;
+  },
 ): Hono<ApiV1Env> {
   const app = new Hono<ApiV1Env>();
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
@@ -785,6 +795,21 @@ export function createApiV1Router(
     scheduleGlobalReload(supervisor);
     return c.json({ skills: await listMaterializedSkillIds(env.dataDir) }, 202);
   });
+
+  // --- Autonomía (P2.3) ---
+  if (autonomy) {
+    const agentExists = async (name: string): Promise<boolean> => {
+      const config = await readAgent(env.dataDir, name).catch(() => undefined);
+      return config !== undefined;
+    };
+    const autonomyDeps: AutonomyRouteDeps = {
+      projection: autonomy.projection,
+      control: autonomy.control,
+      agentExists,
+      now: () => Date.now(),
+    };
+    registerAutonomyRoutes(app, autonomyDeps);
+  }
 
   app.get("/packages", async (c) => c.json({ packages: await listPackages(env) }));
 

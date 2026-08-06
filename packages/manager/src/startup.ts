@@ -94,8 +94,8 @@ export interface StartupDeps<
   createTurns: (deps: { store: S }) => T;
   /** Construye el OAuthService con los providers. */
   createOAuth: (providers: P) => O;
-  /** Construye la app HTTP (`createApi`); recibe el `TurnExecution` compartido (D8). */
-  createApp: (deps: { providers: P; supervisor: Sup; oauth: O; turns: T }) => A;
+  /** Construye la app HTTP (`createApi`); recibe el `TurnExecution` compartido (D8) y el store para autonomía (P2.3). */
+  createApp: (deps: { providers: P; supervisor: Sup; oauth: O; turns: T; store: S }) => A;
   /** Construye el `AgendaLoop` con el repo, el Supervisor y el `TurnExecution` compartidos. */
   createLoop: (deps: { store: S; supervisor: Sup; turns: T }) => Loop;
   /** Publica HTTP (`serve`) — el último paso: nada despacha antes de recuperar. */
@@ -203,7 +203,7 @@ export async function runStartup<
   //    ruta HTTP y el Loop consuman la misma instancia (D8, §6.3).
   const turns = deps.createTurns({ store });
   const oauth = deps.createOAuth(deps.providers); // 9. OAuthService
-  const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns }); // 10. createApi
+  const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns, store }); // 10. createApi + autonomía (P2.3)
   const server = deps.serve(app); //               11. serve — HTTP público
 
   // 12. Fase 3.5 (§1.2, D2): el Loop se compone y arranca DESPUÉS de `serve`.

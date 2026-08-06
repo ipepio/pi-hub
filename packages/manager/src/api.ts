@@ -36,6 +36,9 @@ import {
 import type { TurnExecution } from "./agenda/turn-execution.js";
 import { csrfCookie, generateCsrfToken } from "./api-v1/auth.js";
 import { apiError } from "./api-v1/errors.js";
+import type { StartupStore } from "./startup.js";
+import type { AutonomyProjection } from "./agenda/autonomy-projection.js";
+import type { AutonomyControl } from "./agenda/autonomy-control.js";
 import path from "node:path";
 
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -91,6 +94,10 @@ export function createApi(
   oauth: OAuthService,
   runtimeProviders?: RuntimeProviders,
   turns?: TurnExecution,
+  autonomy?: {
+    projection: Pick<AutonomyProjection, "snapshotForAgent">;
+    control: AutonomyControl;
+  },
 ): Hono {
   const app = new Hono();
   const providers =
@@ -119,7 +126,7 @@ export function createApi(
   // resuelve en orden de registro, así que registrar el router primero deja
   // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
   // ruta `/api/*` del panel.
-  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers, turns));
+  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers, turns, autonomy));
 
   app.use("/api/*", async (c, next) => {
     const authorization = c.req.header("authorization");
