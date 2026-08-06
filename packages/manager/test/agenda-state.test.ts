@@ -157,14 +157,15 @@ describe("errors.ts — catálogo cerrado y traducción hacia arriba (§9)", () 
   });
 
   it("traducciones fijadas por la tabla §9.2", () => {
-    assert.equal(toApiError("INITIATIVE_NOT_FOUND"), "TURN_NOT_FOUND");
+    assert.equal(toApiError("INITIATIVE_NOT_FOUND"), "INITIATIVE_NOT_FOUND");
     assert.equal(toApiError("TURN_NOT_FOUND"), "TURN_NOT_FOUND");
     assert.equal(toApiError("INITIATIVE_TRANSITION_ILLEGAL"), "BAD_REQUEST");
-    assert.equal(toApiError("INITIATIVE_STATE_CONFLICT"), "BAD_REQUEST");
+    assert.equal(toApiError("INITIATIVE_STATE_CONFLICT"), "INITIATIVE_STATE_CONFLICT");
     assert.equal(toApiError("INITIATIVE_ALREADY_TERMINAL"), "BAD_REQUEST");
-    assert.equal(toApiError("INITIATIVE_INVARIANT_VIOLATION"), "BAD_REQUEST");
-    assert.equal(toApiError("TRIGGER_NOT_FOUND"), "BAD_REQUEST");
+    assert.equal(toApiError("INITIATIVE_INVARIANT_VIOLATION"), "INTERNAL_ERROR");
+    assert.equal(toApiError("TRIGGER_NOT_FOUND"), "TRIGGER_NOT_FOUND");
     assert.equal(toApiError("TRIGGER_NOT_DISPARABLE"), "BAD_REQUEST");
+    assert.equal(toApiError("IDEMPOTENCY_CONFLICT"), "IDEMPOTENCY_CONFLICT");
     assert.equal(toApiError("CHAIN_DEPTH_EXCEEDED"), "BAD_REQUEST");
     assert.equal(toApiError("CALLBACK_PARENT_MISMATCH"), "BAD_REQUEST");
     assert.equal(toApiError("CALLBACK_PARENT_TERMINAL"), "BAD_REQUEST");

@@ -1,5 +1,5 @@
 /**
- * Catálogo cerrado de errores de la capa de dominio Agenda — Fase 2.1.
+ * Catálogo cerrado de errores de la capa de dominio Agenda — Fase 2.2.
  *
  * El Manager es la frontera (`CONTRIBUTING.md:80-90`): los callers reciben un
  * código del catálogo, nunca texto crudo. `DomainErrorCode` es una unión
@@ -13,6 +13,12 @@
  * se lanza antes de tocar disco) y `INITIATIVE_STATE_CONFLICT` (el CAS
  * `WHERE state=:expected_from` perdió la carrera — estado válido al leer, otro
  * escritor ganó; §5.1). No se unifican.
+ *
+ * Traducción HTTP fijada por P2.2 (§2.6 del plan P2):
+ *   INITIATIVE_NOT_FOUND → 404, TRIGGER_NOT_FOUND → 404,
+ *   INITIATIVE_STATE_CONFLICT → 409, IDEMPOTENCY_CONFLICT → 409,
+ *   TRIGGER_AUTHORITY_CONFLICT → INTERNAL_ERROR (fail-closed),
+ *   INITIATIVE_INVARIANT_VIOLATION → INTERNAL_ERROR.
  */
 
 import type { ApiErrorCode } from "../api-v1/errors.ts";
@@ -64,33 +70,23 @@ export class DomainError extends Error {
 }
 
 /**
- * Traducción al catálogo HTTP existente (`api-v1/errors.ts`), tabla §9.2.
+ * Traducción al catálogo HTTP (`api-v1/errors.ts`), fijada por P2.2 (§2.6).
  *
  * Códigos sin fila en §9.2 —`CALLBACK_NOT_FOUND`, `CHAIN_DEADLINE_EXCEEDED`
  * (info del barrido, no error de caller) e `IDEMPOTENCY_DUPLICATE` ("no es
  * error"; devuelve `{turnId, duplicate:true}`)— mapean a `INTERNAL_ERROR`:
  * son códigos que en Fase 2 no deben llegar a la frontera HTTP, y si llegan
- * es un bug del Manager que debe verse en logs. El §9.2 deja "no determinada"
- * la traducción pública de `INITIATIVE_*`/`CALLBACK_*` hasta la fase que toque
- * `routes.ts`; esta tabla es la especificación vigente para Fase 2 y no toca
- * `api-v1/` (decisión §9.2: opción 1, sin añadir `STATE_CONFLICT` 409).
- *
- * P1 (plan P1 §4) añade `IDEMPOTENCY_CONFLICT` y `TRIGGER_AUTHORITY_CONFLICT`
- * (revoke de un Trigger cuya `authority` no coincide con la efectiva — estado
- * imposible tras la reconciliación normal, pero fail-closed),
- * errores de caller; su traducción pública la fija P2, así que aquí
- * mapean provisionalmente a `BAD_REQUEST` para mantener `toApiError` exhaustivo
- * sin introducir rutas.
+ * es un bug del Manager que debe verse en logs.
  */
 const API_CODE_BY_DOMAIN: Readonly<Record<DomainErrorCode, ApiErrorCode>> = {
-  INITIATIVE_NOT_FOUND: "TURN_NOT_FOUND",
-  TRIGGER_NOT_FOUND: "BAD_REQUEST",
-  TRIGGER_AUTHORITY_CONFLICT: "BAD_REQUEST",
-  IDEMPOTENCY_CONFLICT: "BAD_REQUEST",
+  INITIATIVE_NOT_FOUND: "INITIATIVE_NOT_FOUND",
+  TRIGGER_NOT_FOUND: "TRIGGER_NOT_FOUND",
+  TRIGGER_AUTHORITY_CONFLICT: "INTERNAL_ERROR",
+  IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT",
   INITIATIVE_TRANSITION_ILLEGAL: "BAD_REQUEST",
-  INITIATIVE_STATE_CONFLICT: "BAD_REQUEST",
+  INITIATIVE_STATE_CONFLICT: "INITIATIVE_STATE_CONFLICT",
   INITIATIVE_ALREADY_TERMINAL: "BAD_REQUEST",
-  INITIATIVE_INVARIANT_VIOLATION: "BAD_REQUEST",
+  INITIATIVE_INVARIANT_VIOLATION: "INTERNAL_ERROR",
   TRIGGER_NOT_DISPARABLE: "BAD_REQUEST",
   CHAIN_DEPTH_EXCEEDED: "BAD_REQUEST",
   CHAIN_DEADLINE_EXCEEDED: "INTERNAL_ERROR",

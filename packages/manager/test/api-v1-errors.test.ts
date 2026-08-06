@@ -12,6 +12,13 @@ describe("api-v1 error envelope", () => {
     });
   });
 
+  it("los nuevos códigos de autonomía (P2.2) tienen status HTTP", () => {
+    assert.strictEqual(HTTP_STATUS_BY_CODE.INITIATIVE_NOT_FOUND, 404);
+    assert.strictEqual(HTTP_STATUS_BY_CODE.TRIGGER_NOT_FOUND, 404);
+    assert.strictEqual(HTTP_STATUS_BY_CODE.INITIATIVE_STATE_CONFLICT, 409);
+    assert.strictEqual(HTTP_STATUS_BY_CODE.IDEMPOTENCY_CONFLICT, 409);
+  });
+
   it("cada código del catálogo tiene un status HTTP", () => {
     // La spec §4.1 fija el catálogo; sin status un código sería inservible.
     for (const code of [
@@ -30,6 +37,10 @@ describe("api-v1 error envelope", () => {
       "BAD_REQUEST",
       "CSRF_REQUIRED",
       "CSRF_INVALID",
+      "INITIATIVE_NOT_FOUND",
+      "TRIGGER_NOT_FOUND",
+      "INITIATIVE_STATE_CONFLICT",
+      "IDEMPOTENCY_CONFLICT",
     ] as const) {
       assert.ok(HTTP_STATUS_BY_CODE[code], `falta status para ${code}`);
     }
