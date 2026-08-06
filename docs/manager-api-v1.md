@@ -84,11 +84,11 @@ Manager. El catálogo y status HTTP son:
 | `PAYLOAD_TOO_LARGE` | 413 | Audio o fichero excede el límite del Runner |
 | `MISSING_AUTH`, `INVALID_AUTH`, `ROTATED_AUTH` | 401 | Problema de autenticación |
 | `MODEL_FORBIDDEN`, `CSRF_REQUIRED`, `CSRF_INVALID` | 403 | Operación no permitida o protección CSRF |
-| `AGENT_NOT_FOUND`, `SESSION_NOT_FOUND`, `TURN_NOT_FOUND` | 404 | Recurso inexistente/no activo |
+| `AGENT_NOT_FOUND`, `SESSION_NOT_FOUND`, `TURN_NOT_FOUND`, `INITIATIVE_NOT_FOUND`, `TRIGGER_NOT_FOUND` | 404 | Recurso inexistente/no activo |
 | `SESSION_EXPIRED` | 410 | Sesión expirada |
-| `AGENT_ALREADY_EXISTS`, `TURN_IN_PROGRESS` | 409 | Conflicto de estado |
+| `AGENT_ALREADY_EXISTS`, `TURN_IN_PROGRESS`, `INITIATIVE_STATE_CONFLICT`, `IDEMPOTENCY_CONFLICT` | 409 | Conflicto de estado |
 | `VOICE_PROVIDER_ERROR` | 502 | Fallo del Provider de voz |
-| `RESOURCE_UNAVAILABLE` | 503 | Manager/Runner temporalmente no disponible |
+| `RESOURCE_UNAVAILABLE` | 503 | Manager/Runner temporalmente no disponible, o admisión no disponible (P4) |
 | `INTERNAL_ERROR` | 500 | Fallo interno; el mensaje se sanea |
 
 Las extensiones OAuth conservan algunos cuerpos históricos `{ "error": "..." }`
@@ -494,6 +494,226 @@ La ruta valida el formato y el token actual, pero **no rota en memoria**:
 responde `503 RESOURCE_UNAVAILABLE` porque una rotación efectiva exige cambiar
 el entorno persistente y reiniciar el Manager. No trates un `200` inexistente
 como confirmación de rotación.
+
+## 11.5. Autonomía de Agents (Loop, Agenda, Initiative, Trigger)
+
+Añadido en P2. Rutas para leer y mutar el estado de autonomía de un Agent.
+
+**Auth por modo:**
+
+| Modo | Principal | Lectura Autonomía | Mutación Autonomía | Autoridad efectiva |
+|---|---:|---:|---|
+| Gobernador | Bearer válido (`service`) | permitido | permitido, sin CSRF | `owner` |
+| Gobernador | cookie válida (`panel`) | permitido | solo con CSRF + same-origin | `owner` |
+| Gobernado | Bearer válido (`service`) | permitido | permitido, sin CSRF | `control_plane` |
+| Gobernado | cookie o antigua (`panel`) | `401 INVALID_AUTH` | `401 INVALID_AUTH` | nunca llega a Control |
+| Ambos | Bearer inválido + cookie | `401 INVALID_AUTH` | `401 INVALID_AUTH` | nunca llega a Control |
+
+Todos los timestamps son epoch **milliseconds** enteros o `null`. No se mezcla
+ISO 8601 con epoch dentro del mismo recurso.
+
+### Snapshot público
+
+```text
+GET /api/v1/agents/:name/autonomy
+```
+
+`200` — snapshot completo del Agent:
+
+```json
+{
+  "asOf": 1712345678000,
+  "initiatives": [...],
+  "agenda": [{"position": 1, "initiative": {...}}],
+  "inbox": [...],
+  "triggers": [...],
+  "historyTruncated": false
+}
+```
+
+**PublicInitiative:**
+
+```json
+{
+  "id": "uuid",
+  "origin": "trigger|calling|human",
+  "triggerId": "uuid|null",
+  "status": "queued|running|waiting_human|waiting_agent|completed|failed|cancelled|initiation",
+  "mode": "solo|ask",
+  "intent": "string",
+  "summary": "string|null",
+  "question": "string|null",
+  "availableAt": 1712345678000,
+  "createdAt": 1712345678000,
+  "stateChangedAt": 1712345678000,
+  "startedAt": 1712345678000|null,
+  "finishedAt": 1712345678000|null,
+  "expiresAt": 1712345678000|null,
+  "failureReason": "turn_failed|null|unknown"
+}
+```
+
+`failureReason` solo contiene literales del catálogo (`turn_failed`,
+`runner_unavailable`, `dispatch_failed`, `agent_errored`,
+`chain_deadline_exceeded`, `startup_recovery`) o `"unknown"` para cualquier
+otro valor interno. `result` **no se publica**.
+
+**PublicTrigger:**
+
+```json
+{
+  "id": "uuid",
+  "kind": "daily|weekly|interval",
+  "definition": {"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"},
+  "intent": "string",
+  "mode": "solo|ask",
+  "suggestedSkill": "string|null",
+  "createdBy": "owner|control_plane|agent",
+  "authority": "owner|control_plane",
+  "proposalState": "proposed|approved|null",
+  "enabled": true,
+  "nextFireAt": 1712345678000|null,
+  "lastFiredAt": 1712345678000|null,
+  "createdAt": 1712345678000,
+  "updatedAt": 1712345678000
+}
+```
+
+`definition` es siempre una de las tres formas exactas:
+
+```json
+{"version":1,"kind":"interval","intervalMs":60000}
+{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}
+{"version":2,"kind":"weekly","timeZone":"Europe/Madrid","at":"09:00","days":["mon","wed","fri"]}
+```
+
+### Crear Trigger
+
+```text
+POST /api/v1/agents/:name/triggers
+Idempotency-Key: <obligatorio, header>
+```
+
+Body estricto (Zod `.strict()`, claves extra rechazadas):
+
+```json
+{
+  "definition": {"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"},
+  "intent": "revisar cada mañana",
+  "mode": "solo",
+  "suggestedSkill": null
+}
+```
+
+| Estado | HTTP | Body |
+|---|---|---|
+| Creación nueva | `201` | `{trigger, replayed:false}` |
+| Idempotencia (misma key, mismo comando) | `200` | `{trigger, replayed:true}` |
+| Key reutilizada con comando distinto | `409` | `IDEMPOTENCY_CONFLICT` |
+
+### Revocar Trigger
+
+```text
+POST /api/v1/agents/:name/triggers/:id/revoke
+```
+
+Sin body contractual. Repetir sobre un trigger ya revocado mantiene `200`.
+
+| Estado | HTTP | Body |
+|---|---|---|
+| Revocado | `200` | `{trigger}` con `enabled:false` |
+| Inexistente o de otro Agent | `404` | `TRIGGER_NOT_FOUND` |
+
+### Cancelar Initiative
+
+```text
+POST /api/v1/agents/:name/initiatives/:id/cancel
+```
+
+Sin body contractual.
+
+| Estado | HTTP | Body |
+|---|---|---|
+| Initiative queued/terminal | `200` | `{status:"cancelled", initiative}` |
+| Initiative running | `202` | `{status:"cancellation_requested", initiative}` |
+| Inexistente o de otro Agent | `404` | `INITIATIVE_NOT_FOUND` |
+| Conflicto de estado (CAS) | `409` | `INITIATIVE_STATE_CONFLICT` |
+
+### Responder a Initiative
+
+```text
+POST /api/v1/agents/:name/initiatives/:id/respond
+Idempotency-Key: <obligatorio, header>
+```
+
+Body:
+
+```json
+{
+  "answer": "sí, procede"
+}
+```
+
+`answer` usa exactamente `1..4000` caracteres (cota `MAX_HUMAN_ANSWER_LENGTH`
+del dominio).
+
+| Estado | HTTP | Body |
+|---|---|---|
+| Respuesta nueva | `200` | `{initiative, replayed:false}` |
+| Idempotencia | `200` | `{initiative, replayed:true}` |
+| Inexistente o de otro Agent | `404` | `INITIATIVE_NOT_FOUND` |
+| Conflicto de estado | `409` | `INITIATIVE_STATE_CONFLICT` |
+| Key con comando distinto | `409` | `IDEMPOTENCY_CONFLICT` |
+
+### Admisión (shell contractual, P4)
+
+```text
+GET  /api/v1/runtime/admission
+PUT  /api/v1/runtime/admission
+```
+
+**En P2 ambas responden `503 RESOURCE_UNAVAILABLE`** porque el port de
+admisón está ausente. El contrato está congelado (misma ruta, misma auth
+por modo, mismo presenter), pero P4 aporta el adapter real y cambia estas
+a `200` sin modificar ruta, auth, schema, presenter ni envelope.
+
+PUT body:
+
+```json
+{"state": "open|draining"}
+```
+
+Contrato futuro (`PublicAdmissionState`):
+
+```json
+{
+  "state": "open|draining",
+  "idle": false,
+  "activeTurns": 0,
+  "runningInitiatives": 0,
+  "changedAt": 1712345678000
+}
+```
+
+No incluye IDs de Agent, turnos ni sesiones.
+
+### Errores específicos de Autonomía
+
+| Código | HTTP | Origen |
+|---|---:|---|
+| `INITIATIVE_NOT_FOUND` | 404 | Initiative inexistente o de otro Agent |
+| `TRIGGER_NOT_FOUND` | 404 | Trigger inexistente o de otro Agent |
+| `INITIATIVE_STATE_CONFLICT` | 409 | CAS/estado ya cambiado |
+| `IDEMPOTENCY_CONFLICT` | 409 | misma key, comando distinto |
+
+El resto de errores del dominio:
+
+| Origen | HTTP | Código |
+|---|---:|---|
+| `TRIGGER_NOT_DISPARABLE`, payload/header inválido | 400 | `BAD_REQUEST` |
+| `STORAGE_BUSY`, `STORAGE_UNAVAILABLE` o admission ausente | 503 | `RESOURCE_UNAVAILABLE` |
+| `TRIGGER_AUTHORITY_CONFLICT`, invariantes, corrupción, schema | 500 | `INTERNAL_ERROR` (saneado) |
+| Error no `DomainError` | 500 | `INTERNAL_ERROR` (log + correlationId) |
 
 ## 12. Invariantes
 

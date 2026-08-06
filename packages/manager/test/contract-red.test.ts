@@ -50,6 +50,7 @@ let TURN_AGENT_CREATION: Promise<void> | undefined;
 let DEFAULT_AGENT: string;
 let PANEL_COOKIE: string;
 let PANEL_CSRF: string;
+let AUTONOMY_AGENT: string;
 
 function headerCookies(response: Response): string[] {
   const headers = response.headers as Headers & { getSetCookie?: () => string[] };
@@ -133,6 +134,13 @@ before(async () => {
     body: { name: UPLOAD_AGENT, model: CONTRACT_MODEL },
   });
   assert.strictEqual(created.status, 201, `no se pudo crear el Agent de H09: ${created.rawText}`);
+
+  AUTONOMY_AGENT = `p27-autonomy-${Date.now()}`;
+  const autoCreated = await request("/api/v1/agents", {
+    method: "POST",
+    body: { name: AUTONOMY_AGENT, model: CONTRACT_MODEL },
+  });
+  assert.strictEqual(autoCreated.status, 201, `no se pudo crear el Agent de P2.7: ${autoCreated.rawText}`);
   DEFAULT_AGENT = `h09-default-${Date.now()}`;
   const defaultCreated = await request("/api/v1/agents", {
     method: "POST",
@@ -145,6 +153,7 @@ after(async () => {
   if (DEFAULT_AGENT) await request(`/api/v1/agents/${DEFAULT_AGENT}`, { method: "DELETE" });
   if (TURN_AGENT) await request(`/api/v1/agents/${TURN_AGENT}`, { method: "DELETE" });
   if (UPLOAD_AGENT) await request(`/api/v1/agents/${UPLOAD_AGENT}`, { method: "DELETE" });
+  if (AUTONOMY_AGENT) await request(`/api/v1/agents/${AUTONOMY_AGENT}`, { method: "DELETE" });
 });
 
 async function uploadRequest(
@@ -190,12 +199,13 @@ async function eventually(assertion: () => Promise<void>, timeoutMs = 10_000): P
 
 async function request(
   path: string,
-  options: { method?: string; body?: unknown; auth?: "valid" | "invalid" | "none" } = {},
+  options: { method?: string; body?: unknown; auth?: "valid" | "invalid" | "none"; headersExtra?: Record<string, string> } = {},
 ): Promise<{ status: number; body: unknown; rawText: string }> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const auth = options.auth ?? "valid";
   if (auth === "valid") headers["Authorization"] = `Bearer ${VALID_TOKEN}`;
   if (auth === "invalid") headers["Authorization"] = "Bearer this-token-is-not-valid";
+  if (options.headersExtra) Object.assign(headers, options.headersExtra);
 
   const res = await fetch(new URL(path, MANAGER_URL), {
     method: options.method ?? "GET",
@@ -884,6 +894,162 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       assert.equal(events.at(-1)?.event, "turn-aborted");
       assert.deepStrictEqual(events.at(-1)?.data, { turnId: events.at(-1)?.data.turnId });
       assert.equal(events.some((event) => event.event === "turn-complete"), false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // P2.7 — Contrato real de Autonomía (Gobernador Bearer↔cookie)
+  // ---------------------------------------------------------------------------
+  //
+  // Estas pruebas verifican que el conjunto ensamblado funciona de verdad:
+  // snapshot, create trigger y revoke trigger, verificando que una mutación
+  // hecha con Bearer se ve con cookie y viceversa.
+
+  describe("P2.7 — Gobernador: Autonomía Bearer↔cookie", () => {
+    const dailyTrigger = {
+      definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
+      intent: "revisar el estado",
+      mode: "solo",
+      suggestedSkill: null,
+    };
+
+    let createdTriggerId: string;
+
+    it("GET /api/v1/agents/:name/autonomy con Bearer devuelve 200 con shape correcta", async () => {
+      const { status, body, rawText } = await request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`);
+      assert.strictEqual(status, 200, `respuesta actual: ${rawText}`);
+      const parsed = body as { asOf?: number; initiatives?: unknown[]; agenda?: unknown[]; inbox?: unknown[]; triggers?: unknown[]; historyTruncated?: boolean };
+      assert.strictEqual(typeof parsed.asOf, "number");
+      assert.ok(Array.isArray(parsed.initiatives));
+      assert.ok(Array.isArray(parsed.agenda));
+      assert.ok(Array.isArray(parsed.inbox));
+      assert.ok(Array.isArray(parsed.triggers));
+      assert.strictEqual(typeof parsed.historyTruncated, "boolean");
+      assertNoInternalsLeaked(rawText);
+    });
+
+    it("GET /api/v1/agents/:name/autonomy con cookie devuelve idéntico asOf", async () => {
+      const [bearerRes, cookieRes] = await Promise.all([
+        request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`),
+        panelRequest(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`),
+      ]);
+      assert.strictEqual(bearerRes.status, 200, `Bearer: ${bearerRes.rawText}`);
+      assert.strictEqual(cookieRes.status, 200, `Cookie: ${cookieRes.rawText}`);
+      const bearer = bearerRes.body as { asOf?: number };
+      const cookie = cookieRes.body as { asOf?: number };
+      // Misma proyección, mismo asOf en el intervalo de la petición
+      assert.strictEqual(bearer.asOf, cookie.asOf, "Bearer y cookie deben ver la misma Projection");
+    });
+
+    it("POST /api/v1/agents/:name/triggers con Bearer crea trigger y devuelve 201", async () => {
+      const { status, body, rawText } = await request(`/api/v1/agents/${AUTONOMY_AGENT}/triggers`, {
+        method: "POST",
+        body: dailyTrigger,
+        headersExtra: { "Idempotency-Key": `p27-create-${Date.now()}` },
+      });
+      assert.strictEqual(status, 201, `esperaba 201: ${rawText}`);
+      const parsed = body as { trigger?: { id?: string }; replayed?: boolean };
+      assert.ok(parsed.trigger?.id, "falta trigger.id");
+      assert.strictEqual(parsed.replayed, false);
+      createdTriggerId = parsed.trigger!.id;
+      assertNoInternalsLeaked(rawText);
+    });
+
+    it("el trigger creado con Bearer es visible vía cookie", async () => {
+      assert.ok(createdTriggerId, "precondición: trigger creado");
+      const { status, body, rawText } = await panelRequest(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`);
+      assert.strictEqual(status, 200, `cookie falló: ${rawText}`);
+      const parsed = body as { triggers?: Array<{ id?: string; enabled?: boolean }> };
+      const found = parsed.triggers?.find((t) => t.id === createdTriggerId);
+      assert.ok(found, `trigger ${createdTriggerId} no visible vía cookie`);
+      assert.strictEqual(found.enabled, true);
+      assertNoInternalsLeaked(rawText);
+    });
+
+    it("POST /api/v1/agents/:name/triggers/:id/revoke con cookie revoca el trigger", async () => {
+      assert.ok(createdTriggerId, "precondición: trigger creado");
+      const { status, body, rawText } = await panelRequest(
+        `/api/v1/agents/${AUTONOMY_AGENT}/triggers/${createdTriggerId}/revoke`,
+        { method: "POST" },
+      );
+      assert.strictEqual(status, 200, `revoke falló: ${rawText}`);
+      const parsed = body as { trigger?: { id?: string; enabled?: boolean } };
+      assert.strictEqual(parsed.trigger?.id, createdTriggerId);
+      assert.strictEqual(parsed.trigger?.enabled, false);
+      assertNoInternalsLeaked(rawText);
+    });
+
+    it("trigger revocado con cookie se ve como disabled vía Bearer", async () => {
+      assert.ok(createdTriggerId, "precondición: trigger creado");
+      const { status, body, rawText } = await request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`);
+      assert.strictEqual(status, 200, `Bearer falló: ${rawText}`);
+      const parsed = body as { triggers?: Array<{ id?: string; enabled?: boolean }> };
+      const found = parsed.triggers?.find((t) => t.id === createdTriggerId);
+      assert.ok(found, `trigger ${createdTriggerId} no visible vía Bearer tras revoke`);
+      assert.strictEqual(found.enabled, false, "debe verse revocado");
+    });
+
+    it("ninguna respuesta contiene secretos internos (redacción)", async () => {
+      // Revisar snapshot con ambas auth
+      const [bearer, cookie] = await Promise.all([
+        request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`),
+        panelRequest(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`),
+      ]);
+      assertNoInternalsLeaked(bearer.rawText);
+      assertNoInternalsLeaked(cookie.rawText);
+
+      // Verificar que no hay campos internos en la respuesta
+      const bearerBody = JSON.stringify(bearer.body);
+      const forbiddenPatterns = ["sessionKey", "turnId", "boundModel", "result", "definitionJson", "createIdempotencyKey", "createCommandHash"];
+      for (const pattern of forbiddenPatterns) {
+        assert.doesNotMatch(bearerBody, new RegExp(pattern), `Bearer no debe contener "${pattern}"`);
+        assert.doesNotMatch(cookie.rawText, new RegExp(pattern), `Cookie no debe contener "${pattern}"`);
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // P2.7 — Gobernado: sin sesión, cookie no autoriza, Bearer sí
+  // ---------------------------------------------------------------------------
+
+  describe("P2.7 — Gobernado: sin sesión, cookie rechazada, Bearer funciona", () => {
+    // En Gobernado (PIHUB_PANEL_ENABLED=false):
+    //   - POST /auth/session da 404 sin Set-Cookie
+    //   - Cookie antigua da 401 en /api/v1
+    //   - Bearer funciona en GET autonomy
+
+    it("POST /auth/session en Gobernado responde 404 sin Set-Cookie", { skip: true }, async () => {
+      // Esta prueba requiere un Manager arrancado en modo Gobernado.
+      // Ejecutar manualmente con:
+      //   PIHUB_PANEL_ENABLED=false npm start
+      // luego apuntar a ese MANAGER_URL.
+      const response = await fetch(new URL("/auth/session", MANAGER_URL), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: VALID_TOKEN }),
+      });
+      assert.strictEqual(response.status, 404, "Gobernado no debe tener /auth/session");
+      const cookies = response.headers as unknown as { getSetCookie?: () => string[] };
+      const setCookie = cookies.getSetCookie?.() ?? [];
+      assert.strictEqual(setCookie.length, 0, "no debe emitir Set-Cookie");
+    });
+
+    it("cookie antigua de panel no autoriza /api/v1 en Gobernado", { skip: true }, async () => {
+      // Requiere Gobernado.
+      const result = await panelRequest("/api/v1/agents");
+      assert.strictEqual(result.status, 401, "cookie de panel no debe autorizar en Gobernado");
+      assert.strictEqual(
+        (result.body as { code?: string }).code,
+        "INVALID_AUTH",
+      );
+    });
+
+    it("Bearer funciona en GET autonomy contra Manager Gobernado", { skip: true }, async () => {
+      // Requiere Gobernado con el Agent creado.
+      const { status, body, rawText } = await request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`);
+      assert.strictEqual(status, 200, `Bearer falló en Gobernado: ${rawText}`);
+      assert.ok((body as { asOf?: number }).asOf);
+      assertNoInternalsLeaked(rawText);
     });
   });
 });

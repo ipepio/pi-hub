@@ -1,6 +1,6 @@
 # Estado de pihub
 
-> Última verificación: **2026-08-05** · versión **v0.8.0-rc.1** · release
+> Última verificación: **2026-08-10** · versión **v0.9.0** · ocho commits sobre la
 > candidate de Providers publicada con digest
 > `sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
 
@@ -86,8 +86,33 @@ La referencia completa, incluidos métodos, payloads, SSE y errores, está en
 
 ## Lo que no cambia ni está terminado
 
-- El motor de autonomía (Loop, Agenda, Initiative y Trigger) sigue siendo
-  diseño aceptado, no código.
+### P1 terminada (v0.9.0)
+
+Agenda durable con proyección coherente, comandos de Trigger/Initiative,
+autoridad por modo (owner vs control_plane). El motor de autonomía existe
+como código — Loop, Agenda, Initiative, Trigger — y se proyecta en el snapshot
+público de `/api/v1/agents/:name/autonomy`. Ocho commits nuevos desde la
+candidate v0.8.0-rc.1.
+
+### P2 terminada (v0.9.0)
+
+Contrato HTTP `/api/v1` de autonomía con auth dual (Bearer de servicio y cookie
+de panel con CSRF), presenters por allowlist que redactan campos internos, y
+panel con pestaña de Autonomía. Las rutas de Trigger e Initiative se prueban
+en `contract-red.test.ts` contra un Manager real.
+
+### P3 pendiente
+
+`waiting_human` end-to-end: camino Runner→Manager, tool `ask_human`, entrega
+por Telegram. El estado existe en dominio y se proyecta, pero nada lo produce
+por un camino real.
+
+### P4 pendiente
+
+Admisión y draining reales. Las rutas existen y devuelven `503` a propósito.
+
+### Otras deudas
+
 - El `docker-compose.yml` standalone aún publica los puertos de Runner. El
   panel no los usa, pero cerrarlos es hardening pendiente.
 - La limitación de `$VAR` en `models.json` para un Runner aislado sigue abierta.

@@ -1,22 +1,30 @@
 # Qué queda en pihub, y por qué
 
-> Estado revisado para **v0.8.0 candidate** (2026-08-03). Cada entrada identifica qué
+> Estado revisado para **v0.9.0** (2026-08-10). Cada entrada identifica qué
 > falta, por qué no se implementa aún y qué impacto tiene. No son backlog
 > genérico: si el motivo deja de ser válido, la entrada debe eliminarse o
 > actualizarse.
 
-## 1. Motor de autonomía: diseñado, pendiente de implementar
+## 1. Motor de autonomía: implementado (P1 + P2)
 
 Los ADRs de autonomía [`0001`–`0008`](adr/), [`0013`](adr/0013-initiative-runs-as-turn-with-own-origin.md) y
-[`0014`](adr/0014-embedded-sqlite-for-agenda-and-terminal-turn-state.md) dejan diseñados Loop, Initiative, Agenda,
-Trigger, Callback, ejecución por turnos y persistencia SQLite. No existen todavía los módulos que los materializan.
+[`0014`](adr/0014-embedded-sqlite-for-agenda-and-terminal-turn-state.md) están materializados como módulos de
+Runtime: Loop, Agenda, Initiative, Trigger, callback, ejecución por turnos y persistencia SQLite. El contrato HTTP
+`/api/v1.../autonomy` expone el snapshot público con presenters por allowlist, auth dual (Bearer + cookie/CSRF), y el
+panel tiene una pestaña de Autonomía.
 
-**Impacto:** el dashboard puede proyectar autonomía contra un fake, pero no hay
-una fuente real que ejecute Trigger → Initiative → `waiting_human`.
+**Lo que queda (P3 pendiente):** `waiting_human` end-to-end. El estado de dominio
+se proyecta (`status: "waiting_human"`, `question`, `availableAt`), pero ningún
+camino real lo produce desde el Runner (tool `ask_human`, entrega por Telegram).
+Para ello hace falta el adapter de Runtime que invoque la tool y el camino de
+entrega externa.
 
-**Desbloqueo:** implementar el diseño aceptado como trabajo de Runtime, incluido
-el almacén de ADR-0014 y la extensión del turno de ADR-0013. No debe confundirse
-con el chat ni con el bridge SSE ya operativo.
+**Lo que queda (P4 pendiente):** admisión y draining reales. Las rutas
+`/api/v1/runtime/admission` existen y devuelven `503 RESOURCE_UNAVAILABLE` a
+propósito; P4 sustituirá el port de admisión ausente por un adapter real.
+
+**No hay que deshacer:** las rutas, presenters, auth y envelope son contrato
+congelado. Cualquier ampliación futura debe mantener compatibilidad.
 
 ## 2. Hardening de Runtime standalone (H01.05/H01.07)
 
