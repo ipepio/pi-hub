@@ -5,6 +5,29 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-06
+
+### Added
+
+- **Almacén durable de la Agenda** (`b128828`): la Agenda de cada Agent ahora vive en
+  SQLite vía `node:sqlite`, sin dependencias nativas, conservando también el estado
+  terminal de los turnos. Antes el estado vivía solo en memoria y un reinicio lo
+  perdía.
+- **Capa de dominio y recuperación al arranque** (`1a82bba`): los ocho estados de
+  Initiative con transiciones validadas, y recuperación de lo que quedó a medias tras
+  una caída. Un fallo de recuperación aborta el arranque en vez de servir con estado
+  inconsistente.
+- **El Loop** (`cb11ec8`): pihub barre, dispara Triggers vencidos y despacha turnos
+  por sí mismo. Antes cada turno necesitaba que alguien llamara por HTTP. Dial de
+  concurrencia configurable, round-robin entre Agents, y apagado que no marca como
+  fallidos los turnos simplemente interrumpidos. Configurable por
+  `PIHUB_LOOP_CONCURRENCY`, `PIHUB_LOOP_POLL_MS`, `PIHUB_LOOP_GRACE_MS`,
+  `PIHUB_LOOP_POST_ABORT_MARGIN_MS` y `PIHUB_TURN_DISPATCH_TIMEOUT_MS`.
+- **Schedules por hora civil** (`52c94e1`): `version: 2` con `daily`/`weekly`, zona
+  IANA obligatoria y hora `HH:mm`. "Cada día laborable a las 09:00" antes era
+  inexpresable. Los schedules `version: 1` por intervalo siguen funcionando sin
+  migración de datos.
+
 ### Changed
 
 - **Catálogo de modelos y providers**: `GET /api/v1/models` y `GET /api/v1/providers`

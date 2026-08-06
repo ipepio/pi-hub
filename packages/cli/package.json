@@ -1,6 +1,6 @@
 {
   "name": "@pihub/cli",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "bin": {
     "pihub": "dist/index.js"
@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@pihub/shared": "0.8.0"
+    "@pihub/shared": "0.9.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
