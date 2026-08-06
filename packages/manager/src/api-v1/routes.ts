@@ -2,6 +2,7 @@ import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   agentPaths,
   isProtectedEnvKey,
@@ -57,7 +58,15 @@ import {
   updateAgentV1Schema,
 } from "./schemas.js";
 
-const MANAGER_VERSION = "0.8.0";
+/**
+ * La versión que reportan `/health` y `/status`. Sale del `package.json` de
+ * `@pihub/manager` — nunca de una constante a mano, para que la imagen no
+ * vuelva a declarar una versión distinta de la que publica. Se lee desde
+ * `dist/api-v1/` y `../../package.json` cae siempre en `packages/manager`.
+ */
+const MANAGER_VERSION = JSON.parse(
+  readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+).version as string;
 
 /** Variables de contexto de `/api/v1`. El correlationId viaja en toda respuesta de error. */
 export type ApiV1Env = { Variables: { correlationId: string } };

@@ -263,6 +263,36 @@ test("GET /status exige la credencial de servicio", async () => {
   }
 });
 
+test("GET /status y GET /health reportan la version del package.json de @pihub/manager", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-version-"));
+  try {
+    await scaffoldGlobalDirs(dataDir);
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+    // `../package.json` desde test/ = packages/manager/package.json.
+    const pkgVersion = JSON.parse(
+      await fs.readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ).version as string;
+
+    const status = await app.request("http://pihub.test/status", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const statusBody = await status.json();
+    assert.equal(status.status, 200);
+    assert.equal(statusBody.version, pkgVersion);
+
+    const health = await app.request("http://pihub.test/health", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const healthBody = await health.json();
+    assert.equal(health.status, 200);
+    assert.equal(healthBody.version, pkgVersion);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("GET /models devuelve 503 RESOURCE_UNAVAILABLE si el catalogo de Providers no se puede leer (no un array vacio disfrazado)", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-models-"));
   try {
