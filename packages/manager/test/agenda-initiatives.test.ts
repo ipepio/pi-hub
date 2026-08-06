@@ -429,6 +429,55 @@ describe("initiatives.ts — barridos T9/T10 (función pura en lote, §5.2)", ()
     assert.equal(repo.get("wa-old").state, "waiting_agent");
   });
 
+  const DAY_MS = 86_400_000;
+
+  it("sweepWaitingHumanExpiry (T10): con el default de 7 días, una pregunta de hace 1 minuto NO caduca", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const now = 100_000_000;
+    insertInitiative(db, {
+      id: "wh-min",
+      state: "waiting_human",
+      summary: "s",
+      state_changed_at: now - 60_000,
+    });
+    // El corte es `now - 7 días`: el parámetro NO es `now` (pasar `now` aquí
+    // caducaba toda pregunta pendiente en el tick siguiente).
+    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
+    assert.equal(n, 0);
+    assert.equal(repo.get("wh-min").state, "waiting_human");
+  });
+
+  it("sweepWaitingHumanExpiry (T10): 8 días sin respuesta sí caduca con el default de 7 días", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const now = 100_000_000;
+    insertInitiative(db, {
+      id: "wh-8d",
+      state: "waiting_human",
+      summary: "s",
+      state_changed_at: now - 8 * DAY_MS,
+    });
+    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
+    assert.equal(n, 1);
+    assert.equal(repo.get("wh-8d").state, "expired");
+  });
+
+  it("sweepWaitingHumanExpiry (T10): justo en el borde (exactamente 7 días) caduca, coherente con el <=", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const now = 100_000_000;
+    insertInitiative(db, {
+      id: "wh-edge",
+      state: "waiting_human",
+      summary: "s",
+      state_changed_at: now - 7 * DAY_MS,
+    });
+    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
+    assert.equal(n, 1);
+    assert.equal(repo.get("wh-edge").state, "expired");
+  });
+
   it("los barridos no dejan la base en transacción abierta: un transition posterior funciona", () => {
     const db = openMemoryDb();
     const repo = new InitiativeRepository(db);

@@ -280,6 +280,12 @@ export class InitiativeRepository {
    * T10 (§6): caducidad de Agent Policy. Pasa a `expired` toda Initiative
    * `waiting_human` cuyo `state_changed_at` venció. Devuelve el nº de filas.
    *
+   * El parámetro **es el corte ya calculado**, no `now`: el caller le pasa
+   * `now - waitingHumanExpiryMs`. Como `state_changed_at` es el instante en
+   * que la Initiative ENTRÓ en `waiting_human` (siempre pasado), el `<=`
+   * implementa "lleva más de N sin respuesta". Pasar `now` aquí caducaba toda
+   * pregunta pendiente en el tick siguiente.
+   *
    * El `WHERE state IN (...)` se deriva de `legalSourcesFor('expired')` — solo
    * `waiting_human` caduca (`CONTEXT.md:40`); de nuevo, la función pura
    * aplicada en lote, nunca un hardcode aparte.

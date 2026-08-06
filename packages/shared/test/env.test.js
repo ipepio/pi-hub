@@ -43,6 +43,8 @@ test("loadEnv: defaults del Loop (Fase 3.7, §9.7)", () => {
   // Punto crítico de la sub-fase: `dispatchTimeoutMs` debe tener un default
   // real y NO cero desde env (`0` significa watchdog desactivado).
   assert.ok(env.turnDispatchTimeoutMs > 0);
+  // Caducidad de `waiting_human` (§6): 7 días, el default del dominio.
+  assert.equal(env.waitingHumanExpiryMs, 604_800_000);
 });
 
 test("loadEnv: PIHUB_LOOP_* y PIHUB_TURN_DISPATCH_TIMEOUT_MS se leen", () => {
@@ -52,12 +54,14 @@ test("loadEnv: PIHUB_LOOP_* y PIHUB_TURN_DISPATCH_TIMEOUT_MS se leen", () => {
     PIHUB_LOOP_GRACE_MS: "0",
     PIHUB_LOOP_POST_ABORT_MARGIN_MS: "500",
     PIHUB_TURN_DISPATCH_TIMEOUT_MS: "120000",
+    PIHUB_WAITING_HUMAN_EXPIRY_MS: "1209600000",
   });
   assert.equal(env.loopConcurrency, 3);
   assert.equal(env.loopPollMs, 250);
   assert.equal(env.loopGraceMs, 0);
   assert.equal(env.loopPostAbortMarginMs, 500);
   assert.equal(env.turnDispatchTimeoutMs, 120000);
+  assert.equal(env.waitingHumanExpiryMs, 1_209_600_000);
 });
 
 test("loadEnv: valores de Loop inválidos lanzan", () => {
@@ -66,4 +70,7 @@ test("loadEnv: valores de Loop inválidos lanzan", () => {
   assert.throws(() => loadEnv({ PIHUB_LOOP_POLL_MS: "0" }), /PIHUB_LOOP_POLL_MS inválido/);
   assert.throws(() => loadEnv({ PIHUB_LOOP_GRACE_MS: "-1" }), /PIHUB_LOOP_GRACE_MS inválido/);
   assert.throws(() => loadEnv({ PIHUB_TURN_DISPATCH_TIMEOUT_MS: "x" }), /PIHUB_TURN_DISPATCH_TIMEOUT_MS inválido/);
+  // `waitingHumanExpiryMs` es positiveInt: 0 significaría caducar al instante.
+  assert.throws(() => loadEnv({ PIHUB_WAITING_HUMAN_EXPIRY_MS: "0" }), /PIHUB_WAITING_HUMAN_EXPIRY_MS inválido/);
+  assert.throws(() => loadEnv({ PIHUB_WAITING_HUMAN_EXPIRY_MS: "-1" }), /PIHUB_WAITING_HUMAN_EXPIRY_MS inválido/);
 });

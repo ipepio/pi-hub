@@ -43,6 +43,12 @@ export interface PihubEnv {
    * (§10): el default es real y NO cero — `0` significaría watchdog desactivado.
    */
   turnDispatchTimeoutMs: number;
+  /**
+   * Caducidad de `waiting_human` en ms (PIHUB_WAITING_HUMAN_EXPIRY_MS; §6,
+   * CONTEXT.md:39-40): cuánto espera una Initiative al humano antes de pasar
+   * a `expired`. Positivo — cero significaría caducar al instante.
+   */
+  waitingHumanExpiryMs: number;
 }
 
 function bool(value: string | undefined, fallback: boolean): boolean {
@@ -113,5 +119,6 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     loopGraceMs: nonNegativeInt(env.PIHUB_LOOP_GRACE_MS, 5000, "PIHUB_LOOP_GRACE_MS"),
     loopPostAbortMarginMs: nonNegativeInt(env.PIHUB_LOOP_POST_ABORT_MARGIN_MS, 1000, "PIHUB_LOOP_POST_ABORT_MARGIN_MS"),
     turnDispatchTimeoutMs: nonNegativeInt(env.PIHUB_TURN_DISPATCH_TIMEOUT_MS, 30_000, "PIHUB_TURN_DISPATCH_TIMEOUT_MS"),
+    waitingHumanExpiryMs: positiveInt(env.PIHUB_WAITING_HUMAN_EXPIRY_MS, 604_800_000, "PIHUB_WAITING_HUMAN_EXPIRY_MS"),
   };
 }

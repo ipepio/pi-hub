@@ -110,6 +110,11 @@ export interface AgendaLoopOptions {
   readonly graceMs?: number;
   /** Margen corto y acotado a los `turn-aborted` tras la gracia (§1.3). Calibración (§10). */
   readonly postAbortMarginMs?: number;
+  /**
+   * Caducidad de `waiting_human` en ms (§6, CONTEXT.md:39-40): el barrido T10
+   * recibe el corte `now - waitingHumanExpiryMs`, no `now`. Default 7 días.
+   */
+  readonly waitingHumanExpiryMs?: number;
   /** Reloj inyectable (§7.1). Default `Date.now`. */
   readonly now?: () => number;
   /** Scheduler inyectable del `tick` (§7.1). Default `setTimeout`. */
@@ -134,6 +139,7 @@ export class AgendaLoop {
   private readonly tickIntervalMs: number;
   private readonly graceMs: number;
   private readonly postAbortMarginMs: number;
+  private readonly waitingHumanExpiryMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
   private readonly cancel: (handle: TimerHandle) => void;
 
@@ -164,6 +170,7 @@ export class AgendaLoop {
     this.tickIntervalMs = options.tickIntervalMs ?? 1000;
     this.graceMs = options.graceMs ?? 5000;
     this.postAbortMarginMs = options.postAbortMarginMs ?? 1000;
+    this.waitingHumanExpiryMs = options.waitingHumanExpiryMs ?? 604_800_000;
     this.schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
     this.cancel = options.cancel ?? ((handle) => clearTimeout(handle));
   }
@@ -237,7 +244,7 @@ export class AgendaLoop {
   private sweepStep(): void {
     const now = this.now();
     this.safeRun("sweepChainDeadline", () => this.agenda.initiatives.sweepChainDeadline(now));
-    this.safeRun("sweepWaitingHumanExpiry", () => this.agenda.initiatives.sweepWaitingHumanExpiry(now));
+    this.safeRun("sweepWaitingHumanExpiry", () => this.agenda.initiatives.sweepWaitingHumanExpiry(now - this.waitingHumanExpiryMs));
   }
 
   /** Disparo de Triggers `schedule` vencidos (§3): una Initiative por Trigger. */

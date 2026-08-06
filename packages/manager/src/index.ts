@@ -59,6 +59,7 @@ const runtime = await runStartup({
       tickIntervalMs: env.loopPollMs,
       graceMs: env.loopGraceMs,
       postAbortMarginMs: env.loopPostAbortMarginMs,
+      waitingHumanExpiryMs: env.waitingHumanExpiryMs,
     }),
   serve: (app) =>
     serve({ fetch: app.fetch, port: env.managerPort, hostname: "0.0.0.0" }, (info) => {

@@ -252,9 +252,11 @@ function humanCommand(agentName: string, turnId: string): StartTurnCommand {
 interface InsertInit {
   id: string;
   agent_name?: string;
-  state?: "queued" | "running";
+  state?: "queued" | "running" | "waiting_human";
   available_at?: number;
   turn_id?: string | null;
+  summary?: string | null;
+  state_changed_at?: number;
 }
 
 /** Siembra una fila `initiatives` (setup de fixture, no comportamiento bajo prueba). */
@@ -269,7 +271,7 @@ function insertInitiative(db: SqliteDb, init: InsertInit): void {
   ).run(
     init.id, init.agent_name ?? "alice", init.state ?? "queued", "human", null,
     "di hola", "solo", "sk-1", init.available_at ?? 0, null, init.turn_id ?? null,
-    0, null, 0, null, null, null, null, 1000, 1000, 1000, null,
+    0, null, 0, init.summary ?? null, null, null, null, 1000, init.state_changed_at ?? 1000, 1000, null,
   );
 }
 
@@ -771,6 +773,51 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     clock.advance(1000);
 
     assert.equal(maxActive, 1);
+  });
+
+  it("el barrido T10 recibe el CORTE (now - waitingHumanExpiryMs), no `now` — una pregunta de hace 1 minuto NO caduca", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const DAY_MS = 86_400_000;
+    // Entró en `waiting_human` 1 minuto antes del primer tick (t=1000).
+    insertInitiative(db, {
+      id: "wh-reciente",
+      state: "waiting_human",
+      summary: "s",
+      state_changed_at: 1000 - 60_000,
+    });
+    const cortes: number[] = [];
+    // Spy del barrido: registra el argumento que el Loop le pasa, sin tocar
+    // el reloj de pared (§7.1).
+    const initiatives = new Proxy(repo.initiatives, {
+      get(target, prop, receiver) {
+        if (prop === "sweepWaitingHumanExpiry") {
+          return (cutoff: number) => {
+            cortes.push(cutoff);
+            return target.sweepWaitingHumanExpiry(cutoff);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const agenda: LoopAgenda = {
+      initiatives,
+      triggers: repo.triggers,
+      turns: repo.turns,
+      claimInitiative: (command) => repo.claimInitiative(command),
+    };
+    const clock = new ManualClock();
+    const { loop } = makeLoop(agenda, clock, {}, { waitingHumanExpiryMs: 7 * DAY_MS });
+
+    loop.start();
+    clock.advance(1000); // t=1000: el tick ejecuta el barrido
+
+    assert.equal(cortes.length, 1);
+    // El Loop pasa el corte, no `now`: con `now` (=1000) la pregunta de hace
+    // 1 minuto caducaría en el tick siguiente (el bug).
+    assert.equal(cortes[0], 1000 - 7 * DAY_MS);
+    assert.equal(repo.initiatives.get("wh-reciente").state, "waiting_human");
   });
 });
 
