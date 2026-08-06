@@ -31,6 +31,7 @@ import type { SqliteDb } from "../storage/sqlite.ts";
 import {
   canTransition,
   canChangeMode,
+  isTerminal,
   legalSourcesFor,
   type InitiativeMode,
   type InitiativeState,
@@ -169,6 +170,104 @@ export class InitiativeRepository {
       throw new DomainError("INITIATIVE_NOT_FOUND", `initiative ${id} no existe`);
     }
     return mapRow(row);
+  }
+
+  /**
+   * Lectura agent-scoped (plan P1 §6.1): toda la superficie de autonomía
+   * cualifica por `(id, agent_name)`. Un ID de otra Agenda es exactamente
+   * `INITIATIVE_NOT_FOUND`, indistinguible de uno inexistente; está prohibido
+   * el `get(id)` global seguido de comparación en JS.
+   */
+  getForAgent(id: string, agentName: string): Initiative {
+    const row = this.sqlite
+      .prepare(`${SELECT_INITIATIVE} WHERE id = ? AND agent_name = ?`)
+      .get(id, agentName) as InitiativeRow | undefined;
+    if (!row) {
+      throw new DomainError(
+        "INITIATIVE_NOT_FOUND",
+        `initiative ${id} del agent ${agentName} no existe`,
+      );
+    }
+    return mapRow(row);
+  }
+
+  /**
+   * Cancelación de los estados **en reposo** (plan P1 §6.2): `queued`,
+   * `waiting_human` y `waiting_agent` → `cancelled` por CAS agent-scoped
+   * (`UPDATE ... WHERE id=? AND agent_name=? AND state=?`), con
+   * `finished_at=state_changed_at=now` y limpieza de `pending_human_input`
+   * (una Initiative cancelada no conserva respuesta pendiente). Sigue el
+   * contrato de seis pasos: `canTransition(from,"cancelled")` antes de tocar
+   * disco y cero filas del CAS es `INITIATIVE_STATE_CONFLICT`.
+   *
+   * `running` **nunca** se escribe aquí: Control la detecta antes y va por
+   * `TurnExecution.abort`; si una carrera la deja `running` entre la lectura
+   * de Control y este CAS, es conflicto de estado, no cancelación.
+   * `cancelled` repetido es éxito idempotente sin escritura; cualquier otro
+   * terminal (`succeeded|failed|expired`) es `INITIATIVE_STATE_CONFLICT`.
+   */
+  cancelForAgent(id: string, agentName: string, now: number): Initiative {
+    const db = this.sqlite;
+    db.exec("BEGIN IMMEDIATE"); // paso 1
+    try {
+      // Paso 2: leer dentro de la transacción, scoped por `(id, agent_name)`.
+      const row = db
+        .prepare(`${SELECT_INITIATIVE} WHERE id = ? AND agent_name = ?`)
+        .get(id, agentName) as InitiativeRow | undefined;
+      if (!row) {
+        throw new DomainError(
+          "INITIATIVE_NOT_FOUND",
+          `initiative ${id} del agent ${agentName} no existe`,
+        );
+      }
+      // Terminales: `cancelled` repetido es éxito idempotente (sin escritura);
+      // cualquier otro terminal es conflicto — el caller lee el durable y no
+      // puede des-cancelar historia.
+      if (row.state === "cancelled") {
+        db.exec("COMMIT");
+        return mapRow(row);
+      }
+      if (isTerminal(row.state) || row.state === "running") {
+        throw new DomainError(
+          "INITIATIVE_STATE_CONFLICT",
+          `initiative ${id}: no se puede cancelar desde ${row.state}`,
+        );
+      }
+      // Paso 3: `canTransition` como autoridad declarativa, antes del write.
+      if (!canTransition(row.state, "cancelled")) {
+        throw new DomainError(
+          "INITIATIVE_TRANSITION_ILLEGAL",
+          `initiative ${id}: transición ${row.state} -> cancelled no es legal (§4.2)`,
+        );
+      }
+      // Paso 4/5: CAS agent-scoped. `pending_human_input` se limpia en la
+      // misma tx: una Initiative cancelada no conserva respuesta pendiente.
+      const patch: Record<string, string | number | null> = {
+        state: "cancelled",
+        state_changed_at: now,
+        finished_at: now,
+        pending_human_input: null,
+      };
+      const columns = Object.keys(patch);
+      const sets = columns.map((c) => `${c} = ?`).join(", ");
+      const values = columns.map((c) => patch[c]);
+      const result = db
+        .prepare(
+          `UPDATE initiatives SET ${sets} WHERE id = ? AND agent_name = ? AND state = ?`,
+        )
+        .run(...values, id, agentName, row.state);
+      if (Number(result.changes) !== 1) {
+        throw new DomainError(
+          "INITIATIVE_STATE_CONFLICT",
+          `initiative ${id}: el CAS de cancelación no cambió exactamente una fila (${String(result.changes)})`,
+        );
+      }
+      db.exec("COMMIT"); // paso 6
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getForAgent(id, agentName);
   }
 
   /** `queued` con `available_at` vencido, por orden de disponibilidad (índice `initiatives_due`). */

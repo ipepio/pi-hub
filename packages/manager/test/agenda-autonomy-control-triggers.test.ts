@@ -47,7 +47,18 @@ afterEach(() => {
 });
 
 function control(db: SqliteDb, authority: EffectiveTriggerAuthority = "owner"): AutonomyControl {
-  return new AutonomyControl({ agenda: new AgendaRepository(db), authority });
+  // P1.5: `AutonomyControl` recibe además `turns: Pick<TurnExecution,"abort">`;
+  // estos tests de Triggers nunca llegan al camino de abort, así que el fake
+  // falla si alguien lo invocara.
+  return new AutonomyControl({
+    agenda: new AgendaRepository(db),
+    turns: {
+      abort: (): boolean => {
+        throw new Error("abort no debe invocarse en tests de Triggers");
+      },
+    },
+    authority,
+  });
 }
 
 /** definition v2 daily de fixture. */
