@@ -79,6 +79,30 @@ export type CancelInitiativeResult =
   | { readonly status: "cancelled"; readonly initiative: Initiative }
   | { readonly status: "cancellation_requested"; readonly initiative: Initiative };
 
+/**
+ * Comando de `respondToInitiative` (plan P1 §6.3): `agentName`, `initiativeId`,
+ * `answer`, `idempotencyKey` y `now`. No recibe principal, token, cookie, Hono
+ * ni un `SqliteDb`. La respuesta no se loguea y el hash es sobre la forma
+ * canónica `{initiativeId, answer}`.
+ */
+export interface RespondInitiativeCommand {
+  readonly agentName: string;
+  readonly initiativeId: string;
+  readonly answer: string;
+  readonly idempotencyKey: string;
+  readonly now: number;
+}
+
+/**
+ * Resultado de `respondToInitiative`: la Initiative y si fue replay idempotente.
+ * `replayed:true` no reencola: la respuesta ya se había absorbido (también
+ * después de un claim, gracias a que la key/hash persisten).
+ */
+export type RespondInitiativeResult = {
+  readonly initiative: Initiative;
+  readonly replayed: boolean;
+};
+
 export class AutonomyControl {
   private readonly agenda: AgendaRepository;
   private readonly turns: Pick<TurnExecution, "abort">;
@@ -182,5 +206,27 @@ export class AutonomyControl {
       "INITIATIVE_STATE_CONFLICT",
       `initiative ${initiative.id}: abort no encontró el turno y durable sigue ${current.state}`,
     );
+  }
+
+  /**
+   * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
+   * `queued` con la `answer` depositada como pending, para que el Loop la
+   * retome con su dispatch normal. Control no despacha ni llama al Runner: el
+   * Loop sigue siendo el dispatcher único y la Initiative conserva su
+   * `session_key` — la respuesta llega al hilo que preguntó, no a uno nuevo.
+   *
+   * La idempotencia es de respuesta (primera key gana): el replay de la misma
+   * key se absorbe sea cual sea el estado actual; una key nueva cuando ya salió
+   * de `waiting_human` es `INITIATIVE_STATE_CONFLICT`. Delega el CAS al
+   * repositorio (`initiatives.respondForAgent`).
+   */
+  respondToInitiative(command: RespondInitiativeCommand): RespondInitiativeResult {
+    return this.agenda.initiatives.respondForAgent({
+      id: command.initiativeId,
+      agentName: command.agentName,
+      answer: command.answer,
+      idempotencyKey: command.idempotencyKey,
+      now: command.now,
+    });
   }
 }

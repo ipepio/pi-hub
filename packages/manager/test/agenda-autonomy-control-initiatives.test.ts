@@ -29,6 +29,7 @@
 
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { SqliteDb } from "../src/storage/sqlite.ts";
 import { runMigrations } from "../src/storage/migrations.ts";
@@ -93,6 +94,8 @@ interface InitiativeSeed {
   started_at?: number | null;
   finished_at?: number | null;
   pending_human_input?: string | null;
+  human_response_idempotency_key?: string | null;
+  human_response_command_hash?: string | null;
 }
 
 /** Siembra una fila `initiatives` (setup de fixture, no comportamiento bajo prueba). */
@@ -103,8 +106,9 @@ function insertInitiative(db: SqliteDb, seed: InitiativeSeed): void {
         available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
         visible_effects_declared, summary, ask_correlation, failure_reason,
         result, created_at, state_changed_at, started_at, finished_at,
-        pending_human_input)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        pending_human_input, human_response_idempotency_key,
+        human_response_command_hash)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     seed.id,
     seed.agent_name ?? "alice",
@@ -129,6 +133,8 @@ function insertInitiative(db: SqliteDb, seed: InitiativeSeed): void {
     seed.started_at ?? null,
     seed.finished_at ?? null,
     seed.pending_human_input ?? null,
+    seed.human_response_idempotency_key ?? null,
+    seed.human_response_command_hash ?? null,
   );
 }
 
@@ -138,18 +144,32 @@ interface InitiativeRaw {
   state: string;
   turn_id: string | null;
   pending_human_input: string | null;
-  finished_at: number | null;
+  human_response_idempotency_key: string | null;
+  human_response_command_hash: string | null;
+  available_at: number;
   state_changed_at: number;
+  session_key: string;
+  bound_model: string | null;
+  intent: string;
+  finished_at: number | null;
 }
 
 /** Fila cruda de `initiatives` para verificar el estado durable. */
 function rowOf(db: SqliteDb, id: string): InitiativeRaw {
   return db
     .prepare(
-      `SELECT id, agent_name, state, turn_id, pending_human_input, finished_at, state_changed_at
+      `SELECT id, agent_name, state, turn_id, pending_human_input,
+              human_response_idempotency_key, human_response_command_hash,
+              available_at, state_changed_at, session_key, bound_model, intent,
+              finished_at
          FROM initiatives WHERE id = ?`,
     )
     .get(id) as InitiativeRaw;
+}
+
+/** SHA-256 de la forma canónica de respuesta (mismo algoritmo que el repo, §2.3). */
+function respondHash(initiativeId: string, answer: string): string {
+  return createHash("sha256").update(JSON.stringify({ initiativeId, answer })).digest("hex");
 }
 
 function isDomainError(code: string): (err: unknown) => boolean {
@@ -447,5 +467,225 @@ describe("AutonomyControl.cancelInitiative (P1.5, plan P1 §6.2)", () => {
     assert.deepEqual(snapshot.agenda.map(({ initiative }) => initiative.id), [], "cancelada ya no está en la agenda");
     assert.strictEqual(snapshot.initiatives[0].state, "cancelled");
     assert.strictEqual(snapshot.initiatives[0].id, "i-q");
+  });
+});
+
+describe("AutonomyControl.respondToInitiative (P1.6, plan P1 §6.3)", () => {
+  it("respond feliz: waiting_human → queued con pending, key y hash; conserva sesión/modelo/intent", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "¿procedo?",
+      session_key: "sk-sesion", bound_model: "gpt-5", intent: "pregunta al humano",
+      state_changed_at: 100, available_at: 100,
+    });
+    const ctl = control(db);
+
+    const result = ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "sí", idempotencyKey: "k-1", now: 500,
+    });
+
+    assert.strictEqual(result.replayed, false);
+    assert.strictEqual(result.initiative.state, "queued");
+    const row = rowOf(db, "i-wh");
+    assert.strictEqual(row.state, "queued");
+    assert.strictEqual(row.pending_human_input, "sí");
+    assert.strictEqual(row.human_response_idempotency_key, "k-1");
+    assert.strictEqual(row.human_response_command_hash, respondHash("i-wh", "sí"));
+    assert.strictEqual(row.available_at, 500);
+    assert.strictEqual(row.state_changed_at, 500);
+    // §6.3: la respuesta llega al hilo que preguntó — misma sesión, mismo modelo.
+    assert.strictEqual(row.session_key, "sk-sesion");
+    assert.strictEqual(row.bound_model, "gpt-5");
+    assert.strictEqual(row.intent, "pregunta al humano");
+  });
+
+  it("replay antes del claim: misma key y misma answer → replayed:true sin reencolar ni tocar disco", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s", pending_human_input: "sí",
+      human_response_idempotency_key: "k-1", human_response_command_hash: respondHash("i-wh", "sí"),
+      available_at: 100, state_changed_at: 500,
+    });
+    const ctl = control(db);
+
+    const result = ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "sí", idempotencyKey: "k-1", now: 900,
+    });
+
+    assert.strictEqual(result.replayed, true);
+    // No se reencola otra vez: la fila no cambia su available_at/state_changed_at.
+    const row = rowOf(db, "i-wh");
+    assert.strictEqual(row.available_at, 100);
+    assert.strictEqual(row.state_changed_at, 500);
+    assert.strictEqual(row.pending_human_input, "sí");
+  });
+
+  it("replay después del claim: el claim consumió el pending pero la misma key sigue absorbiéndose sin reencolar", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s", available_at: 100 });
+    const ctl = control(db);
+    // 1. Respuesta normal: waiting_human → queued con pending.
+    const first = ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "respuesta", idempotencyKey: "k-1", now: 500,
+    });
+    assert.strictEqual(first.replayed, false);
+    // 2. El Loop la reclamó: pending consumido, key/hash conservados (§6.4).
+    const repo = new AgendaRepository(db);
+    const claim = repo.claimInitiative({
+      initiativeId: "i-wh", turnId: "turn-1", idempotencyKey: "idem-loop", now: 600,
+    });
+    assert.strictEqual(claim.dispatchInput, "respuesta");
+    assert.strictEqual(rowOf(db, "i-wh").pending_human_input, null);
+    assert.strictEqual(rowOf(db, "i-wh").human_response_idempotency_key, "k-1", "la key persiste tras el claim");
+
+    // 3. El cliente perdió la respuesta HTTP y repite: replay, no segunda reanudación.
+    const replay = ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "respuesta", idempotencyKey: "k-1", now: 700,
+    });
+    assert.strictEqual(replay.replayed, true);
+    assert.strictEqual(replay.initiative.state, "running", "no se vuelve a encolar ni toca el estado");
+  });
+
+  it("misma key con answer distinta → IDEMPOTENCY_CONFLICT", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_response_idempotency_key: "k-1", human_response_command_hash: respondHash("i-wh", "sí"),
+    });
+    const ctl = control(db);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-wh", answer: "NO, cancela", idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("IDEMPOTENCY_CONFLICT"),
+    );
+  });
+
+  it("segundo respondedor: key nueva tras una respuesta ya absorbida → INITIATIVE_STATE_CONFLICT", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s", available_at: 100 });
+    const ctl = control(db);
+    ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "primera", idempotencyKey: "k-1", now: 400,
+    });
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-wh", answer: "segunda", idempotencyKey: "k-2", now: 500,
+      }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+    // La primera respuesta sigue intacta: primera key gana.
+    const row = rowOf(db, "i-wh");
+    assert.strictEqual(row.pending_human_input, "primera");
+    assert.strictEqual(row.human_response_idempotency_key, "k-1");
+  });
+
+  it("estado incorrecto con key nueva (queued sin respuesta previa) → INITIATIVE_STATE_CONFLICT", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-q", state: "queued", available_at: 100 });
+    const ctl = control(db);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-q", answer: "sí", idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+  });
+
+  it("estado incorrecto con key nueva (running) → INITIATIVE_STATE_CONFLICT", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-run", state: "running", turn_id: "t-1", started_at: 100 });
+    const ctl = control(db);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-run", answer: "sí", idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+  });
+
+  it("otro Agent es indistinguible de inexistente → INITIATIVE_NOT_FOUND", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "alice-wh", agent_name: "alice", state: "waiting_human", summary: "s" });
+    const ctl = control(db);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "bob", initiativeId: "alice-wh", answer: "sí", idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("INITIATIVE_NOT_FOUND"),
+    );
+  });
+
+  it("answer vacía o fuera del límite interno → INITIATIVE_INVARIANT_VIOLATION sin tocar la fila", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s" });
+    const ctl = control(db);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-wh", answer: "", idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("INITIATIVE_INVARIANT_VIOLATION"),
+    );
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-wh", answer: "x".repeat(4001), idempotencyKey: "k-1", now: 500,
+      }),
+      isDomainError("INITIATIVE_INVARIANT_VIOLATION"),
+    );
+    assert.strictEqual(rowOf(db, "i-wh").state, "waiting_human");
+  });
+
+  it("CAS perdido: la respuesta que pierde la carrera no deposita su pending ni su key", () => {
+    const raw = openMemoryDb();
+    insertInitiative(raw, { id: "i-race", state: "waiting_human", summary: "s", state_changed_at: 100 });
+    let mutated = false;
+    const raced = raceDb(raw, () => {
+      if (mutated) return;
+      mutated = true;
+      // Otro respondedor gana la carrera entre la lectura y el CAS de este:
+      // el estado durable deja de ser waiting_human.
+      raw.prepare(
+        `UPDATE initiatives
+            SET state='queued', available_at=400, state_changed_at=400,
+                pending_human_input='ganadora',
+                human_response_idempotency_key='k-ganador',
+                human_response_command_hash=?
+          WHERE id='i-race'`,
+      ).run(respondHash("i-race", "ganadora"));
+    });
+    const ctl = control(raced);
+
+    assert.throws(
+      () => ctl.respondToInitiative({
+        agentName: "alice", initiativeId: "i-race", answer: "perdedora", idempotencyKey: "k-perdedor", now: 500,
+      }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+    // La respuesta del perdedor NO se depositó: el ROLLBACK no deja ni su
+    // pending ni su key — la fila no lleva ningún vestigio del write perdido.
+    const row = rowOf(raw, "i-race");
+    assert.notStrictEqual(row.pending_human_input, "perdedora");
+    assert.notStrictEqual(row.human_response_idempotency_key, "k-perdedor");
+  });
+
+  it("la Initiative respondida vuelve a la agenda de la proyección, no al inbox", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s", available_at: 100 });
+    const ctl = control(db);
+
+    ctl.respondToInitiative({
+      agentName: "alice", initiativeId: "i-wh", answer: "sí", idempotencyKey: "k-1", now: 500,
+    });
+
+    const snapshot = new AgendaRepository(db).projection.snapshotForAgent("alice", 600);
+    assert.deepEqual(snapshot.inbox.map(({ id }) => id), [], "respondida ya no está en el inbox");
+    assert.deepEqual(snapshot.agenda.map(({ initiative }) => initiative.id), ["i-wh"]);
+    assert.strictEqual(snapshot.agenda[0].initiative.pendingHumanInput, "sí", "la proyección interna conserva el pending (sin redactar)");
   });
 });

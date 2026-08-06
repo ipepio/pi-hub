@@ -41,6 +41,8 @@ interface InsertInit {
   bound_model?: string | null;
   turn_id?: string | null;
   started_at?: number | null;
+  session_key?: string;
+  pending_human_input?: string | null;
 }
 
 /** Siembra una fila `initiatives` en `queued` (setup de fixture, no comportamiento bajo prueba). */
@@ -50,12 +52,14 @@ function insertQueuedInitiative(db: SqliteDb, init: InsertInit): void {
        (id, agent_name, state, origin, trigger_id, intent, mode, session_key,
         available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
         visible_effects_declared, summary, ask_correlation, failure_reason,
-        result, created_at, state_changed_at, started_at, finished_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        result, created_at, state_changed_at, started_at, finished_at,
+        pending_human_input)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     init.id, init.agent_name ?? "alice", init.state ?? "queued", "human", null,
-    "di hola", "solo", "sk-1", 1, init.bound_model ?? null, init.turn_id ?? null,
+    "di hola", "solo", init.session_key ?? "sk-1", 1, init.bound_model ?? null, init.turn_id ?? null,
     0, null, 0, null, null, null, null, 1000, 1000, init.started_at ?? null, null,
+    init.pending_human_input ?? null,
   );
 }
 
@@ -94,7 +98,7 @@ describe("index.ts — claimInitiative (T7+T2 en una sola tx, Fase 3.4)", () => 
     const repo = new AgendaRepository(db);
     insertQueuedInitiative(db, { id: "ini-1" });
 
-    const ini = repo.claimInitiative({
+    const { initiative: ini } = repo.claimInitiative({
       initiativeId: "ini-1", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
     });
 
@@ -113,7 +117,7 @@ describe("index.ts — claimInitiative (T7+T2 en una sola tx, Fase 3.4)", () => 
     const repo = new AgendaRepository(db);
     insertQueuedInitiative(db, { id: "ini-bob", agent_name: "bob" });
 
-    const ini = repo.claimInitiative({
+    const { initiative: ini } = repo.claimInitiative({
       initiativeId: "ini-bob", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
     });
     assert.equal(ini.state, "running");
@@ -126,7 +130,7 @@ describe("index.ts — claimInitiative (T7+T2 en una sola tx, Fase 3.4)", () => 
     const repo = new AgendaRepository(db);
     insertQueuedInitiative(db, { id: "ini-race" });
 
-    const first = repo.claimInitiative({
+    const { initiative: first } = repo.claimInitiative({
       initiativeId: "ini-race", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
     });
     assert.equal(first.state, "running");
@@ -217,12 +221,12 @@ describe("index.ts — claimInitiative (T7+T2 en una sola tx, Fase 3.4)", () => 
     insertQueuedInitiative(db, { id: "ini-libre", bound_model: null });
     insertQueuedInitiative(db, { id: "ini-fijado", bound_model: "modelo-existente" });
 
-    const libre = repo.claimInitiative({
+    const { initiative: libre } = repo.claimInitiative({
       initiativeId: "ini-libre", turnId: "t-a", idempotencyKey: "idem-a", now: 2000, boundModel: "gpt-5",
     });
     assert.equal(libre.boundModel, "gpt-5");
 
-    const fijado = repo.claimInitiative({
+    const { initiative: fijado } = repo.claimInitiative({
       initiativeId: "ini-fijado", turnId: "t-b", idempotencyKey: "idem-b", now: 2000, boundModel: "gpt-otro",
     });
     assert.equal(fijado.boundModel, "modelo-existente"); // no se sobrescribe
@@ -273,10 +277,108 @@ describe("index.ts — claimInitiative (T7+T2 en una sola tx, Fase 3.4)", () => 
       isDomainError("INITIATIVE_STATE_CONFLICT"),
     );
 
-    const ini = repo.claimInitiative({
+    const { initiative: ini } = repo.claimInitiative({
       initiativeId: "ini-libre", turnId: "t-ok", idempotencyKey: "idem-ok", now: 2500,
     });
     assert.equal(ini.state, "running");
     assert.equal(countTurns(db), 2);
+  });
+});
+
+describe("index.ts — claimInitiative dispatchInput (P1.6, plan P1 §6.4)", () => {
+  it("una Initiative normal sigue despachando su Intent", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    insertQueuedInitiative(db, { id: "ini-normal" });
+
+    const claim = repo.claimInitiative({
+      initiativeId: "ini-normal", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
+    });
+
+    assert.equal(claim.dispatchInput, "di hola", "sin respuesta pendiente, el mensaje es el Intent");
+    assert.equal(claim.initiative.state, "running");
+  });
+
+  it("una Initiative respondida despacha la respuesta exacta, no el Intent", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    insertQueuedInitiative(db, {
+      id: "ini-respondida",
+      pending_human_input: "sí, aprueba el gasto",
+    });
+
+    const claim = repo.claimInitiative({
+      initiativeId: "ini-respondida", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
+    });
+
+    assert.equal(claim.dispatchInput, "sí, aprueba el gasto", "la respuesta gana al Intent");
+    assert.notEqual(claim.dispatchInput, "di hola");
+  });
+
+  it("el claim consume el pending (NULL en la fila) pero conserva la misma session_key", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    insertQueuedInitiative(db, {
+      id: "ini-pending", session_key: "sk-respuesta", pending_human_input: "respuesta",
+    });
+
+    const claim = repo.claimInitiative({
+      initiativeId: "ini-pending", turnId: "turn-1", idempotencyKey: "idem-1", now: 2000,
+    });
+
+    assert.equal(claim.dispatchInput, "respuesta");
+    assert.equal(claim.initiative.sessionKey, "sk-respuesta", "la reanudación continúa la MISMA sesión");
+    const row = db.prepare("SELECT pending_human_input FROM initiatives WHERE id = ?").get("ini-pending") as {
+      pending_human_input: string | null;
+    };
+    assert.equal(row.pending_human_input, null, "el pending se consume en la misma tx del claim");
+  });
+
+  it("una carrera perdida no consume el pending ni deja reserva de turno", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    insertQueuedInitiative(db, {
+      id: "ini-race", pending_human_input: "respuesta valiosa",
+    });
+    // Adapter que cambia el estado durable justo después de la lectura del
+    // claim (equivalente a que el ganador de la carrera reclame primero): el
+    // CAS `WHERE state='queued'` perderá dentro de la tx.
+    let armed = true;
+    const racer: SqliteDb = {
+      exec: (sql) => db.exec(sql),
+      close: () => db.close(),
+      prepare: (sql) => {
+        const stmt = db.prepare(sql);
+        const isInitiativeRead = /FROM\s+initiatives/i.test(sql);
+        return {
+          get: (...args: unknown[]) => {
+            const result = stmt.get(...args);
+            if (armed && isInitiativeRead) {
+              armed = false;
+              db.prepare(
+                "UPDATE initiatives SET state='running', turn_id='turn-ganador', state_changed_at=1500 WHERE id='ini-race'",
+              ).run();
+            }
+            return result;
+          },
+          all: (...args: unknown[]) => stmt.all(...args),
+          run: (...args: unknown[]) => stmt.run(...args),
+        };
+      },
+    };
+    const racedRepo = new AgendaRepository(racer);
+
+    assert.throws(
+      () => racedRepo.claimInitiative({
+        initiativeId: "ini-race", turnId: "turn-perdedor", idempotencyKey: "idem-perdedor", now: 2000,
+      }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+
+    const row = db.prepare(
+      "SELECT pending_human_input FROM initiatives WHERE id = ?",
+    ).get("ini-race") as { pending_human_input: string | null };
+    assert.equal(row.pending_human_input, "respuesta valiosa", "el pending no se consumió");
+    assert.equal(countTurns(db), 0, "no quedó reserva de turno del claim perdedor");
   });
 });

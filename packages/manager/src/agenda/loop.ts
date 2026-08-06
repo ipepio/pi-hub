@@ -42,6 +42,13 @@
  * `tick` reevalúa la fotografía durable. `bound_model` queda sin fijar (D17):
  * el Agent usa su `AgentConfig.model` (pendiente 5).
  *
+ * El **único** cambio de P1 en este Loop (plan P1 §6.4): el `message` que se
+ * entrega a `TurnExecution` es `claimed.dispatchInput`, no `intent`. Así una
+ * Initiative respondida (pendiente en `queued`) reanuda con la respuesta exacta
+ * en lugar de reejecutar el Intent; `dispatchInput` se calcula dentro de la
+ * transacción del claim (§6.4). No cambia tick, dial, round-robin, Triggers,
+ * barridos ni shutdown.
+ *
  * Shutdown (§1.3, D3): `stop({ graceMs })` pone el flag `stopping` (ningún
  * `tick` nuevo reclama ni dispara Triggers), deja terminar los terminales
  * **naturales** hasta `graceMs` (los Runners siguen vivos durante la gracia),
@@ -59,7 +66,7 @@ import type { Initiative, TransitionCommand } from "./initiatives.ts";
 import type { DueScheduleTrigger } from "./triggers.ts";
 import type { FailureCause, TurnFinalState } from "./turns.ts";
 import type { StartTurnCommand, TimerHandle, TurnHandle } from "./turn-execution.ts";
-import type { ClaimInitiativeCommand } from "./index.ts";
+import type { ClaimInitiativeCommand, ClaimInitiativeResult } from "./index.ts";
 
 /** Superficie de `Supervisor` que el Loop observa (§6: observa, no controla). */
 export interface LoopSupervisor {
@@ -97,7 +104,7 @@ export interface LoopAgenda {
       failureCause?: FailureCause,
     ): void;
   };
-  claimInitiative(command: ClaimInitiativeCommand): Initiative;
+  claimInitiative(command: ClaimInitiativeCommand): ClaimInitiativeResult;
 }
 
 /** Opciones del Loop (todo lo temporal es inyectable, §7.1: el test no duerme). */
@@ -358,9 +365,9 @@ export class AgendaLoop {
     const correlationId = randomUUID();
     const now = this.now();
 
-    let running: Initiative;
+    let claimed: ClaimInitiativeResult;
     try {
-      running = this.agenda.claimInitiative({
+      claimed = this.agenda.claimInitiative({
         initiativeId: ini.id,
         turnId,
         idempotencyKey,
@@ -376,6 +383,7 @@ export class AgendaLoop {
       }
       return;
     }
+    const { initiative: running, dispatchInput } = claimed;
 
     const runnerPort = this.supervisor.runnerPortOf(running.agentName);
     if (runnerPort === undefined) {
@@ -393,7 +401,7 @@ export class AgendaLoop {
         idempotencyKey,
         correlationId,
         sessionKey: running.sessionKey,
-        message: running.intent,
+        message: dispatchInput,
         runnerPort,
         eventProfile: "basic",
         origin: { kind: "initiative", initiativeId: running.id, cause: running.origin },

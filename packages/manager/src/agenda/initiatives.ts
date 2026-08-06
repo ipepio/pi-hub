@@ -27,6 +27,7 @@
  * está en `legalSourcesFor(...)` — la propia `canTransition` aplicada en lote.
  */
 
+import { createHash } from "node:crypto";
 import type { SqliteDb } from "../storage/sqlite.ts";
 import {
   canTransition,
@@ -37,6 +38,13 @@ import {
   type InitiativeState,
 } from "./state.ts";
 import { DomainError } from "./errors.ts";
+
+/**
+ * Límite interno tipado de `answer` (plan P1 §6.3): una respuesta humana se
+ * acepta no vacía y con esta cota; P2 la reutilizará en el borde HTTP sin
+ * reabrir el dominio.
+ */
+export const MAX_HUMAN_ANSWER_LENGTH = 4000;
 
 /** Initiative tal y como la expone el repositorio (columnas en camelCase). */
 export interface Initiative {
@@ -62,6 +70,38 @@ export interface Initiative {
   readonly stateChangedAt: number;
   readonly startedAt: number | null;
   readonly finishedAt: number | null;
+}
+
+/**
+ * Comando de `respondForAgent` (plan P1 §6.3): la persona responde a una
+ * Initiative en `waiting_human` con `answer` y una `idempotencyKey` de
+ * respuesta. No crea Conversation ni despacha al Runner; el Loop sigue siendo
+ * el dispatcher único.
+ */
+export interface RespondForAgentCommand {
+  readonly id: string;
+  readonly agentName: string;
+  readonly answer: string;
+  readonly idempotencyKey: string;
+  readonly now: number;
+}
+
+/**
+ * Resultado de `respondForAgent`: la Initiative tras el comando y si fue un
+ * replay idempotente (`replayed:true` no reencola ni vuelve a tocar disco).
+ */
+export interface RespondForAgentResult {
+  readonly initiative: Initiative;
+  readonly replayed: boolean;
+}
+
+/**
+ * SHA-256 de la forma canónica de la respuesta (plan P1 §2.3): hash sobre
+ * `{initiativeId, answer}` — nunca sobre JSON bruto ni payload que se loguee.
+ */
+function respondCommandHash(initiativeId: string, answer: string): string {
+  const canonical = JSON.stringify({ initiativeId, answer });
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 /**
@@ -117,13 +157,19 @@ interface InitiativeRow {
   state_changed_at: number;
   started_at: number | null;
   finished_at: number | null;
+  /** Columnas v2 de reserva de P3 (plan P1 §2.3); leídas por respond/claim. */
+  pending_human_input: string | null;
+  human_response_idempotency_key: string | null;
+  human_response_command_hash: string | null;
 }
 
 const SELECT_INITIATIVE = `
   SELECT id, agent_name, state, origin, trigger_id, intent, mode, session_key,
          available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
          visible_effects_declared, summary, ask_correlation, failure_reason,
-         result, created_at, state_changed_at, started_at, finished_at
+         result, created_at, state_changed_at, started_at, finished_at,
+         pending_human_input, human_response_idempotency_key,
+         human_response_command_hash
     FROM initiatives
 `;
 
@@ -268,6 +314,121 @@ export class InitiativeRepository {
       throw error;
     }
     return this.getForAgent(id, agentName);
+  }
+
+  /**
+   * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
+   * `queued` con `available_at=state_changed_at=now`, deposita la `answer` en
+   * `pending_human_input` y fija la key/hash de respuesta, todo en **una sola**
+   * `BEGIN IMMEDIATE`. El Loop sigue siendo el dispatcher único: Control no
+   * despacha nada y no se crea Conversation — la Initiative conserva su
+   * `session_key`, `bound_model`, `intent`, pregunta/resumen/correlación y
+   * deadline para historia.
+   *
+   * Idempotencia de respuesta (primera key gana):
+   *
+   * - misma `idempotencyKey` y mismo hash → replay exitoso **sea cual sea el
+   *   estado actual** (`replayed:true`, sin reencolar ni tocar disco otra vez);
+   *   así un replay que llegue *después* del claim sigue siendo idempotente
+   *   porque el claim conserva key/hash al consumir el pending;
+   * - misma key y hash distinto → `IDEMPOTENCY_CONFLICT`;
+   * - key nueva cuando el estado durable ya no es `waiting_human` →
+   *   `INITIATIVE_STATE_CONFLICT` (otro respondedor o el Loop ya ganaron);
+   * - `canTransition("waiting_human","queued")` se comprueba antes del CAS y el
+   *   `WHERE state='waiting_human'` es la autoridad operativa: cero filas es
+   *   `INITIATIVE_STATE_CONFLICT` y el ROLLBACK conserva el pending ganador.
+   *
+   * La `answer` no se loguea; el hash es sobre la forma canónica
+   * `{initiativeId, answer}`.
+   */
+  respondForAgent(command: RespondForAgentCommand): RespondForAgentResult {
+    // Validación tipada antes de abrir tx (plan P1 §6.3): `answer` no vacía y
+    // con límite interno; P2 reutilizará la misma cota en el borde.
+    if (
+      typeof command.answer !== "string" ||
+      command.answer.length === 0 ||
+      command.answer.length > MAX_HUMAN_ANSWER_LENGTH
+    ) {
+      throw new DomainError(
+        "INITIATIVE_INVARIANT_VIOLATION",
+        `initiative ${command.id}: answer vacía o fuera del límite interno (§6.3)`,
+      );
+    }
+    const commandHash = respondCommandHash(command.id, command.answer);
+    const db = this.sqlite;
+    db.exec("BEGIN IMMEDIATE"); // paso 1
+    try {
+      // Paso 2: leer dentro de la transacción, scoped por `(id, agent_name)`.
+      const row = db
+        .prepare(`${SELECT_INITIATIVE} WHERE id = ? AND agent_name = ?`)
+        .get(command.id, command.agentName) as InitiativeRow | undefined;
+      if (!row) {
+        throw new DomainError(
+          "INITIATIVE_NOT_FOUND",
+          `initiative ${command.id} del agent ${command.agentName} no existe`,
+        );
+      }
+      // Replay: la misma key de respuesta se absorbe sea cual sea el estado
+      // actual — el claim ya pudo consumir el pending y dejar `running`.
+      if (row.human_response_idempotency_key === command.idempotencyKey) {
+        if (row.human_response_command_hash === commandHash) {
+          db.exec("COMMIT");
+          return { initiative: mapRow(row), replayed: true };
+        }
+        throw new DomainError(
+          "IDEMPOTENCY_CONFLICT",
+          `initiative ${command.id}: misma key de respuesta, answer distinta`,
+        );
+      }
+      // Paso 3: primera key gana — solo se responde una Initiative que SIGUE
+      // en `waiting_human`; una key nueva tras salir de ahí es conflicto de
+      // estado, no un segundo intento.
+      if (row.state !== "waiting_human") {
+        throw new DomainError(
+          "INITIATIVE_STATE_CONFLICT",
+          `initiative ${command.id}: esperaba waiting_human, durable es ${row.state}`,
+        );
+      }
+      // Autoridad declarativa (paso 3 del contrato), antes de tocar disco.
+      if (!canTransition("waiting_human", "queued")) {
+        throw new DomainError(
+          "INITIATIVE_TRANSITION_ILLEGAL",
+          `initiative ${command.id}: reanudar waiting_human -> queued no es legal (§4.2)`,
+        );
+      }
+      // Paso 5: CAS agent-scoped; `session_key`, `bound_model`, `intent` y el
+      // resto de historia NO se tocan. El pending se deposita para que el
+      // siguiente claim lo despache, y key/hash persisten tras el claim para
+      // absorber el replay posterior.
+      const result = db
+        .prepare(
+          `UPDATE initiatives
+              SET state = 'queued', available_at = ?, state_changed_at = ?,
+                  pending_human_input = ?, human_response_idempotency_key = ?,
+                  human_response_command_hash = ?
+            WHERE id = ? AND agent_name = ? AND state = 'waiting_human'`,
+        )
+        .run(
+          command.now,
+          command.now,
+          command.answer,
+          command.idempotencyKey,
+          commandHash,
+          command.id,
+          command.agentName,
+        );
+      if (Number(result.changes) !== 1) {
+        throw new DomainError(
+          "INITIATIVE_STATE_CONFLICT",
+          `initiative ${command.id}: el CAS de respuesta no cambió exactamente una fila (${String(result.changes)})`,
+        );
+      }
+      db.exec("COMMIT"); // paso 6
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return { initiative: this.getForAgent(command.id, command.agentName), replayed: false };
   }
 
   /** `queued` con `available_at` vencido, por orden de disponibilidad (índice `initiatives_due`). */

@@ -3,6 +3,8 @@ import {
   InitiativeRepository,
   type Initiative,
   type TransitionCommand,
+  type RespondForAgentCommand,
+  type RespondForAgentResult,
 } from "./initiatives.ts";
 import { TriggerRepository, type DueScheduleTrigger, type Trigger } from "./triggers.ts";
 import { CallbackRepository } from "./callbacks.ts";
@@ -11,7 +13,7 @@ import { sqliteErrcode } from "./turns.ts";
 import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
 import { DomainError } from "./errors.ts";
-import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult, type RevokeTriggerCommand, type CancelInitiativeCommand, type CancelInitiativeResult } from "./autonomy-control.ts";
+import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult, type RevokeTriggerCommand, type CancelInitiativeCommand, type CancelInitiativeResult, type RespondInitiativeCommand, type RespondInitiativeResult } from "./autonomy-control.ts";
 import type { EffectiveTriggerAuthority } from "./triggers.ts";
 import {
   AutonomyProjection,
@@ -39,6 +41,24 @@ export interface ClaimInitiativeCommand {
   readonly idempotencyKey: string;
   readonly now: number;
   readonly boundModel?: string;
+}
+
+/**
+ * Resultado del claim (plan P1 §6.4): la Initiative ya `running` y el
+ * `dispatchInput` que el Loop debe entregar como `message` de `startTurn`.
+ *
+ * `dispatchInput = pending_human_input ?? intent`: una Initiative respondida
+ * (que volvió a `queued` con su respuesta depositada) reanuda con la respuesta
+ * exacta, no con el Intent; una Initiative normal sigue despachando su Intent.
+ * El pending se consume en la MISMA transacción T7+T2 (`pending_human_input` se
+ * pone a `NULL` en el UPDATE del claim) — o no se consume: si el claim pierde
+ * la carrera, el ROLLBACK conserva el pending y no deja reserva de turno. La
+ * key/hash de la respuesta NO se limpian, para que un replay posterior al
+ * claim siga siendo idempotente (§6.3).
+ */
+export interface ClaimInitiativeResult {
+  readonly initiative: Initiative;
+  readonly dispatchInput: string;
 }
 
 /**
@@ -107,13 +127,14 @@ export class AgendaRepository {
    * Aquí, o el claim queda `running` con su turno, o el `ROLLBACK` no deja
    * nada: la Initiative gana o no hay fotografía que descartar.
    *
-   * Devuelve la Initiative ya `running`. Lanza `INITIATIVE_NOT_FOUND` si la
-   * Initiative no existe, `INITIATIVE_STATE_CONFLICT` si ya no está `queued`
-   * (carrera perdida — el estado durable decide el siguiente `tick`) y
-   * `TURN_ID_CONFLICT` si la pareja `(agent_name, turn_id)` o la
-   * `idempotency_key` ya están reservadas por otro turno.
+   * Devuelve `{ initiative, dispatchInput }` (plan P1 §6.4): la Initiative ya
+   * `running` y el mensaje exacto que el Loop debe despachar. Lanza
+   * `INITIATIVE_NOT_FOUND` si la Initiative no existe, `INITIATIVE_STATE_CONFLICT`
+   * si ya no está `queued` (carrera perdida — el estado durable decide el
+   * siguiente `tick`) y `TURN_ID_CONFLICT` si la pareja `(agent_name, turn_id)`
+   * o la `idempotency_key` ya están reservadas por otro turno.
    */
-  claimInitiative(command: ClaimInitiativeCommand): Initiative {
+  claimInitiative(command: ClaimInitiativeCommand): ClaimInitiativeResult {
     const { initiativeId, turnId, idempotencyKey, now } = command;
     const db = this.sqlite;
 
@@ -128,25 +149,43 @@ export class AgendaRepository {
     }
 
     db.exec("BEGIN IMMEDIATE"); // paso 1
+    let dispatchInput: string;
     try {
       // Paso 2: leer la Initiative dentro de la transacción. Su `agent_name`
-      // es el dueño de la Agenda y cualifica la reserva de turno.
+      // es el dueño de la Agenda y cualifica la reserva de turno; `intent` y
+      // `pending_human_input` deciden el `dispatchInput` de la reanudación.
       const row = db
-        .prepare("SELECT agent_name, state, started_at, bound_model FROM initiatives WHERE id = ?")
+        .prepare(
+          `SELECT agent_name, state, started_at, bound_model, intent, pending_human_input
+             FROM initiatives WHERE id = ?`,
+        )
         .get(initiativeId) as
-        | { agent_name: string; state: InitiativeState; started_at: number | null; bound_model: string | null }
+        | {
+            agent_name: string;
+            state: InitiativeState;
+            started_at: number | null;
+            bound_model: string | null;
+            intent: string;
+            pending_human_input: string | null;
+          }
         | undefined;
       if (!row) {
         throw new DomainError("INITIATIVE_NOT_FOUND", `initiative ${initiativeId} no existe`);
       }
       if (row.state !== "queued") {
         // El estado durable ya no es el que el claim exige: otro escritor ganó
-        // la carrera (§12.4). El ROLLBACK descarta también la reserva T7.
+        // la carrera (§12.4). El ROLLBACK descarta también la reserva T7 y
+        // conserva el pending (no se consumió).
         throw new DomainError(
           "INITIATIVE_STATE_CONFLICT",
           `initiative ${initiativeId}: esperaba queued, durable es ${row.state}`,
         );
       }
+
+      // §6.4: la respuesta humana pendiente es el mensaje del despacho; una
+      // Initiative normal sigue usando su Intent. Se decide dentro de la tx,
+      // donde no hay carrera con el consumo del pending.
+      dispatchInput = row.pending_human_input ?? row.intent;
 
       // T7 (§6) dentro de la misma tx: reserva durable de idempotencia. El
       // `agent_name` es el de la Initiative, no uno que el caller declare.
@@ -160,11 +199,14 @@ export class AgendaRepository {
 
       // T2 (§6): `queued→running` con `turnId`, por CAS `WHERE state='queued'`
       // (autoridad operativa, Fase 2.2). `started_at`/`bound_model` solo si
-      // eran NULL (invariante 4), como `buildPatch` de `initiatives.ts`.
+      // eran NULL (invariante 4), como `buildPatch` de `initiatives.ts`. El
+      // `pending_human_input` se consume en esta misma UPDATE: el claim y la
+      // reanudación se confirman juntos, o ninguno.
       const patch: Record<string, string | number | null> = {
         state: "running",
         state_changed_at: now,
         turn_id: turnId,
+        pending_human_input: null,
       };
       if (row.started_at === null) patch.started_at = now;
       if (row.bound_model === null && command.boundModel !== undefined) {
@@ -179,7 +221,8 @@ export class AgendaRepository {
       if (Number(result.changes) !== 1) {
         // Guard defensivo: dentro de `BEGIN IMMEDIATE` nadie más pudo cambiar
         // la fila entre la lectura y el UPDATE; si aun así no fue exactamente
-        // una, la carrera se perdió y el ROLLBACK no deja reserva huérfana.
+        // una, la carrera se perdió y el ROLLBACK no deja reserva huérfana ni
+        // consume el pending.
         throw new DomainError(
           "INITIATIVE_STATE_CONFLICT",
           `initiative ${initiativeId}: el CAS del claim no cambió exactamente una fila (${String(result.changes)})`,
@@ -191,7 +234,9 @@ export class AgendaRepository {
       db.exec("ROLLBACK");
       throw error;
     }
-    return this.initiatives.get(initiativeId);
+    // La key/hash de la respuesta se conservan en la fila: un replay posterior
+    // al claim sigue siendo idempotente (§6.3).
+    return { initiative: this.initiatives.get(initiativeId), dispatchInput };
   }
 
   /**
@@ -249,6 +294,8 @@ export type {
   RevokeTriggerCommand,
   CancelInitiativeCommand,
   CancelInitiativeResult,
+  RespondInitiativeCommand,
+  RespondInitiativeResult,
   EffectiveTriggerAuthority,
   InternalAutonomySnapshot,
   InternalInitiative,

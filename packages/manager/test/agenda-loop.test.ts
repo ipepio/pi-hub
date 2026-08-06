@@ -257,6 +257,7 @@ interface InsertInit {
   turn_id?: string | null;
   summary?: string | null;
   state_changed_at?: number;
+  pending_human_input?: string | null;
 }
 
 /** Siembra una fila `initiatives` (setup de fixture, no comportamiento bajo prueba). */
@@ -266,12 +267,14 @@ function insertInitiative(db: SqliteDb, init: InsertInit): void {
        (id, agent_name, state, origin, trigger_id, intent, mode, session_key,
         available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
         visible_effects_declared, summary, ask_correlation, failure_reason,
-        result, created_at, state_changed_at, started_at, finished_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        result, created_at, state_changed_at, started_at, finished_at,
+        pending_human_input)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     init.id, init.agent_name ?? "alice", init.state ?? "queued", "human", null,
     "di hola", "solo", "sk-1", init.available_at ?? 0, null, init.turn_id ?? null,
     0, null, 0, init.summary ?? null, null, null, null, 1000, init.state_changed_at ?? 1000, 1000, null,
+    init.pending_human_input ?? null,
   );
 }
 
@@ -358,6 +361,33 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     clock.advance(1000);
     clock.advance(1000);
     assert.equal(fake.started.length, 1);
+  });
+
+  it("respuesta pendiente: el Loop despacha la answer exacta, no el Intent, en la MISMA sesión (P1.6 §6.4)", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const clock = new ManualClock();
+    const { loop, fake, supervisor } = makeLoop(repo, clock);
+    // Initiative respondida: volvió a `queued` con su respuesta como pending.
+    insertInitiative(db, {
+      id: "ini-resp", agent_name: "alice", available_at: 0,
+      pending_human_input: "sí, aprueba el gasto de 200€",
+    });
+    supervisor.set("alice", "running", 4100);
+
+    loop.start();
+    clock.advance(1000); // primer tick: claim + startTurn
+
+    assert.equal(fake.started.length, 1);
+    assert.equal(fake.started[0].message, "sí, aprueba el gasto de 200€", "la respuesta exacta, no el Intent");
+    assert.notEqual(fake.started[0].message, "di hola");
+    assert.equal(fake.started[0].sessionKey, "sk-1", "la misma sesión que preguntó");
+    const ini = repo.initiatives.get("ini-resp");
+    assert.equal(ini.state, "running");
+    const row = db.prepare("SELECT pending_human_input FROM initiatives WHERE id = ?").get("ini-resp") as {
+      pending_human_input: string | null;
+    };
+    assert.equal(row.pending_human_input, null, "el pending se consume en el claim");
   });
 
   it("no due: available_at > now → cero claims hasta cruzar la fecha", () => {
