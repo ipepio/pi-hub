@@ -11,7 +11,7 @@ import { sqliteErrcode } from "./turns.ts";
 import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
 import { DomainError } from "./errors.ts";
-import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult } from "./autonomy-control.ts";
+import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult, type RevokeTriggerCommand } from "./autonomy-control.ts";
 import type { EffectiveTriggerAuthority } from "./triggers.ts";
 import {
   AutonomyProjection,
@@ -246,6 +246,7 @@ export type {
   Trigger,
   CreateTriggerCommand,
   CreateTriggerResult,
+  RevokeTriggerCommand,
   EffectiveTriggerAuthority,
   InternalAutonomySnapshot,
   InternalInitiative,

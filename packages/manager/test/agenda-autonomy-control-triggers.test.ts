@@ -353,3 +353,338 @@ describe("AutonomyControl.createTrigger (P1.3, plan P1 §4.1)", () => {
     );
   });
 });
+
+/** Siembra un Trigger con metadata arbitraria (setup, no comportamiento bajo prueba). */
+function seedTrigger(
+  db: SqliteDb,
+  overrides: {
+    id: string;
+    agent_name?: string;
+    created_by?: "owner" | "control_plane" | "agent";
+    authority?: "owner" | "control_plane";
+    proposal_state?: "proposed" | "approved" | null;
+    enabled?: number;
+    next_fire_at?: number | null;
+    updated_at?: number;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO triggers
+       (id, agent_name, kind, definition_json, intent, mode, suggested_skill,
+        created_by, authority, proposal_state, enabled, next_fire_at,
+        last_fired_at, created_at, updated_at, create_idempotency_key,
+        create_command_hash)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    overrides.id,
+    overrides.agent_name ?? "alice",
+    "schedule",
+    JSON.stringify({ version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" }),
+    "intent semilla",
+    "solo",
+    null,
+    overrides.created_by ?? "owner",
+    overrides.authority ?? "owner",
+    overrides.proposal_state ?? null,
+    overrides.enabled ?? 1,
+    overrides.next_fire_at ?? ms("2024-03-30T08:00:00Z"),
+    null,
+    0,
+    overrides.updated_at ?? 0,
+    null,
+    null,
+  );
+}
+
+/** Metadata de autoridad de una fila, para afirmar lo que la reconciliación conserva/cambia. */
+interface AuthorityRow {
+  id: string;
+  agent_name: string;
+  created_by: string;
+  authority: string;
+  proposal_state: string | null;
+  enabled: number;
+  next_fire_at: number | null;
+  updated_at: number;
+}
+
+function authorityRow(db: SqliteDb, id: string): AuthorityRow {
+  return db
+    .prepare(
+      `SELECT id, agent_name, created_by, authority, proposal_state, enabled, next_fire_at, updated_at
+         FROM triggers WHERE id = ?`,
+    )
+    .get(id) as AuthorityRow;
+}
+
+describe("AutonomyControl.revokeTrigger (P1.4, plan P1 §4.2)", () => {
+  it("revoke con autoridad correcta: deshabilita, anula next_fire_at y conserva created_by/last_fired_at", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "owner");
+    const created = ctl.createTrigger(command({ now: ms("2024-03-29T08:00:00Z") }));
+    // Conserva `last_fired_at`: si el Trigger ya disparó, revocar no borra historia.
+    db.prepare("UPDATE triggers SET last_fired_at = 5 WHERE id = ?").run(created.trigger.id);
+    const revokeNow = ms("2024-03-29T09:00:00Z");
+
+    const revoked = ctl.revokeTrigger({
+      agentName: "alice",
+      triggerId: created.trigger.id,
+      now: revokeNow,
+    });
+
+    assert.strictEqual(revoked.enabled, false);
+    assert.strictEqual(revoked.nextFireAt, null);
+    assert.strictEqual(revoked.updatedAt, revokeNow);
+    assert.strictEqual(revoked.createdBy, "owner", "created_by es procedencia histórica y nunca cambia");
+    assert.strictEqual(revoked.lastFiredAt, 5, "revocar no borra last_fired_at");
+
+    const row = authorityRow(db, created.trigger.id);
+    assert.strictEqual(row.enabled, 0);
+    assert.strictEqual(row.next_fire_at, null);
+    assert.strictEqual(row.updated_at, revokeNow);
+    assert.strictEqual(row.created_by, "owner");
+    const count = db.prepare("SELECT COUNT(*) AS n FROM triggers").get() as { n: number };
+    assert.strictEqual(count.n, 1, "revocar no borra el Trigger");
+
+    // Revocar conserva historia: la proyección sigue viendo el Trigger, deshabilitado.
+    const snapshot = new AgendaRepository(db).projection.snapshotForAgent("alice", revokeNow);
+    assert.deepEqual(snapshot.triggers.map((t) => t.id), [created.trigger.id]);
+    assert.strictEqual(snapshot.triggers[0].enabled, false);
+  });
+
+  it("revoke repetido es éxito idempotente y no vuelve a tocar updated_at", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "owner");
+    const { trigger } = ctl.createTrigger(command());
+    const firstNow = ms("2024-03-29T09:00:00Z");
+    const secondNow = ms("2024-03-29T10:00:00Z");
+
+    ctl.revokeTrigger({ agentName: "alice", triggerId: trigger.id, now: firstNow });
+    const again = ctl.revokeTrigger({ agentName: "alice", triggerId: trigger.id, now: secondNow });
+
+    assert.strictEqual(again.enabled, false);
+    assert.strictEqual(again.nextFireAt, null);
+    assert.strictEqual(again.updatedAt, firstNow, "la segunda revocación no reescribe updated_at");
+    assert.strictEqual(authorityRow(db, trigger.id).updated_at, firstNow);
+  });
+
+  it("revoke tras un disable externo (carrera perdida) es éxito idempotente y conserva updated_at", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "owner");
+    const { trigger } = ctl.createTrigger(command());
+    // Otro escritor ya deshabilitó el Trigger (el CAS del revoke pierde la carrera).
+    db.prepare("UPDATE triggers SET enabled = 0, next_fire_at = NULL, updated_at = 500 WHERE id = ?")
+      .run(trigger.id);
+
+    const result = ctl.revokeTrigger({
+      agentName: "alice",
+      triggerId: trigger.id,
+      now: ms("2024-03-29T09:00:00Z"),
+    });
+
+    assert.strictEqual(result.enabled, false);
+    assert.strictEqual(result.nextFireAt, null);
+    assert.strictEqual(result.updatedAt, 500, "el perdedor de la carrera no reescribe updated_at");
+  });
+
+  it("revoke con autoridad distinta a la efectiva → TRIGGER_AUTHORITY_CONFLICT y el Trigger queda intacto", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "owner");
+    const { trigger } = ctl.createTrigger(command());
+
+    assert.throws(
+      () =>
+        control(db, "control_plane").revokeTrigger({
+          agentName: "alice",
+          triggerId: trigger.id,
+          now: ms("2024-03-29T09:00:00Z"),
+        }),
+      isDomainError("TRIGGER_AUTHORITY_CONFLICT"),
+    );
+
+    const row = authorityRow(db, trigger.id);
+    assert.strictEqual(row.enabled, 1, "el conflicto no deshabilita el Trigger");
+    assert.strictEqual(row.next_fire_at, trigger.nextFireAt);
+  });
+
+  it("revoke de un ID inexistente → TRIGGER_NOT_FOUND", () => {
+    const db = openMemoryDb();
+    assert.throws(
+      () =>
+        control(db).revokeTrigger({
+          agentName: "alice",
+          triggerId: "no-existe",
+          now: ms("2024-03-29T09:00:00Z"),
+        }),
+      isDomainError("TRIGGER_NOT_FOUND"),
+    );
+  });
+
+  it("revoke de un ID de otro Agent es indistinguible de inexistente → TRIGGER_NOT_FOUND", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "owner");
+    const { trigger } = ctl.createTrigger(command({ agentName: "alice" }));
+
+    assert.throws(
+      () =>
+        control(db, "owner").revokeTrigger({
+          agentName: "bob",
+          triggerId: trigger.id,
+          now: ms("2024-03-29T09:00:00Z"),
+        }),
+      isDomainError("TRIGGER_NOT_FOUND"),
+    );
+
+    const row = authorityRow(db, trigger.id);
+    assert.strictEqual(row.enabled, 1, "el Trigger de Alice sigue habilitado");
+    assert.strictEqual(row.agent_name, "alice");
+  });
+
+  it("Gobernado: revoke bajo control_plane conserva created_by=control_plane", () => {
+    const db = openMemoryDb();
+    const ctl = control(db, "control_plane");
+    const { trigger } = ctl.createTrigger(command());
+
+    const revoked = ctl.revokeTrigger({
+      agentName: "alice",
+      triggerId: trigger.id,
+      now: ms("2024-03-29T09:00:00Z"),
+    });
+
+    assert.strictEqual(revoked.enabled, false);
+    assert.strictEqual(revoked.createdBy, "control_plane", "created_by no se reescribe al revocar");
+    assert.strictEqual(authorityRow(db, trigger.id).created_by, "control_plane");
+  });
+});
+
+describe("TriggerRepository.reconcileAuthority (P1.4, plan P1 §5)", () => {
+  it("matriz §5.1 bajo arranque Gobernador: authority=owner en todo, created_by intacto", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const now = ms("2024-03-29T08:00:00Z");
+    seedTrigger(db, {
+      id: "t-owner",
+      created_by: "owner",
+      authority: "owner",
+      updated_at: 100,
+    });
+    seedTrigger(db, {
+      id: "t-plane",
+      created_by: "control_plane",
+      authority: "control_plane",
+    });
+    seedTrigger(db, {
+      id: "t-agent",
+      created_by: "agent",
+      authority: "control_plane",
+      proposal_state: "proposed",
+    });
+
+    const changed = repo.triggers.reconcileAuthority("owner", now);
+
+    assert.strictEqual(changed, 2, "solo cambian las dos filas cuya authority no era owner");
+
+    const ownerRow = authorityRow(db, "t-owner");
+    assert.strictEqual(ownerRow.authority, "owner");
+    assert.strictEqual(ownerRow.created_by, "owner");
+    assert.strictEqual(ownerRow.updated_at, 100, "restart en el mismo modo no altera timestamps");
+
+    const planeRow = authorityRow(db, "t-plane");
+    assert.strictEqual(planeRow.authority, "owner");
+    assert.strictEqual(planeRow.created_by, "control_plane", "created_by es procedencia y nunca cambia");
+    assert.strictEqual(planeRow.updated_at, now);
+
+    const agentRow = authorityRow(db, "t-agent");
+    assert.strictEqual(agentRow.authority, "owner");
+    assert.strictEqual(agentRow.created_by, "agent");
+    assert.strictEqual(agentRow.proposal_state, "proposed", "la reconciliación no toca proposal_state");
+    assert.strictEqual(agentRow.enabled, 1);
+  });
+
+  it("matriz §5.1 bajo arranque Gobernado: authority=control_plane en todo, created_by intacto", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const now = ms("2024-03-29T08:00:00Z");
+    seedTrigger(db, { id: "t-owner", created_by: "owner", authority: "owner" });
+    seedTrigger(db, {
+      id: "t-plane",
+      created_by: "control_plane",
+      authority: "control_plane",
+      updated_at: 200,
+    });
+    seedTrigger(db, {
+      id: "t-agent",
+      created_by: "agent",
+      authority: "owner",
+      proposal_state: "proposed",
+    });
+
+    const changed = repo.triggers.reconcileAuthority("control_plane", now);
+
+    assert.strictEqual(changed, 2);
+
+    const ownerRow = authorityRow(db, "t-owner");
+    assert.strictEqual(ownerRow.authority, "control_plane");
+    assert.strictEqual(ownerRow.created_by, "owner");
+    assert.strictEqual(ownerRow.updated_at, now);
+
+    const planeRow = authorityRow(db, "t-plane");
+    assert.strictEqual(planeRow.authority, "control_plane");
+    assert.strictEqual(planeRow.updated_at, 200, "restart en el mismo modo no altera timestamps");
+
+    const agentRow = authorityRow(db, "t-agent");
+    assert.strictEqual(agentRow.authority, "control_plane");
+    assert.strictEqual(agentRow.created_by, "agent");
+    assert.strictEqual(agentRow.proposal_state, "proposed");
+  });
+
+  it("restart en el mismo modo: 0 cambios y timestamps estables", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    seedTrigger(db, { id: "t-owner", created_by: "owner", authority: "owner", updated_at: 100 });
+    seedTrigger(db, { id: "t-owner2", created_by: "owner", authority: "owner", updated_at: 200 });
+
+    const first = repo.triggers.reconcileAuthority("owner", ms("2024-03-29T08:00:00Z"));
+    const second = repo.triggers.reconcileAuthority("owner", ms("2024-03-29T09:00:00Z"));
+
+    assert.strictEqual(first, 0);
+    assert.strictEqual(second, 0);
+    assert.strictEqual(authorityRow(db, "t-owner").updated_at, 100);
+    assert.strictEqual(authorityRow(db, "t-owner2").updated_at, 200);
+  });
+
+  it("cambio ida y vuelta Gobernador↔Gobernado: authority sigue al modo, created_by estable", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const n1 = ms("2024-03-29T08:00:00Z");
+    const n2 = ms("2024-03-29T09:00:00Z");
+    const n3 = ms("2024-03-29T10:00:00Z");
+    seedTrigger(db, { id: "t-plane", created_by: "control_plane", authority: "control_plane" });
+
+    const toOwner = repo.triggers.reconcileAuthority("owner", n1);
+    const backToPlane = repo.triggers.reconcileAuthority("control_plane", n2);
+    const ownerAgain = repo.triggers.reconcileAuthority("owner", n3);
+
+    assert.strictEqual(toOwner, 1);
+    assert.strictEqual(backToPlane, 1);
+    assert.strictEqual(ownerAgain, 1);
+
+    const row = authorityRow(db, "t-plane");
+    assert.strictEqual(row.authority, "owner", "la última reconciliación gana");
+    assert.strictEqual(row.created_by, "control_plane", "created_by nunca cambia");
+    assert.strictEqual(row.updated_at, n3);
+  });
+
+  it("la reconciliación no toca la Agenda de otros Agent y solo afecta a triggers", () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    seedTrigger(db, { id: "alice-t", agent_name: "alice", created_by: "owner", authority: "owner" });
+    seedTrigger(db, { id: "bob-t", agent_name: "bob", created_by: "control_plane", authority: "control_plane" });
+
+    const changed = repo.triggers.reconcileAuthority("owner", ms("2024-03-29T08:00:00Z"));
+
+    assert.strictEqual(changed, 1, "solo la fila de Bob cambia; la de Alice ya era owner");
+    assert.strictEqual(authorityRow(db, "bob-t").authority, "owner");
+    assert.strictEqual(authorityRow(db, "alice-t").authority, "owner");
+  });
+});

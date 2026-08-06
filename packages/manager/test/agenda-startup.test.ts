@@ -61,6 +61,15 @@ function spyStore(repo: AgendaRepository, calls: string[]): StartupStore {
         calls.push("recover");
         return repo.recoverRunningOnStartup(now);
       },
+      // P1.4 (§5.3): la reconciliación corre sobre el repositorio real en su
+      // posición exacta — justo después de `openStore` y antes de cualquier
+      // Provider/Runner/HTTP/Loop.
+      triggers: {
+        reconcileAuthority(authority, now): number {
+          calls.push("reconcile");
+          return repo.triggers.reconcileAuthority(authority, now);
+        },
+      },
     },
     close(): void {},
   };
@@ -74,65 +83,70 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
     const calls: string[] = [];
     const store = spyStore(repo, calls);
 
-    const runtime = await runStartup({
-      openStore: async () => {
-        calls.push("openStore");
-        return store;
-      },
-      providers: {
-        async initialize(): Promise<void> {
-          calls.push("initialize");
+    const runtime = await runStartup(
+      {
+        openStore: async () => {
+          calls.push("openStore");
+          return store;
+        },
+        providers: {
+          async initialize(): Promise<void> {
+            calls.push("initialize");
+          },
+        },
+        provision: async () => {
+          calls.push("provision");
+        },
+        createSupervisor: () => {
+          calls.push("createSupervisor");
+          return {
+            async startAll(): Promise<void> {
+              calls.push("startAll");
+            },
+          };
+        },
+        createTurns: () => {
+          calls.push("createTurns");
+          return { marker: "turns" };
+        },
+        createOAuth: () => {
+          calls.push("createOAuth");
+          return {};
+        },
+        createApp: ({ supervisor, oauth, providers, turns }) => {
+          calls.push("createApp");
+          assert.ok(supervisor); // el Supervisor ya arrancado
+          assert.ok(oauth);
+          assert.ok(providers);
+          assert.ok(turns); // el TurnExecution compartido ya existe (Fase 3.5, D8)
+          return {};
+        },
+        createLoop: ({ supervisor, turns }) => {
+          calls.push("createLoop");
+          assert.ok(supervisor);
+          assert.ok(turns); // el mismo TurnExecution compartido
+          return {
+            start(): void {
+              calls.push("loopStart");
+            },
+            async stop(): Promise<void> {},
+          };
+        },
+        serve: () => {
+          calls.push("serve");
+          return { close(): void {} };
         },
       },
-      provision: async () => {
-        calls.push("provision");
-      },
-      createSupervisor: () => {
-        calls.push("createSupervisor");
-        return {
-          async startAll(): Promise<void> {
-            calls.push("startAll");
-          },
-        };
-      },
-      createTurns: () => {
-        calls.push("createTurns");
-        return { marker: "turns" };
-      },
-      createOAuth: () => {
-        calls.push("createOAuth");
-        return {};
-      },
-      createApp: ({ supervisor, oauth, providers, turns }) => {
-        calls.push("createApp");
-        assert.ok(supervisor); // el Supervisor ya arrancado
-        assert.ok(oauth);
-        assert.ok(providers);
-        assert.ok(turns); // el TurnExecution compartido ya existe (Fase 3.5, D8)
-        return {};
-      },
-      createLoop: ({ supervisor, turns }) => {
-        calls.push("createLoop");
-        assert.ok(supervisor);
-        assert.ok(turns); // el mismo TurnExecution compartido
-        return {
-          start(): void {
-            calls.push("loopStart");
-          },
-          async stop(): Promise<void> {},
-        };
-      },
-      serve: () => {
-        calls.push("serve");
-        return { close(): void {} };
-      },
-    });
+      "owner",
+    );
 
-    // La secuencia completa, en el orden que fija el plan (§7.1, §10.3 + §9.5):
-    // `createTurns` antes de `createApp` (D2/D8) y `createLoop`/`loopStart`
-    // después de `serve` (el Loop no despacha antes de que el HTTP esté listo).
+    // La secuencia completa, en el orden que fija el plan (§7.1, §10.3 + §9.5 +
+    // P1.4 §5.3): la reconciliación de autoridad corre justo después de
+    // `openStore` y antes de `initialize`; `createTurns` antes de `createApp`
+    // (D2/D8) y `createLoop`/`loopStart` después de `serve`.
     assert.deepEqual(calls, [
       "openStore",
+      "reconcile",
       "initialize",
       "provision",
       "recover",
@@ -145,7 +159,9 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
       "createLoop",
       "loopStart",
     ]);
-    // El orden crítico, explícito: recuperar → arrancar agentes → servir.
+    // El orden crítico, explícito: reconciliar → recuperar → arrancar agentes → servir.
+    assert.ok(calls.indexOf("reconcile") < calls.indexOf("initialize"));
+    assert.ok(calls.indexOf("reconcile") < calls.indexOf("recover"));
     assert.ok(calls.indexOf("recover") < calls.indexOf("startAll"));
     assert.ok(calls.indexOf("recover") < calls.indexOf("serve"));
 
@@ -180,59 +196,140 @@ describe("startup.ts — composición del arranque (Fase 2.4, §7)", () => {
           calls.push("recover");
           throw new DomainError("STARTUP_RECOVERY_FAILED", "fallo simulado de la recuperación (§7.4)");
         },
+        triggers: {
+          reconcileAuthority(): number {
+            calls.push("reconcile");
+            return 0;
+          },
+        },
       },
       close(): void {},
     };
 
     await assert.rejects(
-      runStartup({
-        openStore: async () => {
-          calls.push("openStore");
-          return store;
-        },
-        providers: {
-          async initialize(): Promise<void> {
-            calls.push("initialize");
+      runStartup(
+        {
+          openStore: async () => {
+            calls.push("openStore");
+            return store;
+          },
+          providers: {
+            async initialize(): Promise<void> {
+              calls.push("initialize");
+            },
+          },
+          provision: async () => {
+            calls.push("provision");
+          },
+          createSupervisor: () => {
+            calls.push("createSupervisor");
+            return {
+              async startAll(): Promise<void> {
+                calls.push("startAll");
+              },
+            };
+          },
+          createTurns: () => {
+            calls.push("createTurns");
+            return {};
+          },
+          createOAuth: () => {
+            calls.push("createOAuth");
+            return {};
+          },
+          createApp: () => {
+            calls.push("createApp");
+            return {};
+          },
+          createLoop: () => {
+            calls.push("createLoop");
+            return { start(): void {}, async stop(): Promise<void> {} };
+          },
+          serve: () => {
+            calls.push("serve");
+            return { close(): void {} };
           },
         },
-        provision: async () => {
-          calls.push("provision");
-        },
-        createSupervisor: () => {
-          calls.push("createSupervisor");
-          return {
-            async startAll(): Promise<void> {
-              calls.push("startAll");
-            },
-          };
-        },
-        createTurns: () => {
-          calls.push("createTurns");
-          return {};
-        },
-        createOAuth: () => {
-          calls.push("createOAuth");
-          return {};
-        },
-        createApp: () => {
-          calls.push("createApp");
-          return {};
-        },
-        createLoop: () => {
-          calls.push("createLoop");
-          return { start(): void {}, async stop(): Promise<void> {} };
-        },
-        serve: () => {
-          calls.push("serve");
-          return { close(): void {} };
-        },
-      }),
+        "owner",
+      ),
       (err: unknown) => err instanceof DomainError && err.code === "STARTUP_RECOVERY_FAILED",
     );
 
     // Aborta sin arrancar agentes ni publicar HTTP: el Manager quedaría sin
     // Supervisor ni `serve`, y systemd reintentaría (§7.4).
-    assert.deepEqual(calls, ["openStore", "initialize", "provision", "recover"]);
+    assert.deepEqual(calls, ["openStore", "reconcile", "initialize", "provision", "recover"]);
+  });
+
+  it("si la reconciliación de autoridad falla, ni initialize ni startAll ni serve ni loop.start se ejecutan (P1.4 §5.3)", async () => {
+    const calls: string[] = [];
+    const store: StartupStore = {
+      agenda: {
+        recoverRunningOnStartup(): StartupRecoveryResult {
+          calls.push("recover");
+          return { runningRecovered: [], deadlineExpired: 0 };
+        },
+        triggers: {
+          reconcileAuthority(): number {
+            calls.push("reconcile");
+            throw new DomainError("STORAGE_UNAVAILABLE", "fallo simulado de la reconciliación (§5.3)");
+          },
+        },
+      },
+      close(): void {},
+    };
+
+    await assert.rejects(
+      runStartup(
+        {
+          openStore: async () => {
+            calls.push("openStore");
+            return store;
+          },
+          providers: {
+            async initialize(): Promise<void> {
+              calls.push("initialize");
+            },
+          },
+          provision: async () => {
+            calls.push("provision");
+          },
+          createSupervisor: () => {
+            calls.push("createSupervisor");
+            return {
+              async startAll(): Promise<void> {
+                calls.push("startAll");
+              },
+            };
+          },
+          createTurns: () => {
+            calls.push("createTurns");
+            return {};
+          },
+          createOAuth: () => {
+            calls.push("createOAuth");
+            return {};
+          },
+          createApp: () => {
+            calls.push("createApp");
+            return {};
+          },
+          createLoop: () => {
+            calls.push("createLoop");
+            return { start(): void {}, async stop(): Promise<void> {} };
+          },
+          serve: () => {
+            calls.push("serve");
+            return { close(): void {} };
+          },
+        },
+        "owner",
+      ),
+      (err: unknown) => err instanceof DomainError && err.code === "STORAGE_UNAVAILABLE",
+    );
+
+    // Mejor no arrancar que servir con autoridad incoherente: la reconciliación
+    // es el primer paso observable y un fallo aborta antes de Providers, HTTP y Loop.
+    assert.deepEqual(calls, ["openStore", "reconcile"]);
   });
 });
 

@@ -24,6 +24,7 @@ import type { ApiErrorCode } from "../api-v1/errors.ts";
 export type DomainErrorCode =
   | "INITIATIVE_NOT_FOUND"
   | "TRIGGER_NOT_FOUND"
+  | "TRIGGER_AUTHORITY_CONFLICT"
   | "IDEMPOTENCY_CONFLICT"
   | "INITIATIVE_TRANSITION_ILLEGAL"
   | "INITIATIVE_STATE_CONFLICT"
@@ -74,14 +75,17 @@ export class DomainError extends Error {
  * `routes.ts`; esta tabla es la especificación vigente para Fase 2 y no toca
  * `api-v1/` (decisión §9.2: opción 1, sin añadir `STATE_CONFLICT` 409).
  *
- * P1 (plan P1 §4) añade `IDEMPOTENCY_CONFLICT`,
- * error de caller; su traducción pública la fija P2, así que aquí
+ * P1 (plan P1 §4) añade `IDEMPOTENCY_CONFLICT` y `TRIGGER_AUTHORITY_CONFLICT`
+ * (revoke de un Trigger cuya `authority` no coincide con la efectiva — estado
+ * imposible tras la reconciliación normal, pero fail-closed),
+ * errores de caller; su traducción pública la fija P2, así que aquí
  * mapean provisionalmente a `BAD_REQUEST` para mantener `toApiError` exhaustivo
  * sin introducir rutas.
  */
 const API_CODE_BY_DOMAIN: Readonly<Record<DomainErrorCode, ApiErrorCode>> = {
   INITIATIVE_NOT_FOUND: "TURN_NOT_FOUND",
   TRIGGER_NOT_FOUND: "BAD_REQUEST",
+  TRIGGER_AUTHORITY_CONFLICT: "BAD_REQUEST",
   IDEMPOTENCY_CONFLICT: "BAD_REQUEST",
   INITIATIVE_TRANSITION_ILLEGAL: "BAD_REQUEST",
   INITIATIVE_STATE_CONFLICT: "BAD_REQUEST",

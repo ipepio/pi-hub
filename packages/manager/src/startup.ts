@@ -3,12 +3,16 @@
  * (`/tmp/f2plan.md` §11 "Fase 2.4", con el detalle en §7 "Recuperación al
  * arranque", §7.1 posición exacta, §7.4 qué pasa si falla).
  *
- * Orden fijado por el plan (§7.1): `openManagerStore → initialize →
- * provision → recoverRunningOnStartup (+ barrido `chain_deadline_at`) →
- * Supervisor.startAll → serve`. La recuperación corre sobre `store.agenda`
- * **entre** `provision` y la construcción del Supervisor: ningún Runner acepta
- * un turno de una Initiative que en disco ya es `failed`, y ninguna petición
- * HTTP despacha antes de que el estado durable sea consistente (ADR 0007).
+ * Orden fijado por el plan (§7.1 + P1.4 §5.3): `openManagerStore →
+ * reconcileAuthority → initialize → provision → recoverRunningOnStartup (+
+ * barrido `chain_deadline_at`) → Supervisor.startAll → serve`. La
+ * reconciliación de autoridad (P1.4) corre justo después de migrar y **antes**
+ * de cualquier Provider/Runner/HTTP/Loop: si falla, el Manager aborta sin
+ * arrancar (mismo principio que `STARTUP_RECOVERY_FAILED`). La recuperación
+ * corre sobre `store.agenda` **entre** `provision` y la construcción del
+ * Supervisor: ningún Runner acepta un turno de una Initiative que en disco ya
+ * es `failed`, y ninguna petición HTTP despacha antes de que el estado durable
+ * sea consistente (ADR 0007).
  *
  * Si `recoverRunningOnStartup` lanza —`STARTUP_RECOVERY_FAILED`, §7.4— la
  * excepción propaga y ni `createSupervisor`/`startAll` ni `createApp`/`serve`
@@ -22,6 +26,7 @@
  */
 
 import type { StartupRecoveryResult } from "./agenda/recovery.ts";
+import type { EffectiveTriggerAuthority } from "./agenda/triggers.ts";
 
 /** Superficie mínima de Providers que la composición toca (`initialize`). */
 export interface ProviderLike {
@@ -54,6 +59,10 @@ export interface StartupStore {
   readonly agenda: {
     /** ADR 0007 + barrido `chain_deadline_at` en una sola tx (§7.2). */
     recoverRunningOnStartup(now: number): StartupRecoveryResult;
+    /** P1.4 (§5.2): autoridad efectiva en todos los Triggers, antes de cualquier efecto observable. */
+    triggers: {
+      reconcileAuthority(authority: EffectiveTriggerAuthority, now: number): number;
+    };
   };
   close(): void;
 }
@@ -138,9 +147,17 @@ function logRecovery(result: StartupRecoveryResult): void {
 }
 
 /**
- * Ejecuta la secuencia de arranque completa en el orden del §7.1. No importa
- * ni ejecuta `index.ts`: los tests pasan fakes por la misma interfaz que
- * producción (plan §10.3).
+ * Ejecuta la secuencia de arranque completa en el orden del §7.1 + P1.4 §5.3.
+ * No importa ni ejecuta `index.ts`: los tests pasan fakes por la misma interfaz
+ * que producción (plan §10.3).
+ *
+ * P1.4 (§5.3) inserta la **reconciliación de autoridad** justo después de
+ * `openStore` y **antes** de cualquier Provider, Runner, HTTP o Loop — el modo
+ * (`panelEnabled`) se deriva una vez en `index.ts` y se pasa como
+ * `effectiveTriggerAuthority`. Un fallo de reconciliación propaga y aborta
+ * antes de `providers.initialize`, `startAll`, `serve` y `loop.start`: mejor
+ * no arrancar que servir con autoridad incoherente (mismo principio que
+ * `STARTUP_RECOVERY_FAILED`).
  *
  * Fase 3.5 (§9.5): el `TurnExecution` compartido se crea **antes** de
  * `createApp` (D2; la ruta HTTP y el Loop comparten la instancia, D8) y el
@@ -157,29 +174,39 @@ export async function runStartup<
   T,
   Loop extends LoopLike,
   A,
->(deps: StartupDeps<S, P, Sup, O, T, Loop, A>): Promise<StartupRuntime<S, Sup, T, Loop, A>> {
-  const store = await deps.openStore(); // 1. openManagerStore (migraciones)
-  await deps.providers.initialize(); //    2. Providers.initialize
-  await deps.provision(); //              3. provisionAgents
+>(
+  deps: StartupDeps<S, P, Sup, O, T, Loop, A>,
+  effectiveTriggerAuthority: EffectiveTriggerAuthority,
+): Promise<StartupRuntime<S, Sup, T, Loop, A>> {
+  const store = await deps.openStore(); //  1. openManagerStore (migraciones)
 
-  // 4. Recuperación al arranque (§7.1): entre `provision` y `new Supervisor`.
+  // 2. P1.4 (§5.3): reconciliar la autoridad de todos los Triggers antes de
+  //    cualquier efecto observable. Si falla, el Manager aborta sin Providers,
+  //    Runner, HTTP ni Loop (§5.3; decisión cerrada "mejor no arrancar que
+  //    servir con autoridad incoherente").
+  store.agenda.triggers.reconcileAuthority(effectiveTriggerAuthority, Date.now());
+
+  await deps.providers.initialize(); //    3. Providers.initialize
+  await deps.provision(); //              4. provisionAgents
+
+  // 5. Recuperación al arranque (§7.1): entre `provision` y `new Supervisor`.
   //    ADR 0007 + barrido `chain_deadline_at` en una sola tx (§7.2). Si lanza,
   //    `STARTUP_RECOVERY_FAILED` propaga y ni `startAll` ni `serve` se ejecutan
   //    (§7.4): el Manager aborta sin publicar HTTP y systemd reintenta.
   const recovery = store.agenda.recoverRunningOnStartup(Date.now());
   logRecovery(recovery);
 
-  const supervisor = deps.createSupervisor(); // 5. new Supervisor
-  await supervisor.startAll(); //              6. Supervisor.startAll
+  const supervisor = deps.createSupervisor(); // 6. new Supervisor
+  await supervisor.startAll(); //              7. Supervisor.startAll
 
-  // 7. TurnExecution compartido (Fase 3.5, D2): ANTES de createApp para que la
+  // 8. TurnExecution compartido (Fase 3.5, D2): ANTES de createApp para que la
   //    ruta HTTP y el Loop consuman la misma instancia (D8, §6.3).
   const turns = deps.createTurns({ store });
-  const oauth = deps.createOAuth(deps.providers); // 8. OAuthService
-  const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns }); // 9. createApi
-  const server = deps.serve(app); //               10. serve — HTTP público
+  const oauth = deps.createOAuth(deps.providers); // 9. OAuthService
+  const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns }); // 10. createApi
+  const server = deps.serve(app); //               11. serve — HTTP público
 
-  // 11. Fase 3.5 (§1.2, D2): el Loop se compone y arranca DESPUÉS de `serve`.
+  // 12. Fase 3.5 (§1.2, D2): el Loop se compone y arranca DESPUÉS de `serve`.
   const loop = deps.createLoop({ store, supervisor, turns });
   loop.start();
 

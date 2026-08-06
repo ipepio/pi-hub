@@ -130,6 +130,19 @@ export interface CreateTriggerResult {
   readonly replayed: boolean;
 }
 
+/**
+ * Comando de `revokeTrigger` (plan P1 §4.2). El caller aporta `agentName`,
+ * `triggerId` y `now`; la `authority` es la efectiva inyectada por
+ * `AutonomyControl`. Revocar deshabilita el Trigger y anula `next_fire_at`;
+ * **no lo borra** ni reescribe `created_by`.
+ */
+export interface RevokeTriggerCommand {
+  readonly agentName: string;
+  readonly triggerId: string;
+  readonly now: number;
+  readonly authority: EffectiveTriggerAuthority;
+}
+
 /** Todo rechazo de schedule es `TRIGGER_NOT_DISPARABLE` (§3); el motivo es interno. */
 function notDisposableSchedule(reason: "json" | "shape" | "timeZone" | "calendar"): DomainError {
   return new DomainError(
@@ -667,5 +680,107 @@ export class TriggerRepository {
       "IDEMPOTENCY_CONFLICT",
       `trigger (agent ${agentName}, key ${existing.create_idempotency_key}): misma key, comando distinto`,
     );
+  }
+
+  /**
+   * Revoke Trigger idempotente (plan P1 §4.2). CAS exacto dentro de una sola
+   * `BEGIN IMMEDIATE`:
+   *
+   * ```sql
+   * UPDATE triggers
+   * SET enabled=0, next_fire_at=NULL, updated_at=?
+   * WHERE id=? AND agent_name=? AND authority=? AND enabled=1;
+   * ```
+   *
+   * Si cambia una fila, devuelve el Trigger revocado. Si cambia cero, relee
+   * **siempre scoped** por `(id, agent_name)`:
+   *
+   * | Relectura | Resultado |
+   * |---|---|
+   * | no existe (incluye ID de otro Agent) | `TRIGGER_NOT_FOUND`. |
+   * | existe, `authority` distinta | `TRIGGER_AUTHORITY_CONFLICT`. |
+   * | existe, autoridad coincide y `enabled=0` | éxito idempotente, sin cambiar otra vez `updated_at`. |
+   * | cualquier otro caso | `TRIGGER_AUTHORITY_CONFLICT` fail-closed; no se inventa éxito. |
+   *
+   * Revocar no borra Trigger, Initiatives ni `last_fired_at` y no reescribe
+   * `created_by`.
+   */
+  revokeTrigger(command: RevokeTriggerCommand): Trigger {
+    const db = this.sqlite;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = db
+        .prepare(
+          `UPDATE triggers
+             SET enabled = 0, next_fire_at = NULL, updated_at = ?
+           WHERE id = ? AND agent_name = ? AND authority = ? AND enabled = 1`,
+        )
+        .run(command.now, command.triggerId, command.agentName, command.authority);
+      if (Number(result.changes) === 1) {
+        db.exec("COMMIT");
+        return this.getForAgent(command.agentName, command.triggerId);
+      }
+      // Cero filas: releer siempre scoped por `(id, agent_name)` — un ID de
+      // otro Agent es indistinguible de inexistente (§4.2, §6.1).
+      const row = db
+        .prepare(`${SELECT_TRIGGER_FULL} WHERE id = ? AND agent_name = ?`)
+        .get(command.triggerId, command.agentName) as TriggerRowFull | undefined;
+      if (!row) {
+        throw new DomainError(
+          "TRIGGER_NOT_FOUND",
+          `trigger ${command.triggerId} no existe para el agent ${command.agentName}`,
+        );
+      }
+      if (row.authority !== command.authority) {
+        throw new DomainError(
+          "TRIGGER_AUTHORITY_CONFLICT",
+          `trigger ${command.triggerId} (agent ${command.agentName}): authority durable ` +
+            `${row.authority} no coincide con la efectiva ${command.authority}`,
+        );
+      }
+      if (row.enabled === 0) {
+        // Revoke repetido es éxito: el perdedor de la carrera no vuelve a
+        // tocar `updated_at`.
+        db.exec("COMMIT");
+        return mapTrigger(row);
+      }
+      throw new DomainError(
+        "TRIGGER_AUTHORITY_CONFLICT",
+        `trigger ${command.triggerId} (agent ${command.agentName}): estado inesperado ` +
+          `(authority=${row.authority}, enabled=${row.enabled})`,
+      );
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Reconciliación de autoridad al arrancar (plan P1 §5.2). Una sola
+   * `BEGIN IMMEDIATE` pone la `authority` efectiva del proceso en **todos** los
+   * Triggers que no la tengan:
+   *
+   * ```sql
+   * UPDATE triggers SET authority=?, updated_at=? WHERE authority<>?;
+   * ```
+   *
+   * Devuelve filas cambiadas. Repetir con el mismo modo devuelve 0 y no altera
+   * timestamps: idempotencia observable. `created_by` nunca cambia (es
+   * procedencia histórica) y la reconciliación no toca `proposal_state`,
+   * `enabled`, schedules, Agents ni Initiatives.
+   */
+  reconcileAuthority(authority: EffectiveTriggerAuthority, now: number): number {
+    const db = this.sqlite;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = db
+        .prepare("UPDATE triggers SET authority = ?, updated_at = ? WHERE authority <> ?")
+        .run(authority, now, authority);
+      db.exec("COMMIT");
+      return Number(result.changes);
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 }
