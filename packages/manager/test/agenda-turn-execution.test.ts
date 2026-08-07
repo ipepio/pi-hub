@@ -87,15 +87,35 @@ function insertRunningInitiative(
   );
 }
 
-/** Arranca un "Runner fake": un WebSocketServer que responde como el Runner. */
+/** Arranca un "Runner fake": un WebSocketServer que responde como el Runner.
+ * Envía `ready` automáticamente al conectar (P3.1 handshake).
+ * @param behavior - función que configura handlers de mensajes en el socket
+ * @param capabilities - capacidades a anunciar en `ready` (vacío = legacy)
+ */
 async function startRunner(
   behavior: (socket: FakeRunnerSocket) => void,
+  capabilities?: string[],
 ): Promise<{ port: number; close: () => Promise<void> }> {
   const runner = new WebSocketServer({ port: 0 });
   await new Promise<void>((resolve) => runner.once("listening", () => resolve()));
   const address = runner.address();
   assert.ok(address && typeof address === "object");
-  runner.on("connection", (socket) => behavior(socket as unknown as FakeRunnerSocket));
+  runner.on("connection", (socket) => {
+    const s = socket as unknown as FakeRunnerSocket;
+    // P3.1: enviar ready después de que el cliente haya registrado sus handlers
+    setTimeout(() => {
+      const readyMsg: Record<string, unknown> = {
+        type: "ready",
+        agent: "test-agent",
+        sessionId: "test-session",
+      };
+      if (capabilities && capabilities.length > 0) {
+        readyMsg.capabilities = capabilities;
+      }
+      s.send(JSON.stringify(readyMsg));
+    }, 5);
+    behavior(s);
+  });
   let closed = false;
   const close = () =>
     new Promise<void>((resolve) => {
@@ -669,15 +689,22 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
     agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-df", 1000);
     insertRunningInitiative(db, "ini-df", "agent", TURN_ID);
 
-    // Fake WS: emite "open" en el siguiente tick (tras registrar listeners) y
-    // su `send` lanza — reproduce el guardia de `turn-execution.ts:317-322`.
+    // Fake WS: emite "open" en el siguiente tick (tras registrar listeners),
+    // emite "ready" para el handshake P3.1, y su `send` lanza.
     const fakeWs = {
       abortRequested: false,
       sent: false,
       listeners: new Map<string, Array<(raw: unknown) => void>>(),
       on(event: string, fn: (raw: unknown) => void) {
         (this.listeners.get(event) ?? this.listeners.set(event, []).get(event)!).push(fn);
-        if (event === "open") queueMicrotask(() => this.listeners.get("open")?.forEach((f) => f(undefined)));
+        if (event === "open") {
+          queueMicrotask(() => {
+            this.listeners.get("open")?.forEach((f) => f(undefined));
+            // P3.1: enviar ready para completar el handshake
+            const readyMsg = JSON.stringify({ type: "ready", agent: "test-agent", sessionId: "test-session", capabilities: ["prompt_context_v1", "ask_human_v1"] });
+            this.listeners.get("message")?.forEach((f) => f(readyMsg));
+          });
+        }
       },
       send() { this.sent = true; throw new Error("send simulado falla"); },
       close() {},
@@ -698,6 +725,67 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
     const ini = agenda.initiatives.get("ini-df");
     assert.equal(ini.state, "failed");
     assert.equal(ini.failureReason, "dispatch_failed");
+    assert.equal(turns.hasLiveTurnForAgent("agent"), false);
+  });
+
+  it("new manager never dispatches an Initiative to a legacy Runner", async () => {
+    // P3.1 matriz §1.1 (nuevo + viejo): un Runner que anuncia `ready` sin
+    // `ask_human_v1` (legacy) no puede recibir el prompt de una Initiative.
+    // El Manager nuevo debe cerrar el turno con `turn-error`/`runner_unavailable`
+    // de inmediato y NO debe enviar el prompt. (Tapa también el cuelgue H2.)
+    const sent: string[] = [];
+    const fakeWs = {
+      listeners: new Map<string, Array<(raw: unknown) => void>>(),
+      on(event: string, fn: (raw: unknown) => void) {
+        (this.listeners.get(event) ?? this.listeners.set(event, []).get(event)!).push(fn);
+        if (event === "open") {
+          queueMicrotask(() => {
+            this.listeners.get("open")?.forEach((f) => f(undefined));
+            // P3.1: ready SIN capabilities (`ask_human_v1` ausente) → legacy.
+            const readyMsg = JSON.stringify({ type: "ready", agent: "test-agent", sessionId: "test-session" });
+            this.listeners.get("message")?.forEach((f) => f(readyMsg));
+          });
+        }
+      },
+      // Si el prompt se enviara (mutación: check de capabilities quitado), el
+      // Runner responde agent_start→agent_end y el turno termina con
+      // turn-complete: así la mutación cae con una aserción nombrada, no con
+      // un cuelgue de la suite (H2).
+      send(data: string) {
+        sent.push(String(data));
+        const message = JSON.parse(String(data)) as { type?: string };
+        if (message.type === "prompt") {
+          queueMicrotask(() => {
+            this.listeners.get("message")?.forEach((f) =>
+              f(JSON.stringify({ type: "agent_start" })),
+            );
+            this.listeners.get("message")?.forEach((f) =>
+              f(JSON.stringify({ type: "agent_end" })),
+            );
+          });
+        }
+      },
+      close() {},
+    };
+    const turns = new TurnExecution({
+      apiToken: "service-token",
+      createWebSocket: () => fakeWs as unknown as WebSocket,
+    });
+    const collector = new EventCollector();
+    const handle = turns.startTurn(
+      command({ origin: { kind: "initiative" }, onEvent: (e) => collector.push(e) }),
+    );
+
+    const terminal = await handle.completion;
+    assert.equal(terminal?.event, "turn-error");
+    assert.equal((terminal?.data as { code: string }).code, "RESOURCE_UNAVAILABLE");
+    assert.deepEqual(collector.events, [
+      {
+        event: "turn-error",
+        data: { turnId: TURN_ID, code: "RESOURCE_UNAVAILABLE", message: "Runner unavailable" },
+      },
+    ]);
+    assert.equal(sent.length, 0, "el prompt de una Initiative no se envía a un Runner legacy");
     assert.equal(turns.hasLiveTurnForAgent("agent"), false);
   });
 

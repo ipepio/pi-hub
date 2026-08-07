@@ -113,6 +113,8 @@ test("un WS que muere después del abort sin agent_end publica turn-aborted", as
     });
 
     runner.on("connection", (socket) => {
+      // P3.1: enviar ready con capabilities para completar el handshake
+      socket.send(JSON.stringify({ type: "ready", agent: "agent", sessionId: "test-session", capabilities: ["prompt_context_v1", "ask_human_v1"] }));
       socket.on("message", (raw) => {
         const message = JSON.parse(String(raw)) as { type?: string };
         if (message.type === "prompt") socket.send(JSON.stringify({ type: "agent_start" }));

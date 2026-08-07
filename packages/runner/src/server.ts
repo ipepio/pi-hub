@@ -18,6 +18,7 @@ import {
   type AgentConfig,
   type ClientWsMessage,
   type PihubEnv,
+  type RunnerCapability,
   type ServerWsMessage,
 } from "@pihub/shared";
 import { SessionHubRegistry, type ChatHub } from "./hub.js";
@@ -255,6 +256,7 @@ function attachWebSocket(
     };
     const unsubscribe = hub.subscribe(send);
 
+    const capabilities: RunnerCapability[] = ["prompt_context_v1", "ask_human_v1"];
     send({
       type: "ready",
       agent: config.name,
@@ -262,6 +264,7 @@ function attachWebSocket(
       sessionId: hub.sessionId ?? "",
       stt: sttEnabled(env),
       tts: ttsEnabled(env),
+      capabilities,
     });
 
     ws.on("message", (raw) => {
@@ -272,7 +275,7 @@ function attachWebSocket(
         return;
       }
       if (message.type === "prompt" && message.text?.trim()) {
-        void hub.prompt(message.text);
+        void hub.prompt(message.text, message.context);
       } else if (message.type === "abort") {
         void hub.abort();
       } else if (message.type === "new_session") {

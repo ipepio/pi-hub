@@ -1,5 +1,6 @@
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { ServerWsMessage } from "@pihub/shared";
+import type { ServerWsMessage, SessionType } from "@pihub/shared";
+import { ASK_HUMAN_TOOL_NAME } from "@pihub/shared";
 import type { ResolvedModel, SessionFactory } from "./session.js";
 
 type Listener = (message: ServerWsMessage) => void;
@@ -13,9 +14,31 @@ export class ChatHub {
   private listeners = new Set<Listener>();
   /** Modelo cambiado en vivo desde la UI; no persiste, muere con el proceso. */
   private modelOverride?: ResolvedModel;
+  /** Tipo de sesión (P3.1): se fija con el primer prompt y no cambia. */
+  private _sessionType: SessionType = "human";
+  /** Latch: solo una emisión Ask por prompt. */
+  private _askEmittedThisPrompt = false;
 
   constructor(factory: SessionFactory) {
     this.factory = factory;
+  }
+
+  /** Tipo de sesión actual (P3.1). Inmutable tras el primer prompt. */
+  get sessionType(): SessionType {
+    return this._sessionType;
+  }
+
+  /**
+   * Fija el tipo de sesión. Solo se acepta el primer valor; los posteriores
+   * se rechazan para evitar que un prompt de tipo distinto cambie el tipo
+   * sobre la misma clave.
+   */
+  setSessionType(type: SessionType): void {
+    if (this._sessionType !== type && this.session) {
+      // Ya hay sesión creada con un tipo distinto — rechazar
+      throw new Error(`Cannot change session type from ${this._sessionType} to ${type} on an active session`);
+    }
+    this._sessionType = type;
   }
 
   subscribe(listener: Listener): () => void {
@@ -33,6 +56,8 @@ export class ChatHub {
     // la misma promesa en lugar de crear (y filtrar) dos AgentSession.
     if (!this.creating) {
       this.creating = (async () => {
+        // P3.1: propagar el tipo de sesión a la factory antes de crear
+        (this.factory as { sessionType: SessionType }).sessionType = this._sessionType;
         const session = await this.factory.create(this.modelOverride);
         this.unsubscribe = session.subscribe((event) => this.onEvent(event));
         this.session = session;
@@ -68,8 +93,24 @@ export class ChatHub {
         break;
       }
       case "tool_execution_end": {
-        const e = event as { toolName?: string; isError?: boolean };
-        this.broadcast({ type: "tool_end", toolName: e.toolName ?? "tool", isError: !!e.isError });
+        const e = event as { toolName?: string; isError?: boolean; result?: { question?: string; summary?: string }; toolCallId?: string };
+        const toolName = e.toolName ?? "tool";
+
+        // P3.1: emitir tool_end primero (el resultado ya está incorporado)
+        this.broadcast({ type: "tool_end", toolName, isError: !!e.isError });
+
+        // P3.1: ask_human — emitir human_input_required y abortar
+        if (toolName === ASK_HUMAN_TOOL_NAME && !e.isError && !this._askEmittedThisPrompt) {
+          this._askEmittedThisPrompt = true;
+          this.broadcast({
+            type: "human_input_required",
+            question: e.result?.question ?? "",
+            summary: e.result?.summary ?? "",
+            toolCallId: e.toolCallId ?? "",
+          });
+          // Abortar el run después de tool_execution_end (cinturón de seguridad)
+          void this.session?.abort();
+        }
         break;
       }
       default:
@@ -78,7 +119,14 @@ export class ChatHub {
   }
 
   /** Lanza un prompt sin bloquear; los resultados llegan por eventos. */
-  async prompt(text: string): Promise<void> {
+  async prompt(text: string, context?: { kind: "human" | "initiative" }): Promise<void> {
+    // P3.1: fijar tipo de sesión (solo el primer prompt cuenta)
+    if (context?.kind === "initiative") {
+      this._sessionType = "initiative";
+    }
+    // Resetear el latch Ask para este prompt
+    this._askEmittedThisPrompt = false;
+
     const session = await this.ensureSession();
     const options = session.isStreaming ? ({ streamingBehavior: "followUp" } as const) : undefined;
     session.prompt(text, options).catch((error: unknown) => {
@@ -120,6 +168,7 @@ export class ChatHub {
     this.session?.dispose();
     this.session = undefined;
     this.unsubscribe = undefined;
+    this._askEmittedThisPrompt = false;
   }
 
   get sessionId(): string | undefined {

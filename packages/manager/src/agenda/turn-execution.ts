@@ -44,6 +44,7 @@ import {
 } from "../api-v1/turns.ts";
 import { DomainError } from "./errors.ts";
 import { TurnRepository, type FailureCause, type TurnFinalState } from "./turns.ts";
+import type { RunnerCapability } from "@pihub/shared";
 
 /** Turno vivo con WS abierto contra el Runner (clave `agentName:turnId`). */
 interface TurnoVivo {
@@ -61,6 +62,10 @@ interface MensajeRunner {
   message?: unknown;
   toolName?: unknown;
   isError?: unknown;
+  capabilities?: unknown;
+  question?: unknown;
+  summary?: unknown;
+  toolCallId?: unknown;
 }
 
 /**
@@ -129,6 +134,13 @@ export interface TurnExecutionOptions {
    * desactiva (la ruta de Fase 3.2 conserva el "sin timeout" actual).
    */
   readonly dispatchTimeoutMs?: number;
+  /**
+   * Watchdog del handshake P3.1: si el Runner no envía `ready` con
+   * capabilities en este plazo desde que el WS se abre, el turno se cierra
+   * con `dispatch_failed`. Siempre activo (default 10 s) para que ningun
+   * turno se cuelgue si el Runner no responde al handshake.
+   */
+  readonly handshakeTimeoutMs?: number;
   /** Scheduler inyectable para el watchdog (tests sin tiempo real). */
   readonly schedule?: (callback: () => void, ms: number) => TimerHandle;
   /** Cancelador inyectable del scheduler. */
@@ -167,6 +179,7 @@ export class TurnExecution {
   private readonly repository: Pick<TurnRepository, "complete"> | undefined;
   private readonly now: () => number;
   private readonly dispatchTimeoutMs: number;
+  private readonly handshakeTimeoutMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
   private readonly cancel: (handle: TimerHandle) => void;
   private readonly createWebSocket: (url: string) => WebSocket;
@@ -176,6 +189,7 @@ export class TurnExecution {
     this.repository = options.repository;
     this.now = options.now ?? Date.now;
     this.dispatchTimeoutMs = options.dispatchTimeoutMs ?? 0;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     this.schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
     this.cancel = options.cancel ?? ((handle) => clearTimeout(handle));
     this.createWebSocket =
@@ -224,6 +238,7 @@ export class TurnExecution {
 
     let cerrado = false;
     let timeoutHandle: TimerHandle | undefined;
+    let handshakeTimeoutHandle: TimerHandle | undefined;
 
     /** `turn-error` público de una causa del catálogo (el código identifica la clase). */
     const turnError = (cause: FailureCause): TurnSseEvent => ({
@@ -239,6 +254,13 @@ export class TurnExecution {
       if (timeoutHandle !== undefined) {
         this.cancel(timeoutHandle);
         timeoutHandle = undefined;
+      }
+    };
+
+    const cancelarHandshakeTimeout = () => {
+      if (handshakeTimeoutHandle !== undefined) {
+        this.cancel(handshakeTimeoutHandle);
+        handshakeTimeoutHandle = undefined;
       }
     };
 
@@ -299,6 +321,7 @@ export class TurnExecution {
       if (cerrado) return;
       cerrado = true;
       cancelarTimeout();
+      cancelarHandshakeTimeout();
       this.turnosVivos.delete(clave);
       const escrituraFinal = emitir(terminal);
       void escrituraFinal.then(
@@ -315,6 +338,29 @@ export class TurnExecution {
       );
     };
 
+    let handshakeDone = false;
+    let runnerCapabilities: RunnerCapability[] = [];
+
+    /** Envía el prompt con contexto según el origen y capabilities. */
+    const enviarPrompt = (): void => {
+      if (handshakeDone) return;
+      handshakeDone = true;
+
+      // Matriz §1.1: un Manager nuevo no manda una Initiative a un Runner
+      // que no tiene `ask_human_v1`.
+      if (command.origin.kind === "initiative" && !runnerCapabilities.includes("ask_human_v1")) {
+        finalizar(turnError("runner_unavailable"), "runner_unavailable");
+        return;
+      }
+
+      const context = command.origin.kind === "initiative" ? { kind: "initiative" as const } : { kind: "human" as const };
+      try {
+        ws.send(JSON.stringify({ type: "prompt", text: message, context }));
+      } catch {
+        finalizar(turnError("dispatch_failed"), "dispatch_failed");
+      }
+    };
+
     ws.on("open", () => {
       if (cerrado) {
         cerrarSocket();
@@ -323,14 +369,14 @@ export class TurnExecution {
       // Registrado solo tras `open`: mandar `{type:"abort"}` antes de que el
       // WS esté realmente conectado no es seguro.
       this.turnosVivos.set(clave, { ws, abortRequested: false });
-      try {
-        ws.send(JSON.stringify({ type: "prompt", text: message }));
-      } catch {
-        // Un envío que falla tras aceptar el turno es un fallo de despacho
-        // (§5.2 `dispatch_failed`): el `close`/`error` del WS también emitiría
-        // terminal, pero este camino no deja el turno pendiente del socket.
+
+      // No se envía el prompt inmediatamente: se espera `ready` del Runner.
+      // El handshake tiene su propio watchdog (P3.1): si el Runner no envía
+      // `ready` en `handshakeTimeoutMs`, el turno se cierra con dispatch_failed.
+      handshakeTimeoutHandle = this.schedule(() => {
+        handshakeTimeoutHandle = undefined;
         finalizar(turnError("dispatch_failed"), "dispatch_failed");
-      }
+      }, this.handshakeTimeoutMs);
     });
 
     ws.on("message", (raw: unknown) => {
@@ -340,6 +386,16 @@ export class TurnExecution {
       } catch {
         return;
       }
+
+      // P3.1: interceptar `ready` para el handshake antes de traducir eventos
+      if (mensaje.type === "ready" && !handshakeDone) {
+        runnerCapabilities = (mensaje as { capabilities?: RunnerCapability[] }).capabilities ?? [];
+        cancelarHandshakeTimeout();
+        cancelarTimeout();
+        enviarPrompt();
+        return;
+      }
+
       const turno = this.turnosVivos.get(clave);
       const evento = toTurnEvent(mensaje, turnId, eventProfile, turno?.abortRequested === true);
       if (!evento) return;

@@ -52,9 +52,17 @@ export interface ModelInfo {
   configured: boolean;
 }
 
+/** Capacidades que un Runner anuncia al conectar (P3.1). */
+export type RunnerCapability = "prompt_context_v1" | "ask_human_v1";
+
+/** Contexto de origen del turno que el Manager envía al Runner (P3.1). */
+export type PromptContext =
+  | { kind: "human" }
+  | { kind: "initiative" };
+
 /** Mensajes WS cliente -> runner */
 export type ClientWsMessage =
-  | { type: "prompt"; text: string }
+  | { type: "prompt"; text: string; context?: PromptContext }
   | { type: "abort" }
   | { type: "new_session" }
   /** Cambio de modelo en vivo: no persiste, se revierte al reiniciar el runner */
@@ -62,7 +70,7 @@ export type ClientWsMessage =
 
 /** Mensajes WS runner -> cliente */
 export type ServerWsMessage =
-  | { type: "ready"; agent: string; model?: string; sessionId: string; stt?: boolean; tts?: boolean }
+  | { type: "ready"; agent: string; model?: string; sessionId: string; stt?: boolean; tts?: boolean; capabilities?: RunnerCapability[] }
   | { type: "agent_start" }
   | { type: "agent_end" }
   | { type: "text_delta"; delta: string }
@@ -71,4 +79,20 @@ export type ServerWsMessage =
   | { type: "tool_end"; toolName: string; isError: boolean }
   | { type: "session_new"; sessionId: string }
   | { type: "model_changed"; model: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  /** P3.1: el Runner necesita respuesta humana */
+  | { type: "human_input_required"; question: string; summary: string; toolCallId: string };
+
+// --- Constantes del protocolo P3.1 ---
+
+/** Longitud máxima de `question` en la tool ask_human (P3.1). */
+export const ASK_HUMAN_QUESTION_MAX = 1000;
+
+/** Longitud máxima de `summary` en la tool ask_human (P3.1). */
+export const ASK_HUMAN_SUMMARY_MAX = 500;
+
+/** Nombre reservado de la tool ask_human (P3.1). */
+export const ASK_HUMAN_TOOL_NAME = "ask_human";
+
+/** Tipo de sesión interna del Runner: human o initiative (P3.1). */
+export type SessionType = "human" | "initiative";

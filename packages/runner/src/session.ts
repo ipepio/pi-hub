@@ -5,6 +5,7 @@ import {
   DefaultResourceLoader,
   SessionManager,
   type AgentSession,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { createRuntimeProviders, type ResolvedRuntimeModel } from "@pihub/providers";
 import {
@@ -18,7 +19,11 @@ import {
   type AgentPaths,
   type ModelInfo,
   type PihubEnv,
+  ASK_HUMAN_TOOL_NAME,
+  type SessionType,
 } from "@pihub/shared";
+
+import { askHumanTool } from "./ask-human.ts";
 
 export type ResolvedModel = ResolvedRuntimeModel;
 
@@ -40,8 +45,11 @@ export class SessionFactory {
   private readonly env: PihubEnv;
   private extensionProvidersPrepared = false;
   public readonly config: AgentConfig;
+  /** P3.1: human o initiative — controla la tool ask_human reservada. */
+  public sessionType: SessionType = "human";
 
-  constructor(env: PihubEnv, config: AgentConfig, sessionKey?: string) {
+  constructor(env: PihubEnv, config: AgentConfig, sessionKey?: string, sessionType?: SessionType) {
+    if (sessionType) this.sessionType = sessionType;
     this.env = env;
     this.config = config;
     const agent = agentPaths(env.dataDir, config.name);
@@ -57,7 +65,7 @@ export class SessionFactory {
   }
 
   forSession(sessionKey: string): SessionFactory {
-    return new SessionFactory(this.env, this.config, sessionKey);
+    return new SessionFactory(this.env, this.config, sessionKey, this.sessionType);
   }
 
   private async ensureExtensionProviders(): Promise<void> {
@@ -145,9 +153,18 @@ export class SessionFactory {
     this.extensionProvidersPrepared = true;
 
     const model = overrideModel ?? (await this.resolveModel());
+
+    // P3.1: sesión human → excluye ask_human (incluso si una extensión la registra);
+    //        sesión initiative → inyecta la tool SDK reservada.
+    const sessionOptions: { excludeTools?: string[]; customTools?: ToolDefinition[] } =
+      this.sessionType === "initiative"
+        ? { customTools: [askHumanTool] }
+        : { excludeTools: [ASK_HUMAN_TOOL_NAME] };
+
     return this.runtimeProviders.createSession({
       cwd: this.paths.workspaceDir,
       agentDir: this.globalDir,
+      ...sessionOptions,
       ...(model ? { model } : {}),
       ...(this.config.thinkingLevel ? { thinkingLevel: this.config.thinkingLevel } : {}),
       resourceLoader: loader,
