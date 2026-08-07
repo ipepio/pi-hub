@@ -7,6 +7,19 @@ import { speakable, sttEnabled, synthesize, transcribe, ttsEnabled } from "./spe
 const EDIT_INTERVAL_MS = 2500;
 const TG_LIMIT = 4096;
 
+/** Decide si un usuario está permitido según la allowlist. Vacía = permitir a todos. */
+export function isAllowedUser(allowlist: number[], fromId: number | undefined): boolean {
+  if (allowlist.length === 0) return true;
+  return fromId !== undefined && allowlist.includes(fromId);
+}
+
+/** Avisa por consola si el bot de Telegram arranca sin allowlist. */
+export function warnIfNoAllowlist(agentName: string, allowlist: number[]): void {
+  if (allowlist.length === 0) {
+    console.warn(`[telegram:${agentName}] sin allowlist: el bot acepta a cualquier usuario`);
+  }
+}
+
 /** Bot de Telegram del agente: comandos + lenguaje natural, una sesión pi por chat. */
 export function startTelegram(
   env: PihubEnv,
@@ -15,14 +28,13 @@ export function startTelegram(
 ): { stop: () => void } | undefined {
   if (!config.telegramToken) return undefined;
 
+  warnIfNoAllowlist(config.name, env.telegramAllowedUsers);
+
   const bot = new Bot(config.telegramToken);
   const sessions = new Map<number, AgentSession>();
   const startedAt = Date.now();
 
-  const allowed = (ctx: Context): boolean => {
-    if (env.telegramAllowedUsers.length === 0) return true;
-    return !!ctx.from && env.telegramAllowedUsers.includes(ctx.from.id);
-  };
+  const allowed = (ctx: Context): boolean => isAllowedUser(env.telegramAllowedUsers, ctx.from?.id);
 
   async function getSession(chatId: number): Promise<AgentSession> {
     let session = sessions.get(chatId);

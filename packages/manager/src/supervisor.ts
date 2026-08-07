@@ -47,6 +47,7 @@ export function runnerEnvFor(
     PI_CODING_AGENT_DIR: globalDir,
     PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
     ...memoryEnvFor(env, config),
+    PIHUB_TELEGRAM_ALLOWED_USERS: env.telegramAllowedUsers.join(","),
   };
   if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none") delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
   return runnerEnv;

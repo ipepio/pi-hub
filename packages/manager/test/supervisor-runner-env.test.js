@@ -29,7 +29,7 @@ test("runnerEnvFor conserva stores e internas, pero no el entorno del Manager", 
     });
     const runnerEnv = runnerEnvFor(
       storeEnv,
-      { dataDir, memoryEnabled: true, sharedMemoryDefault: "none" },
+      { dataDir, memoryEnabled: true, sharedMemoryDefault: "none", telegramAllowedUsers: [] },
       { name: "agent", port: 4100, enabled: true, createdAt: "2026-08-01T00:00:00.000Z" },
     );
 
@@ -54,4 +54,19 @@ test("runnerEnvFor conserva stores e internas, pero no el entorno del Manager", 
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("runnerEnvFor propaga la allowlist de Telegram al env del Runner", () => {
+  const storeEnv = {};
+  const runnerEnv = runnerEnvFor(
+    storeEnv,
+    {
+      dataDir: "/data",
+      memoryEnabled: true,
+      sharedMemoryDefault: "none",
+      telegramAllowedUsers: [111, 222],
+    },
+    { name: "agent", port: 4100, enabled: true, createdAt: "2026-08-01T00:00:00.000Z" },
+  );
+  assert.equal(runnerEnv.PIHUB_TELEGRAM_ALLOWED_USERS, "111,222");
 });
