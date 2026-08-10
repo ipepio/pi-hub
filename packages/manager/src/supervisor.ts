@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import {
   agentPaths,
@@ -37,6 +38,7 @@ export function runnerEnvFor(
   storeEnv: NodeJS.ProcessEnv,
   env: PihubEnv,
   config: AgentConfig,
+  callbackToken: string,
 ): NodeJS.ProcessEnv {
   const paths = agentPaths(env.dataDir, config.name);
   const globalDir = dataPaths(env.dataDir).globalDir;
@@ -48,6 +50,8 @@ export function runnerEnvFor(
     PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
     ...memoryEnvFor(env, config),
     PIHUB_TELEGRAM_ALLOWED_USERS: env.telegramAllowedUsers.join(","),
+    PIHUB_RUNNER_CALLBACK_TOKEN: callbackToken,
+    PIHUB_MANAGER_PORT: String(env.managerPort),
   };
   if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none") delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
   return runnerEnv;
@@ -55,6 +59,8 @@ export function runnerEnvFor(
 
 interface Managed {
   proc: ChildProcess;
+  /** Credencial efímera y exclusiva de este spawn para callbacks internos al Manager. */
+  callbackToken: string;
   /** Puerto del Runner (`config.port`): el Loop lo necesita para abrir el WS del turno. */
   port: number;
   intentionalStop: boolean;
@@ -67,11 +73,22 @@ interface Managed {
 
 const MAX_RESTARTS = 5;
 const RESTART_WINDOW_MS = 60_000;
+const CALLBACK_TOKEN_RE = /^[0-9a-fA-F]{64}$/;
+
+type CallbackTokenSource = () => string;
+
+function randomCallbackToken(): string {
+  return randomBytes(32).toString("hex");
+}
 
 export class Supervisor {
   private processes = new Map<string, Managed>();
 
-  constructor(private env: PihubEnv) {}
+  constructor(
+    private env: PihubEnv,
+    /** Seam determinista reservado a tests; producción siempre usa 32 bytes aleatorios. */
+    private callbackTokenSource: CallbackTokenSource = randomCallbackToken,
+  ) {}
 
   async startAll(): Promise<void> {
     for (const agent of await listAgents(this.env.dataDir)) {
@@ -104,7 +121,8 @@ export class Supervisor {
     // Solo el entorno del sistema permitido y los stores explícitos llegan al
     // Runner; las vars internas de pihub se añaden en la composición final.
     const storeEnv = await resolveRunnerEnv(this.env.dataDir, config.name, process.env);
-    const runnerEnv = runnerEnvFor(storeEnv, this.env, config);
+    const callbackToken = this.callbackTokenSource();
+    const runnerEnv = runnerEnvFor(storeEnv, this.env, config, callbackToken);
     const proc = spawn(process.execPath, [runnerEntry], {
       env: runnerEnv,
       cwd: paths.workspaceDir,
@@ -115,6 +133,7 @@ export class Supervisor {
 
     const managed: Managed = {
       proc,
+      callbackToken,
       port: config.port,
       intentionalStop: false,
       restarts: this.withinWindow(config.name) ? (this.processes.get(config.name)?.restarts ?? 0) + 1 : 0,
@@ -153,6 +172,8 @@ export class Supervisor {
     const managed = this.processes.get(name);
     if (!managed || managed.exited) return;
     managed.intentionalStop = true;
+    // Revoca la credencial al observar el stop, sin esperar al evento de salida.
+    managed.exited = true;
     managed.proc.kill("SIGTERM");
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -230,6 +251,23 @@ export class Supervisor {
   runnerPortOf(name: string): number | undefined {
     const managed = this.processes.get(name);
     return managed && !managed.exited ? managed.port : undefined;
+  }
+
+  /** Resuelve una credencial efímera de callback únicamente contra Runners vivos. */
+  verifyCallbackToken(candidate: unknown): string | undefined {
+    if (typeof candidate !== "string" || !CALLBACK_TOKEN_RE.test(candidate)) return undefined;
+    const candidateBuffer = Buffer.from(candidate, "hex");
+    for (const [agentName, managed] of this.processes) {
+      if (managed.exited || !CALLBACK_TOKEN_RE.test(managed.callbackToken)) continue;
+      const expectedBuffer = Buffer.from(managed.callbackToken, "hex");
+      if (
+        expectedBuffer.length === candidateBuffer.length &&
+        timingSafeEqual(expectedBuffer, candidateBuffer)
+      ) {
+        return agentName;
+      }
+    }
+    return undefined;
   }
 
   async statusOf(config: AgentConfig): Promise<AgentStatus> {
