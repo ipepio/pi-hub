@@ -15,6 +15,13 @@ export interface PihubEnv {
   platformPromptEnabled: boolean;
   oauthProviders: string[];
   telegramAllowedUsers: number[];
+  /**
+   * Chat privado primario de Telegram para la entrega de preguntas humanas
+   * (PIHUB_TELEGRAM_PRIMARY_CHAT_ID, [ÁRBITRO-1]): ausente = panel-only y
+   * cero llamadas a Telegram (fail-closed). Debe ser miembro de
+   * `telegramAllowedUsers` y positivo (los IDs negativos son grupos/canales).
+   */
+  telegramPrimaryChatId?: number;
   /** Ruta a un manifiesto JSON de agentes a provisionar al arrancar (PIHUB_AGENTS_FILE) */
   agentsFile?: string;
   /** URL base de un servidor de audio OpenAI-compatible (speaches, LocalAI...). Vacío = voz desactivada */
@@ -77,6 +84,38 @@ function nonNegativeInt(value: string | undefined, fallback: number, name: strin
   return n;
 }
 
+/**
+ * PIHUB_TELEGRAM_PRIMARY_CHAT_ID — [ÁRBITRO-1]: el enrutado de Telegram se
+ * configura por variable de entorno, no por comando de bot. Fail-fast y
+ * fail-closed: ausente → `undefined` (panel-only, cero llamadas a Telegram);
+ * presente → chat privado positivo (entero seguro) y MIEMBRO de la allowlist,
+ * que no puede estar vacía. Los IDs negativos son grupos/canales de Telegram
+ * y se rechazan. Cualquier violación lanza con la variable y el motivo.
+ */
+export function parseTelegramPrimaryChatId(
+  value: string | undefined,
+  telegramAllowedUsers: number[],
+): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new Error(
+      `PIHUB_TELEGRAM_PRIMARY_CHAT_ID inválido: ${value} (chat privado positivo, número entero seguro)`,
+    );
+  }
+  if (telegramAllowedUsers.length === 0) {
+    throw new Error(
+      `PIHUB_TELEGRAM_PRIMARY_CHAT_ID=${value} requiere PIHUB_TELEGRAM_ALLOWED_USERS no vacía (fail-closed: sin allowlist no hay enrutado)`,
+    );
+  }
+  if (!telegramAllowedUsers.includes(n)) {
+    throw new Error(
+      `PIHUB_TELEGRAM_PRIMARY_CHAT_ID=${value} no está en PIHUB_TELEGRAM_ALLOWED_USERS (${telegramAllowedUsers.join(", ")})`,
+    );
+  }
+  return n;
+}
+
 export function parsePortRange(value: string | undefined): [number, number] {
   const match = /^(\d+)\s*-\s*(\d+)$/.exec(value ?? "");
   if (!match) return [4100, 4199];
@@ -93,6 +132,9 @@ export function parseSharedMemoryAccess(value: string | undefined): SharedMemory
 }
 
 export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
+  const telegramAllowedUsers = list(env.PIHUB_TELEGRAM_ALLOWED_USERS)
+    .map(Number)
+    .filter((n) => !Number.isNaN(n));
   return {
     dataDir: env.PIHUB_DATA_DIR ?? "/data",
     apiToken: env.API_TOKEN ?? "",
@@ -106,7 +148,8 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     sharedMemoryDefault: parseSharedMemoryAccess(env.PIHUB_SHARED_MEMORY_DEFAULT),
     platformPromptEnabled: bool(env.PIHUB_PLATFORM_PROMPT_ENABLED, true),
     oauthProviders: list(env.PIHUB_OAUTH_PROVIDERS),
-    telegramAllowedUsers: list(env.PIHUB_TELEGRAM_ALLOWED_USERS).map(Number).filter((n) => !Number.isNaN(n)),
+    telegramAllowedUsers,
+    telegramPrimaryChatId: parseTelegramPrimaryChatId(env.PIHUB_TELEGRAM_PRIMARY_CHAT_ID, telegramAllowedUsers),
     agentsFile: env.PIHUB_AGENTS_FILE || undefined,
     speechUrl: (env.PIHUB_SPEECH_URL || "").replace(/\/+$/, "") || undefined,
     speechApiKey: env.PIHUB_SPEECH_API_KEY || undefined,

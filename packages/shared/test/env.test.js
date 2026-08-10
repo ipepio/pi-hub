@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadEnv, parseSharedMemoryAccess } from "../dist/env.js";
+import { loadEnv, parseSharedMemoryAccess, parseTelegramPrimaryChatId } from "../dist/env.js";
 import { resolveSharedMemoryAccess } from "../dist/memory.js";
 
 test("parseSharedMemoryAccess: sin valor o vacío devuelve none", () => {
@@ -73,4 +73,61 @@ test("loadEnv: valores de Loop inválidos lanzan", () => {
   // `waitingHumanExpiryMs` es positiveInt: 0 significaría caducar al instante.
   assert.throws(() => loadEnv({ PIHUB_WAITING_HUMAN_EXPIRY_MS: "0" }), /PIHUB_WAITING_HUMAN_EXPIRY_MS inválido/);
   assert.throws(() => loadEnv({ PIHUB_WAITING_HUMAN_EXPIRY_MS: "-1" }), /PIHUB_WAITING_HUMAN_EXPIRY_MS inválido/);
+});
+
+test("parseTelegramPrimaryChatId: ausente o vacío devuelve undefined (panel-only)", () => {
+  assert.equal(parseTelegramPrimaryChatId(undefined, [111]), undefined);
+  assert.equal(parseTelegramPrimaryChatId("", [111]), undefined);
+});
+
+test("parseTelegramPrimaryChatId: válido (positivo y miembro de la allowlist)", () => {
+  assert.equal(parseTelegramPrimaryChatId("222", [111, 222]), 222);
+});
+
+test("parseTelegramPrimaryChatId: no numérico o no entero lanza", () => {
+  assert.throws(() => parseTelegramPrimaryChatId("abc", [111]), /PIHUB_TELEGRAM_PRIMARY_CHAT_ID inválido/);
+  assert.throws(() => parseTelegramPrimaryChatId("12.5", [111]), /PIHUB_TELEGRAM_PRIMARY_CHAT_ID inválido/);
+});
+
+test("parseTelegramPrimaryChatId: negativo (grupo/canal) o cero lanza", () => {
+  assert.throws(() => parseTelegramPrimaryChatId("-1001234567890", [111]), /PIHUB_TELEGRAM_PRIMARY_CHAT_ID inválido/);
+  assert.throws(() => parseTelegramPrimaryChatId("0", [111]), /PIHUB_TELEGRAM_PRIMARY_CHAT_ID inválido/);
+});
+
+test("parseTelegramPrimaryChatId: fuera de la allowlist lanza", () => {
+  assert.throws(
+    () => parseTelegramPrimaryChatId("333", [111, 222]),
+    /PIHUB_TELEGRAM_PRIMARY_CHAT_ID=333 no está en PIHUB_TELEGRAM_ALLOWED_USERS/,
+  );
+});
+
+test("parseTelegramPrimaryChatId: allowlist vacía con primary lanza (fail-closed)", () => {
+  assert.throws(
+    () => parseTelegramPrimaryChatId("111", []),
+    /PIHUB_TELEGRAM_ALLOWED_USERS no vacía/,
+  );
+});
+
+test("loadEnv: PIHUB_TELEGRAM_PRIMARY_CHAT_ID ausente es undefined (panel-only)", () => {
+  assert.equal(loadEnv({}).telegramPrimaryChatId, undefined);
+  assert.equal(loadEnv({ PIHUB_TELEGRAM_ALLOWED_USERS: "111,222" }).telegramPrimaryChatId, undefined);
+});
+
+test("loadEnv: PIHUB_TELEGRAM_PRIMARY_CHAT_ID válido se parsea", () => {
+  const env = loadEnv({ PIHUB_TELEGRAM_ALLOWED_USERS: "111,222", PIHUB_TELEGRAM_PRIMARY_CHAT_ID: "222" });
+  assert.equal(env.telegramPrimaryChatId, 222);
+});
+
+test("loadEnv: PIHUB_TELEGRAM_PRIMARY_CHAT_ID fuera de la allowlist lanza", () => {
+  assert.throws(
+    () => loadEnv({ PIHUB_TELEGRAM_ALLOWED_USERS: "111,222", PIHUB_TELEGRAM_PRIMARY_CHAT_ID: "333" }),
+    /PIHUB_TELEGRAM_PRIMARY_CHAT_ID=333 no está en PIHUB_TELEGRAM_ALLOWED_USERS/,
+  );
+});
+
+test("loadEnv: allowlist vacía con primary lanza (fail-closed)", () => {
+  assert.throws(
+    () => loadEnv({ PIHUB_TELEGRAM_PRIMARY_CHAT_ID: "111" }),
+    /PIHUB_TELEGRAM_ALLOWED_USERS no vacía/,
+  );
 });
