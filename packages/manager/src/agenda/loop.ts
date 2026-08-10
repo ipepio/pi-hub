@@ -118,8 +118,13 @@ export interface AgendaLoopOptions {
   /** Margen corto y acotado a los `turn-aborted` tras la gracia (§1.3). Calibración (§10). */
   readonly postAbortMarginMs?: number;
   /**
-   * Caducidad de `waiting_human` en ms (§6, CONTEXT.md:39-40): el barrido T10
-   * recibe el corte `now - waitingHumanExpiryMs`, no `now`. Default 7 días.
+   * Duración de política de una espera humana en ms (§6, CONTEXT.md:39-40).
+   * El barrido T10 recibe `now` directamente (NO un corte por la duración de
+   * política) y la autoridad de expiración es `human_expires_at` POR FILA: el
+   * deadline se captura al crear la pausa (`now + expiryMs`), no se recalcula
+   * en el barrido. `waitingHumanExpiryMs` se conserva aunque hoy no tenga
+   * consumidor en el Loop: A07 lo inyecta en `TurnExecution` como el
+   * `expiryMs` de `pauseRunningForHuman`. Default 7 días.
    */
   readonly waitingHumanExpiryMs?: number;
   /** Reloj inyectable (§7.1). Default `Date.now`. */
@@ -146,6 +151,7 @@ export class AgendaLoop {
   private readonly tickIntervalMs: number;
   private readonly graceMs: number;
   private readonly postAbortMarginMs: number;
+  /** Duración de política de espera humana (A07 la consume en el camino de pausa, no el barrido). */
   private readonly waitingHumanExpiryMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
   private readonly cancel: (handle: TimerHandle) => void;
@@ -251,7 +257,9 @@ export class AgendaLoop {
   private sweepStep(): void {
     const now = this.now();
     this.safeRun("sweepChainDeadline", () => this.agenda.initiatives.sweepChainDeadline(now));
-    this.safeRun("sweepWaitingHumanExpiry", () => this.agenda.initiatives.sweepWaitingHumanExpiry(now - this.waitingHumanExpiryMs));
+    // P3.2: `human_expires_at` es la autoridad por fila; el Loop pasa `now`
+    // directamente y el repositorio compara `human_expires_at <= now`.
+    this.safeRun("sweepWaitingHumanExpiry", () => this.agenda.initiatives.sweepWaitingHumanExpiry(now));
   }
 
   /** Disparo de Triggers `schedule` vencidos (§3): una Initiative por Trigger. */
