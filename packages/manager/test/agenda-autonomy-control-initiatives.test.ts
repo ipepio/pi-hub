@@ -152,6 +152,7 @@ interface InitiativeRaw {
   bound_model: string | null;
   intent: string;
   finished_at: number | null;
+  human_request_id: string | null;
 }
 
 /** Fila cruda de `initiatives` para verificar el estado durable. */
@@ -161,15 +162,15 @@ function rowOf(db: SqliteDb, id: string): InitiativeRaw {
       `SELECT id, agent_name, state, turn_id, pending_human_input,
               human_response_idempotency_key, human_response_command_hash,
               available_at, state_changed_at, session_key, bound_model, intent,
-              finished_at
+              finished_at, human_request_id
          FROM initiatives WHERE id = ?`,
     )
     .get(id) as InitiativeRaw;
 }
 
-/** SHA-256 de la forma canónica de respuesta (mismo algoritmo que el repo, §2.3). */
-function respondHash(initiativeId: string, answer: string): string {
-  return createHash("sha256").update(JSON.stringify({ initiativeId, answer })).digest("hex");
+/** SHA-256 de la forma canónica de respuesta (mismo algoritmo que el repo, §2.3; P3.2 incluye humanRequestId). */
+function respondHash(initiativeId: string, answer: string, humanRequestId: string | null = null): string {
+  return createHash("sha256").update(JSON.stringify({ initiativeId, humanRequestId, answer })).digest("hex");
 }
 
 function isDomainError(code: string): (err: unknown) => boolean {
@@ -687,5 +688,61 @@ describe("AutonomyControl.respondToInitiative (P1.6, plan P1 §6.3)", () => {
     assert.deepEqual(snapshot.inbox.map(({ id }) => id), [], "respondida ya no está en el inbox");
     assert.deepEqual(snapshot.agenda.map(({ initiative }) => initiative.id), ["i-wh"]);
     assert.strictEqual(snapshot.agenda[0].initiative.pendingHumanInput, "sí", "la proyección interna conserva el pending (sin redactar)");
+  });
+});
+
+describe("AutonomyControl.respondToInitiative con expectedHumanRequestId (P3.2 B1)", () => {
+  it("B1: expectedHumanRequestId viejo no contesta la pregunta nueva (a través de Control)", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s" });
+    // La pregunta ACTUAL es req-2; el respondedor declara contestar req-1.
+    db.prepare(
+      `UPDATE initiatives
+          SET human_request_id = 'req-2', human_question = '¿pregunta 2?',
+              human_expires_at = ?
+        WHERE id = 'i-wh'`,
+    ).run(86_400_000 + 1000);
+    const ctl = control(db);
+
+    assert.throws(
+      () =>
+        ctl.respondToInitiative({
+          agentName: "alice",
+          initiativeId: "i-wh",
+          answer: "respuesta a la pregunta 1",
+          idempotencyKey: "k-late",
+          now: 2000,
+          expectedHumanRequestId: "req-1",
+        }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+
+    // La pregunta actual sigue intacta: ni estado ni request id cambiaron.
+    const row = rowOf(db, "i-wh");
+    assert.strictEqual(row.state, "waiting_human");
+    assert.strictEqual(row.human_request_id, "req-2");
+  });
+
+  it("B1: expectedHumanRequestId actual responde a través de Control", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, { id: "i-wh", state: "waiting_human", summary: "s" });
+    db.prepare(
+      `UPDATE initiatives
+          SET human_request_id = 'req-2', human_question = '¿pregunta 2?',
+              human_expires_at = ?
+        WHERE id = 'i-wh'`,
+    ).run(86_400_000 + 1000);
+    const ctl = control(db);
+
+    const result = ctl.respondToInitiative({
+      agentName: "alice",
+      initiativeId: "i-wh",
+      answer: "sí",
+      idempotencyKey: "k-2",
+      now: 2000,
+      expectedHumanRequestId: "req-2",
+    });
+    assert.strictEqual(result.replayed, false);
+    assert.strictEqual(result.initiative.state, "queued");
   });
 });

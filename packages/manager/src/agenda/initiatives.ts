@@ -70,6 +70,10 @@ export interface Initiative {
   readonly stateChangedAt: number;
   readonly startedAt: number | null;
   readonly finishedAt: number | null;
+  /** P3.2: pregunta, deadline y request ID de la espera humana actual. */
+  readonly humanQuestion: string | null;
+  readonly humanExpiresAt: number | null;
+  readonly humanRequestId: string | null;
 }
 
 /**
@@ -84,6 +88,14 @@ export interface RespondForAgentCommand {
   readonly answer: string;
   readonly idempotencyKey: string;
   readonly now: number;
+  /**
+   * P3.2/B1: request humano que el respondedor declara estar contestando.
+   * Cuando no es null, el CAS exige `human_request_id = expected`; un valor
+   * viejo no contesta la pregunta nueva. `null`/ausente = comportamiento
+   * actual (retrocompatible). A14 lo envía desde la delivery de Telegram;
+   * el panel (A11) lo envía con el `human_request_id` que muestra.
+   */
+  readonly expectedHumanRequestId?: string | null;
 }
 
 /**
@@ -95,12 +107,8 @@ export interface RespondForAgentResult {
   readonly replayed: boolean;
 }
 
-/**
- * SHA-256 de la forma canónica de la respuesta (plan P1 §2.3): hash sobre
- * `{initiativeId, answer}` — nunca sobre JSON bruto ni payload que se loguee.
- */
-function respondCommandHash(initiativeId: string, answer: string): string {
-  const canonical = JSON.stringify({ initiativeId, answer });
+function respondCommandHash(initiativeId: string, humanRequestId: string | null, answer: string): string {
+  const canonical = JSON.stringify({ initiativeId, humanRequestId, answer });
   return createHash("sha256").update(canonical).digest("hex");
 }
 
@@ -161,6 +169,10 @@ interface InitiativeRow {
   pending_human_input: string | null;
   human_response_idempotency_key: string | null;
   human_response_command_hash: string | null;
+  /** Columnas v2 de espera humana (P3.2): cuestión, deadline, request ID. */
+  human_question: string | null;
+  human_expires_at: number | null;
+  human_request_id: string | null;
 }
 
 const SELECT_INITIATIVE = `
@@ -169,7 +181,8 @@ const SELECT_INITIATIVE = `
          visible_effects_declared, summary, ask_correlation, failure_reason,
          result, created_at, state_changed_at, started_at, finished_at,
          pending_human_input, human_response_idempotency_key,
-         human_response_command_hash
+         human_response_command_hash,
+         human_question, human_expires_at, human_request_id
     FROM initiatives
 `;
 
@@ -191,6 +204,9 @@ function mapRow(row: InitiativeRow): Initiative {
     visibleEffectsDeclared: row.visible_effects_declared === 1,
     summary: row.summary,
     askCorrelation: row.ask_correlation,
+    humanQuestion: row.human_question,
+    humanExpiresAt: row.human_expires_at,
+    humanRequestId: row.human_request_id,
     failureReason: row.failure_reason,
     result: row.result,
     createdAt: row.created_at,
@@ -317,13 +333,17 @@ export class InitiativeRepository {
   }
 
   /**
-   * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
+   * Responde a una Initiative en `waiting_human` (plan P1 §6.3, P3.2): la vuelve a
    * `queued` con `available_at=state_changed_at=now`, deposita la `answer` en
    * `pending_human_input` y fija la key/hash de respuesta, todo en **una sola**
    * `BEGIN IMMEDIATE`. El Loop sigue siendo el dispatcher único: Control no
    * despacha nada y no se crea Conversation — la Initiative conserva su
    * `session_key`, `bound_model`, `intent`, pregunta/resumen/correlación y
    * deadline para historia.
+   *
+   * P3.2: el hash incluye `human_request_id` actual para que una respuesta a
+   * una pregunta vieja no conteste la nueva (caso real: preguntas dos veces
+   * seguidas y el dueño responde tarde a la primera).
    *
    * Idempotencia de respuesta (primera key gana):
    *
@@ -339,7 +359,7 @@ export class InitiativeRepository {
    *   `INITIATIVE_STATE_CONFLICT` y el ROLLBACK conserva el pending ganador.
    *
    * La `answer` no se loguea; el hash es sobre la forma canónica
-   * `{initiativeId, answer}`.
+   * `{initiativeId, humanRequestId, answer}`.
    */
   respondForAgent(command: RespondForAgentCommand): RespondForAgentResult {
     // Validación tipada antes de abrir tx (plan P1 §6.3): `answer` no vacía y
@@ -354,7 +374,6 @@ export class InitiativeRepository {
         `initiative ${command.id}: answer vacía o fuera del límite interno (§6.3)`,
       );
     }
-    const commandHash = respondCommandHash(command.id, command.answer);
     const db = this.sqlite;
     db.exec("BEGIN IMMEDIATE"); // paso 1
     try {
@@ -368,6 +387,9 @@ export class InitiativeRepository {
           `initiative ${command.id} del agent ${command.agentName} no existe`,
         );
       }
+      // P3.2: el hash incluye el `human_request_id` actual, para que una
+      // respuesta a una pregunta vieja no conteste la nueva.
+      const commandHash = respondCommandHash(command.id, row.human_request_id, command.answer);
       // Replay: la misma key de respuesta se absorbe sea cual sea el estado
       // actual — el claim ya pudo consumir el pending y dejar `running`.
       if (row.human_response_idempotency_key === command.idempotencyKey) {
@@ -396,17 +418,32 @@ export class InitiativeRepository {
           `initiative ${command.id}: reanudar waiting_human -> queued no es legal (§4.2)`,
         );
       }
-      // Paso 5: CAS agent-scoped; `session_key`, `bound_model`, `intent` y el
-      // resto de historia NO se tocan. El pending se deposita para que el
-      // siguiente claim lo despache, y key/hash persisten tras el claim para
-      // absorber el replay posterior.
+      // P3.2/B3: la guarda de deadline va DESPUÉS del short-circuit de replay
+      // (un replay idempotente de una respuesta ya aceptada no se ve afectado
+      // por el deadline: queda absorbido antes de esta guarda) y ANTES del CAS.
+      // En el límite exacto manda el deadline: `now >= human_expires_at`
+      // rechaza aunque el sweep no haya corrido — el respond no hace autoridad
+      // al tick, `human_expires_at` es la autoridad por fila. El sweep marca
+      // `expired`; el respond devuelve conflicto público.
+      if (row.human_expires_at !== null && command.now >= row.human_expires_at) {
+        throw new DomainError(
+          "INITIATIVE_STATE_CONFLICT",
+          `initiative ${command.id}: la espera humana caducó (human_expires_at=${row.human_expires_at}, now=${command.now})`,
+        );
+      }
+      // P3.2/B1: cuando el respondedor declara qué request humano contesta, el
+      // CAS lo exige explícitamente. El hash sigue dando idempotencia (rama de
+      // replay), pero deja de ser el sustituto del CAS: una answer de la
+      // pregunta anterior con key nueva ya no contesta la pregunta actual.
+      const expectedRequestClause =
+        command.expectedHumanRequestId != null ? " AND human_request_id = ?" : "";
       const result = db
         .prepare(
           `UPDATE initiatives
               SET state = 'queued', available_at = ?, state_changed_at = ?,
                   pending_human_input = ?, human_response_idempotency_key = ?,
                   human_response_command_hash = ?
-            WHERE id = ? AND agent_name = ? AND state = 'waiting_human'`,
+            WHERE id = ? AND agent_name = ? AND state = 'waiting_human'${expectedRequestClause}`,
         )
         .run(
           command.now,
@@ -416,11 +453,14 @@ export class InitiativeRepository {
           commandHash,
           command.id,
           command.agentName,
+          ...(command.expectedHumanRequestId != null ? [command.expectedHumanRequestId] : []),
         );
       if (Number(result.changes) !== 1) {
         throw new DomainError(
           "INITIATIVE_STATE_CONFLICT",
-          `initiative ${command.id}: el CAS de respuesta no cambió exactamente una fila (${String(result.changes)})`,
+          command.expectedHumanRequestId != null
+            ? `initiative ${command.id}: el human_request_id esperado ${command.expectedHumanRequestId} ya no es el actual — el CAS de respuesta no cambió exactamente una fila`
+            : `initiative ${command.id}: el CAS de respuesta no cambió exactamente una fila (${String(result.changes)})`,
         );
       }
       db.exec("COMMIT"); // paso 6
@@ -537,14 +577,18 @@ export class InitiativeRepository {
   }
 
   /**
-   * T10 (§6): caducidad de Agent Policy. Pasa a `expired` toda Initiative
-   * `waiting_human` cuyo `state_changed_at` venció. Devuelve el nº de filas.
+   * T10 (§6, P3.2): caducidad de Agent Policy. Pasa a `expired` toda Initiative
+   * `waiting_human` cuyo `human_expires_at` venció. Devuelve el nº de filas.
    *
-   * El parámetro **es el corte ya calculado**, no `now`: el caller le pasa
-   * `now - waitingHumanExpiryMs`. Como `state_changed_at` es el instante en
-   * que la Initiative ENTRÓ en `waiting_human` (siempre pasado), el `<=`
-   * implementa "lleva más de N sin respuesta". Pasar `now` aquí caducaba toda
-   * pregunta pendiente en el tick siguiente.
+   * P3.2: la autoridad pasa de `state_changed_at` a `human_expires_at` por fila.
+   * El parámetro **es `now`** (no `now - expiryMs`): el caller pasa el instante
+   * actual y la comparación usa `human_expires_at <= now`. Una fila con
+   * `human_expires_at IS NULL` **no caduca nunca** (backfill de la migración v2
+   * fija un deadline para las filas legacy; si una fila no tiene deadline, no
+   * se expira).
+   *
+   * Cambiar `PIHUB_WAITING_HUMAN_EXPIRY_MS` después de crear una espera **no
+   * mueve** su deadline: el plazo se capturó por fila al pausar.
    *
    * El `WHERE state IN (...)` se deriva de `legalSourcesFor('expired')` — solo
    * `waiting_human` caduca (`CONTEXT.md:40`); de nuevo, la función pura
@@ -561,7 +605,8 @@ export class InitiativeRepository {
           `UPDATE initiatives
               SET state = 'expired', finished_at = ?, state_changed_at = ?
             WHERE state IN (${placeholders})
-              AND state_changed_at <= ?`,
+              AND human_expires_at IS NOT NULL
+              AND human_expires_at <= ?`,
         )
         .run(now, now, ...from, now);
       db.exec("COMMIT");

@@ -91,6 +91,8 @@ export interface RespondInitiativeCommand {
   readonly answer: string;
   readonly idempotencyKey: string;
   readonly now: number;
+  /** P3.2/B1: request humano que el respondedor declara contestar (opcional). */
+  readonly expectedHumanRequestId?: string | null;
 }
 
 /**
@@ -227,6 +229,7 @@ export class AutonomyControl {
       answer: command.answer,
       idempotencyKey: command.idempotencyKey,
       now: command.now,
+      expectedHumanRequestId: command.expectedHumanRequestId,
     });
   }
 }

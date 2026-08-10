@@ -265,6 +265,10 @@ export const createTriggerBodySchema = z
 export const respondBodySchema = z
   .object({
     answer: z.string().min(1).max(MAX_HUMAN_ANSWER_LENGTH),
+    // P3.2/B1: OPCIONAL y aditivo (no rompe el contrato congelado). Ausente o
+    // null = comportamiento actual; el panel (A11) lo envía con el
+    // `human_request_id` que muestra y el Manager lo exige solo cuando viene.
+    expectedHumanRequestId: z.string().nullable().optional(),
   })
   .strict();
 
@@ -644,7 +648,7 @@ async function handleRespondInitiative(c: Context<AuthEnv>, deps: AutonomyRouteD
     if (!parsed.success) {
       return fail(c, "BAD_REQUEST", "Invalid respond payload");
     }
-    const { answer } = parsed.data;
+    const { answer, expectedHumanRequestId } = parsed.data;
     const now = deps.now();
     try {
       const result = deps.control.respondToInitiative({
@@ -653,6 +657,7 @@ async function handleRespondInitiative(c: Context<AuthEnv>, deps: AutonomyRouteD
         answer,
         idempotencyKey: idempotencyKey.trim(),
         now,
+        expectedHumanRequestId: expectedHumanRequestId ?? null,
       });
       const presenter = presenterFor(c);
       const publicResult = presenter.presentRespondInitiativeResult(result);

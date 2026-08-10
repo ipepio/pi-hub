@@ -18,6 +18,7 @@
 
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { SqliteDb } from "../src/storage/sqlite.ts";
 import { runMigrations } from "../src/storage/migrations.ts";
@@ -73,6 +74,12 @@ interface InsertInit {
   state_changed_at?: number;
   started_at?: number | null;
   finished_at?: number | null;
+  human_expires_at?: number | null;
+  human_question?: string | null;
+  human_request_id?: string | null;
+  pending_human_input?: string | null;
+  human_response_idempotency_key?: string | null;
+  human_response_command_hash?: string | null;
 }
 
 /** Siembra una fila `initiatives` (setup de fixture, no comportamiento bajo prueba). */
@@ -100,20 +107,32 @@ function insertInitiative(db: SqliteDb, init: InsertInit): void {
     state_changed_at: init.state_changed_at ?? 1000,
     started_at: init.started_at ?? null,
     finished_at: init.finished_at ?? null,
+    human_expires_at: init.human_expires_at ?? null,
+    human_question: init.human_question ?? null,
+    human_request_id: init.human_request_id ?? null,
+    pending_human_input: init.pending_human_input ?? null,
+    human_response_idempotency_key: init.human_response_idempotency_key ?? null,
+    human_response_command_hash: init.human_response_command_hash ?? null,
   };
   db.prepare(
     `INSERT INTO initiatives
        (id, agent_name, state, origin, trigger_id, intent, mode, session_key,
         available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
         visible_effects_declared, summary, ask_correlation, failure_reason,
-        result, created_at, state_changed_at, started_at, finished_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        result, created_at, state_changed_at, started_at, finished_at,
+        human_expires_at, human_question, human_request_id,
+        pending_human_input, human_response_idempotency_key,
+        human_response_command_hash)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     row.id, row.agent_name, row.state, row.origin, row.trigger_id, row.intent,
     row.mode, row.session_key, row.available_at, row.bound_model, row.turn_id,
     row.chain_depth, row.chain_deadline_at, row.visible_effects_declared,
     row.summary, row.ask_correlation, row.failure_reason, row.result,
     row.created_at, row.state_changed_at, row.started_at, row.finished_at,
+    row.human_expires_at, row.human_question, row.human_request_id,
+    row.pending_human_input, row.human_response_idempotency_key,
+    row.human_response_command_hash,
   );
 }
 
@@ -411,13 +430,14 @@ describe("initiatives.ts — barridos T9/T10 (función pura en lote, §5.2)", ()
     assert.equal(repo.get("s-term").state, "succeeded");
   });
 
-  it("sweepWaitingHumanExpiry (T10): solo waiting_human con state_changed_at vencido caduca", () => {
+  it("sweepWaitingHumanExpiry (T10): solo waiting_human con human_expires_at vencido caduca", () => {
     const db = openMemoryDb();
     const repo = new InitiativeRepository(db);
-    insertInitiative(db, { id: "wh-old", state: "waiting_human", summary: "s", state_changed_at: 100 });
-    insertInitiative(db, { id: "wh-fresh", state: "waiting_human", summary: "s", state_changed_at: 9999 });
-    insertInitiative(db, { id: "q-old", state: "queued", state_changed_at: 100 }); // queued no caduca (CONTEXT.md:40)
-    insertInitiative(db, { id: "wa-old", state: "waiting_agent", chain_deadline_at: 9999, state_changed_at: 100 }); // waiting_agent tampoco
+    insertInitiative(db, { id: "wh-old", state: "waiting_human", summary: "s", human_expires_at: 100 });
+    insertInitiative(db, { id: "wh-fresh", state: "waiting_human", summary: "s", human_expires_at: 9999 });
+    insertInitiative(db, { id: "wh-no-deadline", state: "waiting_human", summary: "s", human_expires_at: null });
+    insertInitiative(db, { id: "q-old", state: "queued", human_expires_at: 100 }); // queued no caduca (CONTEXT.md:40)
+    insertInitiative(db, { id: "wa-old", state: "waiting_agent", chain_deadline_at: 9999, human_expires_at: 100 }); // waiting_agent tampoco
     const n = repo.sweepWaitingHumanExpiry(500);
     assert.equal(n, 1);
     const expired = repo.get("wh-old");
@@ -425,45 +445,46 @@ describe("initiatives.ts — barridos T9/T10 (función pura en lote, §5.2)", ()
     assert.equal(expired.finishedAt, 500);
     assert.equal(expired.summary, "s"); // decisión 7: conserva summary
     assert.equal(repo.get("wh-fresh").state, "waiting_human");
+    assert.equal(repo.get("wh-no-deadline").state, "waiting_human"); // sin deadline nunca caduca
     assert.equal(repo.get("q-old").state, "queued");
     assert.equal(repo.get("wa-old").state, "waiting_agent");
   });
 
   const DAY_MS = 86_400_000;
 
-  it("sweepWaitingHumanExpiry (T10): con el default de 7 días, una pregunta de hace 1 minuto NO caduca", () => {
+  it("sweepWaitingHumanExpiry (T10): el parámetro es `now`; human_expires_at es la autoridad por fila", () => {
     const db = openMemoryDb();
     const repo = new InitiativeRepository(db);
     const now = 100_000_000;
+    // Pregunta de hace 1 minuto con deadline lejano: no caduca.
     insertInitiative(db, {
-      id: "wh-min",
+      id: "wh-future",
       state: "waiting_human",
       summary: "s",
-      state_changed_at: now - 60_000,
+      human_expires_at: now + 86_400_000, // expira mañana
     });
-    // El corte es `now - 7 días`: el parámetro NO es `now` (pasar `now` aquí
-    // caducaba toda pregunta pendiente en el tick siguiente).
-    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
-    assert.equal(n, 0);
-    assert.equal(repo.get("wh-min").state, "waiting_human");
-  });
-
-  it("sweepWaitingHumanExpiry (T10): 8 días sin respuesta sí caduca con el default de 7 días", () => {
-    const db = openMemoryDb();
-    const repo = new InitiativeRepository(db);
-    const now = 100_000_000;
+    // Pregunta con deadline ya vencido: caduca.
     insertInitiative(db, {
-      id: "wh-8d",
+      id: "wh-expired",
       state: "waiting_human",
       summary: "s",
-      state_changed_at: now - 8 * DAY_MS,
+      human_expires_at: now - 1,
     });
-    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
+    // Pregunta sin deadline: nunca caduca.
+    insertInitiative(db, {
+      id: "wh-no-deadline",
+      state: "waiting_human",
+      summary: "s",
+      human_expires_at: null,
+    });
+    const n = repo.sweepWaitingHumanExpiry(now);
     assert.equal(n, 1);
-    assert.equal(repo.get("wh-8d").state, "expired");
+    assert.equal(repo.get("wh-future").state, "waiting_human");
+    assert.equal(repo.get("wh-expired").state, "expired");
+    assert.equal(repo.get("wh-no-deadline").state, "waiting_human");
   });
 
-  it("sweepWaitingHumanExpiry (T10): justo en el borde (exactamente 7 días) caduca, coherente con el <=", () => {
+  it("sweepWaitingHumanExpiry (T10): justo en el borde (human_expires_at == now) caduca, coherente con el <=", () => {
     const db = openMemoryDb();
     const repo = new InitiativeRepository(db);
     const now = 100_000_000;
@@ -471,20 +492,202 @@ describe("initiatives.ts — barridos T9/T10 (función pura en lote, §5.2)", ()
       id: "wh-edge",
       state: "waiting_human",
       summary: "s",
-      state_changed_at: now - 7 * DAY_MS,
+      human_expires_at: now,
     });
-    const n = repo.sweepWaitingHumanExpiry(now - 7 * DAY_MS);
+    const n = repo.sweepWaitingHumanExpiry(now);
     assert.equal(n, 1);
     assert.equal(repo.get("wh-edge").state, "expired");
+  });
+
+  it("sweepWaitingHumanExpiry (T10): cambiar env después de crear la espera no mueve su deadline", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const now = 100_000_000;
+    // Fila con deadline capturado por fila: 7 días desde su creación.
+    insertInitiative(db, {
+      id: "wh-fixed",
+      state: "waiting_human",
+      summary: "s",
+      human_expires_at: now + 7 * DAY_MS,
+    });
+    // Pasar un `now` muy lejano (simula cambiar el env a 1 día) no mueve el deadline de la fila.
+    const n = repo.sweepWaitingHumanExpiry(now + 2 * DAY_MS);
+    assert.equal(n, 0);
+    assert.equal(repo.get("wh-fixed").state, "waiting_human");
   });
 
   it("los barridos no dejan la base en transacción abierta: un transition posterior funciona", () => {
     const db = openMemoryDb();
     const repo = new InitiativeRepository(db);
-    insertInitiative(db, { id: "wh-old", state: "waiting_human", summary: "s", state_changed_at: 100 });
+    insertInitiative(db, { id: "wh-old", state: "waiting_human", summary: "s", human_expires_at: 100 });
     repo.sweepWaitingHumanExpiry(500);
     insertInitiative(db, { id: "fresh", state: "waiting_human", summary: "s", state_changed_at: 9999 });
     const after = repo.transition({ id: "fresh", from: "waiting_human", to: "queued", now: 6000, availableAt: 6100 });
     assert.equal(after.state, "queued");
+  });
+});
+
+describe("initiatives.ts — respondForAgent: expectedHumanRequestId y deadline (P3.2 B1/B3)", () => {
+  const DAY_MS = 86_400_000;
+
+  /** Hash canónico de una respuesta aceptada (misma forma que `respondCommandHash`). */
+  function respondHash(initiativeId: string, humanRequestId: string | null, answer: string): string {
+    return createHash("sha256")
+      .update(JSON.stringify({ initiativeId, humanRequestId, answer }))
+      .digest("hex");
+  }
+
+  function pendingInputOf(db: SqliteDb, id: string): string | null {
+    const row = db
+      .prepare("SELECT pending_human_input FROM initiatives WHERE id = ?")
+      .get(id) as { pending_human_input: string | null } | undefined;
+    return row?.pending_human_input ?? null;
+  }
+
+  it("B1: expectedHumanRequestId viejo no responde la pregunta nueva (mismatch → INITIATIVE_STATE_CONFLICT)", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta 2?", human_request_id: "req-2",
+      human_expires_at: 100_000 + DAY_MS,
+    });
+
+    // El respondedor declara contestar req-1 (pregunta VIEJA) con key nueva.
+    assert.throws(
+      () =>
+        repo.respondForAgent({
+          id: "i-wh", agentName: "alice", answer: "respuesta a la pregunta 1",
+          idempotencyKey: "k-late", now: 100_000, expectedHumanRequestId: "req-1",
+        }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+
+    // La pregunta actual queda intacta: nada se contestó ni se escribió.
+    const after = repo.get("i-wh");
+    assert.equal(after.state, "waiting_human");
+    assert.equal(after.humanRequestId, "req-2");
+    assert.equal(pendingInputOf(db, "i-wh"), null);
+  });
+
+  it("B1: expectedHumanRequestId actual responde (queued con pending)", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta 2?", human_request_id: "req-2",
+      human_expires_at: 100_000 + DAY_MS,
+    });
+
+    const result = repo.respondForAgent({
+      id: "i-wh", agentName: "alice", answer: "sí",
+      idempotencyKey: "k-2", now: 101_000, expectedHumanRequestId: "req-2",
+    });
+    assert.equal(result.replayed, false);
+    assert.equal(result.initiative.state, "queued");
+    assert.equal(pendingInputOf(db, "i-wh"), "sí");
+  });
+
+  it("B1: expectedHumanRequestId ausente o null conserva el comportamiento actual (retrocompatible)", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta?", human_request_id: "req-2",
+      human_expires_at: 100_000 + DAY_MS,
+    });
+
+    const result = repo.respondForAgent({
+      id: "i-wh", agentName: "alice", answer: "sí",
+      idempotencyKey: "k-0", now: 101_000, expectedHumanRequestId: null,
+    });
+    assert.equal(result.replayed, false);
+    assert.equal(result.initiative.state, "queued");
+  });
+
+  it("B3: responder justo antes del deadline (now = expiresAt - 1) responde", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const deadline = 100_000 + DAY_MS;
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta?", human_request_id: "req-1",
+      human_expires_at: deadline,
+    });
+
+    const result = repo.respondForAgent({
+      id: "i-wh", agentName: "alice", answer: "a tiempo",
+      idempotencyKey: "k-1", now: deadline - 1,
+    });
+    assert.equal(result.replayed, false);
+    assert.equal(result.initiative.state, "queued");
+  });
+
+  it("B3: responder en el límite exacto (now == expiresAt) NO responde", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const deadline = 100_000 + DAY_MS;
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta?", human_request_id: "req-1",
+      human_expires_at: deadline,
+    });
+
+    assert.throws(
+      () =>
+        repo.respondForAgent({
+          id: "i-wh", agentName: "alice", answer: "en el límite",
+          idempotencyKey: "k-1", now: deadline,
+        }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+    assert.equal(repo.get("i-wh").state, "waiting_human");
+  });
+
+  it("B3: responder después del deadline (now > expiresAt) NO responde aunque el sweep no corra", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const deadline = 100_000 + DAY_MS;
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta?", human_request_id: "req-1",
+      human_expires_at: deadline,
+    });
+
+    assert.throws(
+      () =>
+        repo.respondForAgent({
+          id: "i-wh", agentName: "alice", answer: "tarde",
+          idempotencyKey: "k-1", now: deadline + 1,
+        }),
+      isDomainError("INITIATIVE_STATE_CONFLICT"),
+    );
+    // Nada se escribió: la fila sigue waiting_human (el sweep la marcará expired).
+    assert.equal(repo.get("i-wh").state, "waiting_human");
+  });
+
+  it("B3: un replay con la misma key y mismo hash de una respuesta ya aceptada sigue siendo éxito idempotente aunque el deadline haya pasado", () => {
+    const db = openMemoryDb();
+    const repo = new InitiativeRepository(db);
+    const deadline = 100_000;
+    const hash = respondHash("i-wh", "req-1", "respuesta");
+    insertInitiative(db, {
+      id: "i-wh", state: "waiting_human", summary: "s",
+      human_question: "¿pregunta?", human_request_id: "req-1",
+      human_expires_at: deadline,
+      pending_human_input: "respuesta",
+      human_response_idempotency_key: "k-1",
+      human_response_command_hash: hash,
+    });
+
+    // El deadline ya pasó, pero es la MISMA key+hash de la respuesta ya
+    // aceptada: la rama de replay se absorbe ANTES de la guarda de deadline.
+    const result = repo.respondForAgent({
+      id: "i-wh", agentName: "alice", answer: "respuesta",
+      idempotencyKey: "k-1", now: deadline + 1000,
+    });
+    assert.equal(result.replayed, true);
+    // No se reencola ni toca disco: la fila sigue waiting_human.
+    assert.equal(repo.get("i-wh").state, "waiting_human");
   });
 });
