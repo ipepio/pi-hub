@@ -5,6 +5,94 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-08-10
+
+### Added
+
+- **Autonomía visible por API y panel** (`1615683`, `068d2cc`, `58416c0`,
+  `7bface2`, `85baffb`): la Agenda se lee como un único snapshot coherente por
+  Agent; los Triggers pueden crearse (solo schedules `version: 2` en hora
+  civil) y revocarse conservando su histórico; una Initiative puede cancelarse
+  sin mentir sobre su estado; y una respuesta humana la vuelve a poner a
+  trabajar conservando la sesión. El consumo de la respuesta ocurre en la misma
+  transacción que reclama el turno: la entrega es at-least-once, una respuesta
+  a mitad de carrera no se pierde en silencio.
+- **API de autonomía sobre `/api/v1`** (`8c8a179`, `30b1617`): primeros
+  endpoints que exponen la Agenda de un Agent y permiten cancelar o responder
+  una Initiative desde fuera; una lectura sirve un snapshot de una sola
+  proyección y cancelar algo en running responde 202, porque el terminal lo
+  escribe quien cierra el turno. La admisión de runtime queda con rutas, schema
+  y envelope congelados pero sin comportamiento (503) hasta que exista su
+  adaptador.
+- **Panel de autonomía** (`7d8e991`, `67e2a89`): el panel habla los mismos
+  endpoints `/api/v1` con wrappers finos, y una pestaña Autonomy muestra cola,
+  vuelo, histórico, Triggers y preguntas pendientes, con acciones de crear
+  schedule, revocar, cancelar y responder. Las idempotency keys viajan como
+  header y las aporta el llamador, nunca el cliente.
+- **Presentador y documentación de la autonomía** (`b566749`, `8640df3`): los
+  shapes públicos se construyen campo a campo desde una allowlist y los
+  resultados de ejecución no se publican; la API queda documentada con rutas,
+  DTOs, catálogo de errores y autenticación por modo de despliegue, incluyendo
+  lo que aún no es real (la admisión responde 503).
+- **Protocolo ask_human** (`cd9b924`, `63a7c57`): un turno sabe si viene de una
+  Initiative y solo esas sesiones reciben la herramienta reservada `ask_human`;
+  un manager que habla el protocolo rehúsa despachar trabajo autónomo a un
+  runner que no puede pausar, y la pregunta y su resumen viajan hasta el fin de
+  la ejecución de la herramienta.
+- **Pausa por input humano (P3.2)** (`c62dc08`, `25c90af`, `ba250bd`,
+  `876fffd`, `f01a465`): `pauseRunningForHuman` valida cotas, IDs y overflow
+  antes de abrir la transacción; `human_expires_at` pasa a ser por fila y el
+  Loop entrega `now` al barrido; el repositorio de human requests se cierra
+  hacia delante; el CAS de respuesta impone el id de la petición y su plazo; y
+  los tests prueban el rollback a medias con un disparador `BEFORE UPDATE`.
+- **`waiting_human` como terminal durable (P3.3)** (`df75a14`, `b2aafad`):
+  `human_input_required` se convierte en el terminal que sobrevive al reinicio
+  y una Initiative en espera libera el slot del Loop sin un terminal público.
+- **Entrega al canal primario de Telegram (P3.4)** (`c1d57d2`, `6ca4dbd`,
+  `48c0c1c`, `9edfd5b`): se parsea y valida
+  `PIHUB_TELEGRAM_PRIMARY_CHAT_ID`; el manager entrega la pregunta al chat
+  primario; la proyección expone el estado de la notificación sin filtrar
+  coordenadas de entrega; y el envío es fire-and-forget tras la pausa.
+- **Respuestas de Telegram por ruta interna (P3.5)** (`5be15f5`, `a01326e`,
+  `54d826d`): cada spawn recibe un token de callback con ámbito de Agent, el
+  manager acepta las respuestas del runner por una ruta scoped interna y el
+  runner deja de perder los updates pendientes.
+- **Reanudación tras reinicio (P3.6)** (`f4890ff`, `7d2fdc8`): el runner
+  retoma la última sesión de un hub con clave tras reiniciar y se prueba que
+  una petición en `waiting_human` sobrevive al reinicio con la misma sesión.
+- **Viaje P3 documentado y probado (P3.7)** (`877e7ce`, `ee5d76a`): el journey
+  de trigger a terminal con variantes panel y Telegram queda cubierto por
+  tests, y se documenta `ask_human`, el canal primario y la ruta interna de
+  respuesta.
+- **Agenda migrada a schema 2 (SQLite)** (`4839671`): nuevas columnas para
+  idempotency, la pregunta humana y su plazo, correlación de entrega de
+  Telegram y admisión de runtime, casi todas dormidas; las filas existentes
+  sobreviven y la migración commitea DDL y `user_version` en una transacción.
+- **La versión reportada es la real** (`16c5bc0`): `/health` y `/status` dejan
+  de arrastrar la constante 0.8.0 y reportan la versión del paquete.
+
+### Changed
+
+- **Compatibilidad `/api/v1`: sigue v1** (`8640df3`): la superficie de
+  autonomía es aditiva sobre la versión vigente y el contrato de éxito no
+  cambia; los viajes governed y self-governed quedan cubiertos por contrato y
+  una mutación hecha con una credencial es visible con la otra.
+- **Allowlist de Telegram propagada al runner** (`6e92659`): la variable se
+  recortaba con el prefijo `PIHUB_*` y siempre llegaba vacía (="permitir a
+  cualquiera"); ahora se pasa explícitamente al runner y el arranque avisa si
+  no hay allowlist configurada.
+
+### Fixed
+
+- **Las preguntas humanas expiraban al siguiente tick** (`359f708`): el
+  barrido usaba `now` como corte y `state_changed_at` siempre está en el
+  pasado; el corte pasa a ser `human_expires_at` por fila y
+  `waitingHumanExpiryMs` se conserva.
+- **Una cookie vieja seguía abriendo un runtime que cambió de manos**
+  (`4280119`): la ruta de sesión del panel solo se monta si el panel existe,
+  un runtime governed responde 404 e emite sin cookie, y una cookie de panel
+  se rechaza en todo `/api/v1` en vez de ruta por ruta.
+
 ## [0.9.0] — 2026-08-06
 
 ### Added
