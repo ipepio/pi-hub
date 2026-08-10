@@ -9,7 +9,12 @@ import {
 import { TriggerRepository, type DueScheduleTrigger, type Trigger } from "./triggers.ts";
 import { CallbackRepository } from "./callbacks.ts";
 import { TurnRepository, type ReserveResult, type TurnFinalState, type FailureCause } from "./turns.ts";
-import { HumanRequestRepository, type HumanRequest, type PauseRunningForHumanCommand } from "./human-requests.ts";
+import {
+  HumanRequestDeliveriesRepository,
+  HumanRequestRepository,
+  type HumanRequest,
+  type PauseRunningForHumanCommand,
+} from "./human-requests.ts";
 import { sqliteErrcode } from "./turns.ts";
 import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
@@ -86,6 +91,8 @@ export class AgendaRepository {
   readonly turns: TurnRepository;
   /** Repositorio de pausa humana (P3.2): `pauseRunningForHuman` atómica. */
   readonly humanRequests: HumanRequestRepository;
+  /** Entregas del Primary Channel (P3.4): reserva pending y correlación Telegram. */
+  readonly humanRequestDeliveries: HumanRequestDeliveriesRepository;
 
   /**
    * Proyección de Autonomy (P1.2): la lectura única de la Agenda que
@@ -104,6 +111,7 @@ export class AgendaRepository {
     this.callbacks = new CallbackRepository(sqlite, this.initiatives);
     this.turns = new TurnRepository(sqlite);
     this.humanRequests = new HumanRequestRepository(sqlite);
+    this.humanRequestDeliveries = new HumanRequestDeliveriesRepository(sqlite);
     this.projection = new AutonomyProjection(sqlite, {
       historyLimit: options?.autonomyHistoryLimit ?? DEFAULT_HISTORY_LIMIT,
     });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { serve } from "@hono/node-server";
-import { loadEnv } from "@pihub/shared";
+import { isValidAgentName, loadEnv, readAgent } from "@pihub/shared";
 import { bootstrap } from "./bootstrap.js";
 import { provisionAgents } from "./provision.js";
 import { createApi } from "./api.js";
@@ -14,8 +14,33 @@ import { AgendaLoop } from "./agenda/loop.js";
 import { TurnExecution } from "./agenda/turn-execution.js";
 import type { EffectiveTriggerAuthority } from "./agenda/triggers.js";
 import { AutonomyControl } from "./agenda/autonomy-control.js";
+import {
+  HumanRequestDelivery,
+  type TelegramBotClient,
+} from "./primary-channel/human-request-delivery.js";
 
 const env = loadEnv();
+
+/** Cliente HTTP real; `HumanRequestDelivery` conserva este efecto inyectable. */
+const telegramBotClient: TelegramBotClient = {
+  async sendMessage(token, params) {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    if (!response.ok) throw response;
+
+    const payload = await response.json() as {
+      ok?: unknown;
+      result?: { message_id?: unknown };
+    };
+    if (payload.ok !== true || !Number.isSafeInteger(payload.result?.message_id)) {
+      throw new SyntaxError("Telegram Bot API devolvió una respuesta inválida");
+    }
+    return { message_id: payload.result!.message_id as number };
+  },
+};
 
 // P1.4 (§5): la autoridad efectiva se deriva **una vez** del modo
 // (`panelEnabled`), nunca de la credencial del request: un Bearer usado por el
@@ -51,18 +76,38 @@ const runtime = await runStartup(
     // terminal de Initiative escriba `turns.complete` con su causa (§4.6).
     // Fase 3.7 (§9.7): el watchdog de apertura/silencio se lee de env — en
     // producción el default es real y NO cero (`0` significaría desactivado).
-    createTurns: ({ store }) =>
-      new TurnExecution({
+    createTurns: ({ store }) => {
+      // [ÁRBITRO-1]: sin panel o chat privado primario no se compone ningún
+      // delivery. El panel sigue mostrando la espera y Telegram recibe cero
+      // llamadas (fail-closed).
+      const delivery = env.panelEnabled && env.telegramPrimaryChatId !== undefined
+        ? new HumanRequestDelivery({
+            client: telegramBotClient,
+            deliveries: store.agenda.humanRequestDeliveries,
+            primaryChatId: env.telegramPrimaryChatId,
+            agentConfigFor: async (agentName) => {
+              if (!isValidAgentName(agentName)) return null;
+              const config = await readAgent(env.dataDir, agentName);
+              return config?.name === agentName ? config : null;
+            },
+          })
+        : undefined;
+
+      return new TurnExecution({
         apiToken: env.apiToken,
         repository: store.agenda.turns,
         humanRequests: store.agenda.humanRequests,
         now: () => Date.now(),
         requestId: () => randomUUID(),
         expiryMs: env.waitingHumanExpiryMs,
-        // A12 sustituye este no-op por HumanRequestDelivery fire-and-forget.
-        onHumanRequest: () => {},
+        onHumanRequest: delivery
+          ? (request) => {
+              void delivery.deliver(request);
+            }
+          : undefined,
         dispatchTimeoutMs: env.turnDispatchTimeoutMs,
-      }),
+      });
+    },
     createOAuth: (providers) => new OAuthService(providers),
     createApp: ({ supervisor, oauth, providers, turns, store }) => {
       // P2.3: construir el AutonomyControl real con el store y turns compartidos.

@@ -39,6 +39,7 @@ import type {
   HumanRequest,
   PauseRunningForHumanCommand,
 } from "../src/agenda/human-requests.ts";
+import { HumanRequestDelivery } from "../src/primary-channel/human-request-delivery.ts";
 import { createApiV1Router } from "../dist/api-v1/routes.js";
 import type { Supervisor } from "../src/supervisor.ts";
 
@@ -1086,6 +1087,106 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
       toolCallId: "tool-ask-1",
       expiresAt: 62_000,
     }]);
+  });
+
+  it("a blocked HumanRequestDelivery starts after the pause without settling completion", async () => {
+    const db = openMemoryDb();
+    const agenda = new AgendaRepository(db);
+    agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-real-delivery", 1000);
+    insertRunningInitiative(db, "ini-real-delivery", "agent", TURN_ID);
+
+    const runner = await startRunner((socket) => {
+      socket.on("message", (raw) => {
+        const message = JSON.parse(String(raw)) as { type?: string };
+        if (message.type === "prompt") {
+          socket.send(JSON.stringify({ type: "agent_start" }));
+          socket.send(JSON.stringify({
+            type: "human_input_required",
+            question: "¿Entrego la solicitud?",
+            summary: "El Primary Channel está bloqueado",
+            toolCallId: "tool-real-delivery",
+          }));
+        }
+      });
+    }, ["ask_human_v1"]);
+
+    let sent: { token: string; chatId: number; text: string } | undefined;
+    const blockedBotApi = new Promise<{ message_id: number }>(() => {});
+    const delivery = new HumanRequestDelivery({
+      client: {
+        sendMessage(token, params) {
+          sent = { token, chatId: params.chat_id, text: params.text };
+          return blockedBotApi;
+        },
+      },
+      agentConfigFor: async (agentName) => ({
+        name: agentName,
+        port: 4100,
+        enabled: true,
+        createdAt: "2026-08-10T00:00:00.000Z",
+        telegramToken: "agent-scoped-token",
+      }),
+      deliveries: agenda.humanRequestDeliveries,
+      primaryChatId: 123,
+      now: () => 2001,
+    });
+    const turns = new TurnExecution({
+      apiToken: "service-token",
+      repository: agenda.turns,
+      humanRequests: agenda.humanRequests,
+      now: () => 2000,
+      requestId: () => "request-real-delivery",
+      expiryMs: 60_000,
+      onHumanRequest: (request) => {
+        void delivery.deliver(request);
+      },
+    });
+    const handle = turns.startTurn(command({
+      idempotencyKey: "idem-real-delivery",
+      runnerPort: runner.port,
+      origin: { kind: "initiative", initiativeId: "ini-real-delivery", cause: "trigger" },
+    }));
+
+    let completionSettled = false;
+    void handle.completion.then(() => { completionSettled = true; });
+    assert.deepEqual(await handle.waitingHuman, {
+      initiativeId: "ini-real-delivery",
+      requestId: "request-real-delivery",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(turns.hasLiveTurnForAgent("agent"), false, "el slot se libera antes de Telegram");
+    assert.equal(completionSettled, false, "delivery no forma parte de completion");
+    assert.deepEqual(sent, {
+      token: "agent-scoped-token",
+      chatId: 123,
+      text: [
+        "❓ Pregunta para ti",
+        "",
+        "¿Entrego la solicitud?",
+        "",
+        "Contexto: El Primary Channel está bloqueado",
+        "",
+        "Responde antes de 1970-01-01T00:01:02.000Z",
+      ].join("\n"),
+    });
+    assert.deepEqual(
+      agenda.humanRequestDeliveries.lookupDelivery(
+        "agent",
+        "telegram",
+        "123",
+        "pending:request-real-delivery",
+      ),
+      {
+        humanRequestId: "request-real-delivery",
+        agentName: "agent",
+        initiativeId: "ini-real-delivery",
+        channel: "telegram",
+        externalChatId: "123",
+        externalMessageId: "pending:request-real-delivery",
+        createdAt: 2001,
+      },
+    );
   });
 
   it("pauseRunningForHuman failure resolves neither channel nor releases the slot", async () => {

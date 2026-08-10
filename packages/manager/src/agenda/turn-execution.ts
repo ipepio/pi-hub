@@ -420,23 +420,22 @@ export class TurnExecution {
         return;
       }
 
-      // Orden cerrado P3.3: COMMIT (arriba) → liberar vivo → canal interno →
-      // cerrar WS → entrega fire-and-forget. No emitir SSE ni llamar T6: la
-      // pausa durable ya escribió `paused_for_human` y `waiting_human`.
+      // Orden cerrado P3.3/P3.4: COMMIT (arriba) → liberar vivo → canal
+      // interno → cerrar WS → entrega fire-and-forget. No emitir SSE ni llamar
+      // T6: la pausa durable ya escribió `paused_for_human` y `waiting_human`.
       cerrado = true;
       cancelarTimeout();
       cancelarHandshakeTimeout();
       this.turnosVivos.delete(clave);
       resolveWaitingHuman?.({ initiativeId: request.initiativeId, requestId: request.requestId });
       cerrarSocket();
-      queueMicrotask(() => {
-        try {
-          this.onHumanRequest?.(request);
-        } catch {
-          // El callback no puede devolver la pausa a running ni filtrar su payload.
+      void Promise.resolve()
+        .then(() => this.onHumanRequest?.(request))
+        .catch(() => {
+          // Ni un throw síncrono ni una Promise devuelta por error puede
+          // devolver la pausa a running, bloquear el dial o quedar unhandled.
           console.error(`[pihub] HUMAN_REQUEST_CALLBACK_FAILED ${clave}`);
-        }
-      });
+        });
     };
 
     let handshakeDone = false;
