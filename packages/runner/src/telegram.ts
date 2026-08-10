@@ -1,4 +1,10 @@
-import { Bot, InputFile, type Context } from "grammy";
+import {
+  Bot,
+  InputFile,
+  type Context,
+  type Filter,
+  type MiddlewareFn,
+} from "grammy";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, PihubEnv } from "@pihub/shared";
 import type { SessionFactory } from "./session.js";
@@ -6,6 +12,37 @@ import { speakable, sttEnabled, synthesize, transcribe, ttsEnabled } from "./spe
 
 const EDIT_INTERVAL_MS = 2500;
 const TG_LIMIT = 4096;
+export const CALLBACK_TIMEOUT_MS = 5_000;
+
+const CALLBACK_ERROR_MESSAGE = "No pude entregar la respuesta. Reinténtalo o usa el panel.";
+const CALLBACK_RESPONSE_MESSAGES = {
+  accepted: "Respuesta recibida.",
+  replayed: "Respuesta ya recibida.",
+  already_handled: "Esta solicitud ya fue respondida.",
+  expired: "Esta solicitud ha caducado; usa el panel.",
+} as const;
+
+type HandledTelegramReplyStatus = keyof typeof CALLBACK_RESPONSE_MESSAGES;
+type TelegramReplyStatus = HandledTelegramReplyStatus | "unknown";
+type TelegramTextContext = Filter<Context, "message:text">;
+
+export interface TelegramHumanReplyDependencies {
+  fetch: typeof globalThis.fetch;
+  respondTo: (ctx: TelegramTextContext, text: string) => Promise<unknown>;
+}
+
+function parseTelegramReplyStatus(body: unknown): TelegramReplyStatus | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const status = (body as { status?: unknown }).status;
+  if (status === "unknown") return status;
+  if (
+    typeof status === "string" &&
+    Object.prototype.hasOwnProperty.call(CALLBACK_RESPONSE_MESSAGES, status)
+  ) {
+    return status as HandledTelegramReplyStatus;
+  }
+  return undefined;
+}
 
 /** Decide si un usuario está permitido según la allowlist. Vacía = permitir a todos. */
 export function isAllowedUser(allowlist: number[], fromId: number | undefined): boolean {
@@ -18,6 +55,61 @@ export function warnIfNoAllowlist(agentName: string, allowlist: number[]): void 
   if (allowlist.length === 0) {
     console.warn(`[telegram:${agentName}] sin allowlist: el bot acepta a cualquier usuario`);
   }
+}
+
+/**
+ * Crea el ingress de replies a tarjetas humanas. `unknown` es el único
+ * resultado que delega al flujo de comandos/chat; todo lo demás consume el
+ * update para que una respuesta nunca abra una sesión humana por accidente.
+ */
+export function createTelegramHumanReplyMiddleware(
+  env: Pick<PihubEnv, "managerPort">,
+  dependencies: TelegramHumanReplyDependencies,
+): MiddlewareFn<TelegramTextContext> {
+  return async (ctx, next) => {
+    const replyTo = ctx.message.reply_to_message;
+    if (!replyTo) {
+      await next();
+      return;
+    }
+
+    let status: TelegramReplyStatus;
+    try {
+      const callbackToken = process.env.PIHUB_RUNNER_CALLBACK_TOKEN;
+      if (!callbackToken) throw new Error("runner callback token ausente");
+
+      const chatId = ctx.chat.id;
+      const replyToMessageId = replyTo.message_id;
+      const text = ctx.message.text;
+      const idempotencyKey = `telegram:update:${ctx.update.update_id}`;
+      const response = await dependencies.fetch(
+        `http://127.0.0.1:${env.managerPort}/internal/runner/telegram-reply`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-pihub-runner-callback-token": callbackToken,
+          },
+          body: JSON.stringify({ chatId, replyToMessageId, text, idempotencyKey }),
+          signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
+        },
+      );
+      if (response.status !== 200) throw new Error(`callback HTTP ${response.status}`);
+
+      const parsedStatus = parseTelegramReplyStatus(await response.json());
+      if (parsedStatus === undefined) throw new Error("callback response inválida");
+      status = parsedStatus;
+    } catch {
+      await dependencies.respondTo(ctx, CALLBACK_ERROR_MESSAGE);
+      return;
+    }
+
+    if (status === "unknown") {
+      await next();
+      return;
+    }
+    await dependencies.respondTo(ctx, CALLBACK_RESPONSE_MESSAGES[status]);
+  };
 }
 
 /** Bot de Telegram del agente: comandos + lenguaje natural, una sesión pi por chat. */
@@ -52,6 +144,14 @@ export function startTelegram(
     }
     await next();
   });
+
+  bot.on(
+    "message:text",
+    createTelegramHumanReplyMiddleware(env, {
+      fetch: globalThis.fetch,
+      respondTo: (ctx, text) => ctx.reply(text),
+    }),
+  );
 
   bot.command("start", (ctx) =>
     ctx.reply(
@@ -232,7 +332,7 @@ export function startTelegram(
     .catch(() => {});
 
   bot.catch((error) => console.error(`[telegram:${config.name}]`, error.message));
-  void bot.start({ drop_pending_updates: true });
+  void bot.start();
   console.log(`[telegram:${config.name}] bot iniciado`);
 
   return {
