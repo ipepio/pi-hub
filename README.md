@@ -217,6 +217,19 @@ Tras reiniciar el Manager no hay replay SSE ni recuerdo de esas claves; un
 caller debe tratar el corte como un reintento explícito, no como una
 reconexión transparente.
 
+### Autonomía (Agent Mode) y `ask_human`
+
+Los Agents pueden operar de forma autónoma: el Loop del Manager agenda
+Initiatives que se disparan desde triggers. En modo `ask`, un Agent puede
+pausarse con la tool `ask_human` cuando necesita una decisión humana: la
+Initiative pasa a `waiting_human`, la pregunta aparece en el inbox del panel y,
+si `PIHUB_TELEGRAM_PRIMARY_CHAT_ID` está configurado, se notifica también al
+chat privado de Telegram. Responder (panel o Telegram) reencola la Initiative
+con su `expectedHumanRequestId` y esta se retoma en la misma sesión. Sin
+primary chat no hay llamadas a Telegram (fail-closed): el panel es el inbox
+canónico. El contrato completo está en
+[`docs/manager-api-v1.md`](docs/manager-api-v1.md) §11.5.
+
 ## Recursos, memoria y canales
 
 ### Memoria
@@ -266,6 +279,9 @@ herramientas de red adicionales. Consulta las limitaciones vigentes en
   Models seleccionables desde el dashboard y nunca se cargan en el Manager.
 - `PIHUB_TELEGRAM_ALLOWED_USERS` limita los IDs de Telegram; vacío permite
   cualquiera, por lo que no es apropiado para una instalación expuesta.
+- `PIHUB_TELEGRAM_PRIMARY_CHAT_ID` (opcional) fija el chat privado que recibe
+  las preguntas de `ask_human`; debe ser un entero positivo miembro de la
+  allowlist (fail-closed: sin esta variable no hay envíos a Telegram).
 - Configura `PIHUB_SPEECH_URL`, `PIHUB_STT_MODEL` y opcionalmente
   `PIHUB_TTS_MODEL`/`PIHUB_TTS_VOICE` para voz OpenAI-compatible.
 
@@ -306,6 +322,7 @@ Ejecuta `pihub` sin argumentos para ver todos los métodos y flags.
 | `PIHUB_GLOBAL_PACKAGES` | vacío | Paquetes globales iniciales separados por coma |
 | `PIHUB_AGENTS_FILE` | vacío | Manifiesto declarativo idempotente de Agents |
 | `PIHUB_OAUTH_PROVIDERS` | vacío | Providers OAuth habilitados |
+| `PIHUB_TELEGRAM_PRIMARY_CHAT_ID` | vacío | Chat privado de Telegram para las preguntas de `ask_human` (fail-closed) |
 | `PIHUB_SPEECH_URL` | vacío | Servidor OpenAI-compatible de STT/TTS |
 | `PIHUB_UPLOADS_RETENTION_HOURS` | `24` | Retención de uploads del workspace |
 

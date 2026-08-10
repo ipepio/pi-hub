@@ -497,7 +497,8 @@ como confirmación de rotación.
 
 ## 11.5. Autonomía de Agents (Loop, Agenda, Initiative, Trigger)
 
-Añadido en P2. Rutas para leer y mutar el estado de autonomía de un Agent.
+Añadido en P2 y cerrado con P3 (ask_human, waiting_human, entrega por Telegram).
+Rutas para leer y mutar el estado de autonomía de un Agent.
 
 **Auth por modo:**
 
@@ -536,13 +537,14 @@ GET /api/v1/agents/:name/autonomy
 ```json
 {
   "id": "uuid",
-  "origin": "trigger|calling|human",
+  "origin": "trigger|callback|human",
   "triggerId": "uuid|null",
-  "status": "queued|running|waiting_human|waiting_agent|completed|failed|cancelled|initiation",
+  "status": "queued|running|waiting_human|waiting_agent|succeeded|failed|expired|cancelled",
   "mode": "solo|ask",
   "intent": "string",
   "summary": "string|null",
   "question": "string|null",
+  "notificationStatus": "delivered|not_delivered|null",
   "availableAt": 1712345678000,
   "createdAt": 1712345678000,
   "stateChangedAt": 1712345678000,
@@ -557,6 +559,27 @@ GET /api/v1/agents/:name/autonomy
 `runner_unavailable`, `dispatch_failed`, `agent_errored`,
 `chain_deadline_exceeded`, `startup_recovery`) o `"unknown"` para cualquier
 otro valor interno. `result` **no se publica**.
+
+**Modo `ask` y espera humana (P3).** Una Initiative en `mode:"ask"` puede
+pausarse pidiendo input humano con la tool `ask_human` del Agent: pasa a
+`waiting_human`, la pregunta queda en `question`, el contexto en `summary` y la
+cota de respuesta en `expiresAt` (epoch ms). Esa Initiative entra en `inbox`
+del snapshot. La espera es durable (sobrevive al reinicio del Manager) y se
+retoma reencolando a `queued` cuando el humano responde por el panel o por el
+canal primario de Telegram.
+
+`notificationStatus` solo se puebla en `waiting_human`:
+
+- `null` — no hay espera humana (cualquier otro estado o sin request).
+- `not_delivered` — espera activa sin entrega confirmada (reserva de envío
+  pendiente, canal primario no configurado o envío fallido).
+- `delivered` — el canal primario de Telegram confirmó un `message_id` real
+  para la tarjeta de la espera actual.
+
+Sin `PIHUB_TELEGRAM_PRIMARY_CHAT_ID` no hay llamadas a Telegram en absoluto
+(fail-closed): la entrega es best-effort y el panel es el inbox canónico; el
+botón de responder sigue disponible aunque la notificación no llegara. Nunca
+salen `human_request_id`, chat/message IDs, tokens ni textos de error.
 
 **PublicTrigger:**
 
@@ -650,12 +673,19 @@ Body:
 
 ```json
 {
-  "answer": "sí, procede"
+  "answer": "sí, procede",
+  "expectedHumanRequestId": "uuid|null"
 }
 ```
 
 `answer` usa exactamente `1..4000` caracteres (cota `MAX_HUMAN_ANSWER_LENGTH`
-del dominio).
+del dominio). `expectedHumanRequestId` es **opcional** (P3.2): si se envía, la
+respuesta solo aplica a la espera humana con ese request id (CAS) y una
+respuesta a una tarjeta/espera anterior ya no contesta una Ask nueva; ausente
+o `null` conserva el comportamiento previo. El panel lo envía con el request
+que muestra. Responder a una espera ya expirada responde
+`409 INITIATIVE_STATE_CONFLICT` aunque el barrido de expiración no haya
+corrido todavía.
 
 | Estado | HTTP | Body |
 |---|---|---|
@@ -664,6 +694,17 @@ del dominio).
 | Inexistente o de otro Agent | `404` | `INITIATIVE_NOT_FOUND` |
 | Conflicto de estado | `409` | `INITIATIVE_STATE_CONFLICT` |
 | Key con comando distinto | `409` | `IDEMPOTENCY_CONFLICT` |
+
+### Callback interno del Runner (fuera del contrato)
+
+El Manager monta `POST /internal/runner/telegram-reply`, la vía **interna** por
+la que un Runner devuelve las respuestas escritas en el chat primario de
+Telegram. No es parte de `/api/v1` ni una API de integración: se autentica con
+un token efímero por spawn (`x-pihub-runner-callback-token`), no acepta
+Bearer/cookie/CSRF y ningún caller externo debe usarla. La correlación es
+interna (chat/message de la tarjeta → `human_request_id` →
+`expectedHumanRequestId` del CAS de respond); el contrato público solo expone
+el resultado observado vía `notificationStatus`.
 
 ### Admisión (shell contractual, P4)
 
