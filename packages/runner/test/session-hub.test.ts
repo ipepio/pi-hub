@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SessionHubRegistry } from "../src/hub.ts";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { ChatHub, SessionHubRegistry } from "../src/hub.ts";
 import { SessionFactory } from "../src/session.ts";
 import { ASK_HUMAN_TOOL_NAME } from "@pihub/shared";
 import { askHumanTool } from "../src/ask-human.ts";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 
 function fakeFactory() {
   const prompts: Array<{ sessionKey: string; text: string }> = [];
@@ -130,4 +134,106 @@ test("isStreaming detecta un turno vivo en cualquier Channel Session", async () 
   assert.equal(registry.isStreaming, true);
   streaming = false;
   assert.equal(registry.isStreaming, false);
+});
+
+// ---------------------------------------------------------------------------
+// P3.6: la factory keyed reanuda la última sesión del directorio tras restart;
+//       new_session fuerza una sesión nueva (modo fresh) y nunca reabre la
+//       conversación descartada.
+// ---------------------------------------------------------------------------
+
+/** Crea un SessionFactory real con runtimeProviders falsificado que captura el
+ *  SessionManager de cada creación y devuelve una sesión fake con el sessionId
+ *  real del manager (el manager persiste en ficheros reales en un dir temporal). */
+async function keyedFactoryWithRealManager(dataDir: string, sessionType: "human" | "initiative") {
+  const managers: SessionManager[] = [];
+  const stub = {
+    createSession: async (opts: any) => {
+      const manager = opts.sessionManager as SessionManager;
+      managers.push(manager);
+      return {
+        isStreaming: false,
+        sessionId: manager.getSessionId(),
+        subscribe: () => () => {},
+        async prompt() {},
+        async abort() {},
+        dispose() {},
+      };
+    },
+    registerExtensionProviders: async () => {},
+    resolveModel: async () => null,
+  };
+  const factory = new SessionFactory(
+    { dataDir, memoryEnabled: false, platformPromptEnabled: false } as never,
+    { name: "test", port: 0, enabled: true, createdAt: "2025-01-01" } as never,
+    undefined,
+    sessionType,
+  );
+  // forSession crea una factory nueva: hay que stubbear su runtimeProviders,
+  // no el de la factory base.
+  return {
+    keyed(sessionKey: string): SessionFactory {
+      const keyed = factory.forSession(sessionKey);
+      (keyed as any).runtimeProviders = stub;
+      return keyed;
+    },
+    managers,
+  };
+}
+
+/** Persiste una conversación real (usuario + asistente) en el SessionManager. */
+function persistConversation(manager: SessionManager): void {
+  manager.appendMessage({ role: "user", content: "hola" } as never);
+  manager.appendMessage({ role: "assistant", content: "mundo" } as never);
+  assert.ok(manager.getSessionFile(), "la conversación queda persistida en un fichero real");
+}
+
+test("a recreated Initiative hub resumes the latest session for the same sessionKey", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pihub-a16-resume-"));
+
+  // Primera vida: hub keyed initiative que crea y persiste una conversación.
+  const first = await keyedFactoryWithRealManager(dataDir, "initiative");
+  const hub1 = new ChatHub(first.keyed("channel-1"));
+  await hub1.ensureSession();
+  const firstManager = first.managers[0];
+  assert.ok(firstManager, "la primera creación produce un SessionManager");
+  persistConversation(firstManager);
+  const originalSessionId = firstManager.getSessionId();
+  const originalFile = firstManager.getSessionFile();
+
+  // Restart simulado: un factory nuevo para la misma sessionKey.
+  const second = await keyedFactoryWithRealManager(dataDir, "initiative");
+  const hub2 = new ChatHub(second.keyed("channel-1"));
+  await hub2.ensureSession();
+  const resumedManager = second.managers[0];
+  assert.strictEqual(
+    resumedManager.getSessionId(),
+    originalSessionId,
+    "tras restart el hub reabre el mismo session ID/history de la misma sessionKey",
+  );
+  assert.strictEqual(
+    resumedManager.getSessionFile(),
+    originalFile,
+    "tras restart reabre el mismo fichero de transcript",
+  );
+});
+
+test("explicit new_session never resumes the discarded conversation", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "pihub-a16-fresh-"));
+  const { keyed, managers } = await keyedFactoryWithRealManager(dataDir, "initiative");
+  const hub = new ChatHub(keyed("channel-2"));
+
+  await hub.ensureSession();
+  persistConversation(managers[0]);
+  const originalSessionId = managers[0].getSessionId();
+  assert.ok(originalSessionId);
+
+  const newSessionId = await hub.newSession();
+  assert.strictEqual(managers.length, 2, "new_session crea un segundo SessionManager");
+  assert.notStrictEqual(
+    managers[1].getSessionId(),
+    originalSessionId,
+    "new_session da un session ID nuevo: nunca reabre la conversación descartada",
+  );
+  assert.strictEqual(newSessionId, managers[1].getSessionId());
 });

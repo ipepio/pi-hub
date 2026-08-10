@@ -28,6 +28,14 @@ import { askHumanTool } from "./ask-human.ts";
 export type ResolvedModel = ResolvedRuntimeModel;
 
 /**
+ * P3.6: modo de creación de sesión.
+ * - `resumeLatest`: reabre la sesión más reciente del directorio (factory keyed
+ *   tras un restart); si no existe, el SDK crea una nueva.
+ * - `fresh`: siempre crea una sesión nueva (new_session y standalone).
+ */
+export type SessionCreationMode = "resumeLatest" | "fresh";
+
+/**
  * Convierte una identidad de Channel Session en un directorio estable que
  * no puede escapar del workspace ni filtrar la clave original en el path.
  */
@@ -47,8 +55,16 @@ export class SessionFactory {
   public readonly config: AgentConfig;
   /** P3.1: human o initiative — controla la tool ask_human reservada. */
   public sessionType: SessionType = "human";
+  /** P3.6: modo de creación de la siguiente sesión (ver SessionCreationMode). */
+  public creationMode: SessionCreationMode;
 
-  constructor(env: PihubEnv, config: AgentConfig, sessionKey?: string, sessionType?: SessionType) {
+  constructor(
+    env: PihubEnv,
+    config: AgentConfig,
+    sessionKey?: string,
+    sessionType?: SessionType,
+    creationMode: SessionCreationMode = "fresh",
+  ) {
     if (sessionType) this.sessionType = sessionType;
     this.env = env;
     this.config = config;
@@ -57,6 +73,7 @@ export class SessionFactory {
       ? { ...agent, sessionsDir: sessionStorageDirectory(agent.sessionsDir, sessionKey) }
       : agent;
     this.globalDir = dataPaths(env.dataDir).globalDir;
+    this.creationMode = creationMode;
     this.runtimeProviders = createRuntimeProviders({
       dataDir: env.dataDir,
       agentName: config.name,
@@ -64,8 +81,21 @@ export class SessionFactory {
     });
   }
 
+  /**
+   * P3.6: factory keyed — su primera creación reanuda la sesión más reciente
+   * del directorio de esa sessionKey (tras un restart) en lugar de abrir una
+   * nueva; si no hay ninguna sesión, el SDK crea una nueva.
+   */
   forSession(sessionKey: string): SessionFactory {
-    return new SessionFactory(this.env, this.config, sessionKey, this.sessionType);
+    return new SessionFactory(this.env, this.config, sessionKey, this.sessionType, "resumeLatest");
+  }
+
+  /**
+   * P3.6: la siguiente creación debe ser una sesión nueva (new_session), nunca
+   * reabrir la conversación descartada por reset().
+   */
+  useFreshCreation(): void {
+    this.creationMode = "fresh";
   }
 
   private async ensureExtensionProviders(): Promise<void> {
@@ -168,7 +198,12 @@ export class SessionFactory {
       ...(model ? { model } : {}),
       ...(this.config.thinkingLevel ? { thinkingLevel: this.config.thinkingLevel } : {}),
       resourceLoader: loader,
-      sessionManager: SessionManager.create(this.paths.workspaceDir, this.paths.sessionsDir),
+      // P3.6: keyed → reanuda la última sesión del directorio (o crea si no existe);
+      //       fresh (new_session / standalone) → siempre una sesión nueva.
+      sessionManager:
+        this.creationMode === "resumeLatest"
+          ? SessionManager.continueRecent(this.paths.workspaceDir, this.paths.sessionsDir)
+          : SessionManager.create(this.paths.workspaceDir, this.paths.sessionsDir),
     });
   }
 }

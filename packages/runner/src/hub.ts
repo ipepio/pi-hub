@@ -157,6 +157,9 @@ export class ChatHub {
 
   async newSession(): Promise<string> {
     this.reset();
+    // P3.6: tras reset, la siguiente creación debe ser fresh: nunca reabrir la
+    // sesión descartada aunque sea la más reciente del directorio.
+    this.factory.useFreshCreation();
     const session = await this.ensureSession();
     this.broadcast({ type: "session_new", sessionId: session.sessionId });
     return session.sessionId;
