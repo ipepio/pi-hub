@@ -211,6 +211,15 @@ export class AutonomyControl {
   }
 
   /**
+   * Lectura agent-scoped para bordes internos que deben explicar un conflicto
+   * de CAS sin abrir el almacén ni inferir la causa desde el texto del error.
+   * Un ID de otro Agent conserva la semántica indistinguible de no encontrado.
+   */
+  initiativeForAgent(agentName: string, initiativeId: string): Initiative {
+    return this.agenda.initiatives.getForAgent(initiativeId, agentName);
+  }
+
+  /**
    * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
    * `queued` con la `answer` depositada como pending, para que el Loop la
    * retome con su dispatch normal. Control no despacha ni llama al Runner: el

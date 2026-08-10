@@ -39,6 +39,8 @@ import { apiError } from "./api-v1/errors.js";
 import type { StartupStore } from "./startup.js";
 import type { AutonomyProjection } from "./agenda/autonomy-projection.js";
 import type { AutonomyControl } from "./agenda/autonomy-control.js";
+import type { HumanRequestDeliveries } from "./agenda/human-requests.js";
+import { internalRouter } from "./api-v1/internal.js";
 import path from "node:path";
 
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -97,6 +99,7 @@ export function createApi(
   autonomy?: {
     projection: Pick<AutonomyProjection, "snapshotForAgent">;
     control: AutonomyControl;
+    deliveries: Pick<HumanRequestDeliveries, "lookupDelivery">;
   },
 ): Hono {
   const app = new Hono();
@@ -117,6 +120,17 @@ export function createApi(
       c.header("Set-Cookie", csrfCookie(csrfToken), { append: true });
       return c.json({ ok: true, csrfToken });
     });
+  }
+
+  // El callback Runner→Manager es una superficie interna separada de `/api/v1`:
+  // solo existe cuando la autonomía durable está compuesta y autentica con la
+  // credencial efímera del Runner, nunca con API_TOKEN/cookie/Bearer.
+  if (autonomy) {
+    app.route("/internal/runner", internalRouter({
+      supervisor,
+      control: autonomy.control,
+      deliveries: autonomy.deliveries,
+    }));
   }
 
   // La interfaz privada versionada se monta ANTES del guard del panel: el

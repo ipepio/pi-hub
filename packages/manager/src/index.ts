@@ -120,6 +120,7 @@ const runtime = await runStartup(
       return createApi(env, supervisor, oauth, providers, turns, {
         projection: store.agenda.projection,
         control: autonomyControl,
+        deliveries: store.agenda.humanRequestDeliveries,
       });
     },
     // Fase 3.5 (D2): el Loop se compone y arranca después de `serve`.
