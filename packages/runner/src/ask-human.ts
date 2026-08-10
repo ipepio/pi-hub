@@ -35,9 +35,9 @@ export const askHumanTool = defineTool({
     { additionalProperties: false },
   ),
   executionMode: "sequential",
-  execute: async (_toolCallId, _params) => ({
+  execute: async (_toolCallId, params) => ({
     content: [{ type: "text" as const, text: "The human has been notified and will respond shortly." }],
-    details: {},
+    details: { question: params.question, summary: params.summary },
     terminate: true,
   }),
 });

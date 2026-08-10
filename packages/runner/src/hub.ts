@@ -93,7 +93,7 @@ export class ChatHub {
         break;
       }
       case "tool_execution_end": {
-        const e = event as { toolName?: string; isError?: boolean; result?: { question?: string; summary?: string }; toolCallId?: string };
+        const e = event as { toolName?: string; isError?: boolean; result?: { details?: { question?: string; summary?: string } }; toolCallId?: string };
         const toolName = e.toolName ?? "tool";
 
         // P3.1: emitir tool_end primero (el resultado ya está incorporado)
@@ -104,8 +104,8 @@ export class ChatHub {
           this._askEmittedThisPrompt = true;
           this.broadcast({
             type: "human_input_required",
-            question: e.result?.question ?? "",
-            summary: e.result?.summary ?? "",
+            question: e.result?.details?.question ?? "",
+            summary: e.result?.details?.summary ?? "",
             toolCallId: e.toolCallId ?? "",
           });
           // Abortar el run después de tool_execution_end (cinturón de seguridad)

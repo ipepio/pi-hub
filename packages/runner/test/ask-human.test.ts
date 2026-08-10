@@ -13,6 +13,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ASK_HUMAN_TOOL_NAME, ASK_HUMAN_QUESTION_MAX, ASK_HUMAN_SUMMARY_MAX } from "@pihub/shared";
 import { askHumanTool } from "../src/ask-human.ts";
 import { ChatHub } from "../src/hub.ts";
@@ -23,7 +24,7 @@ interface FakeAgentSessionEvent {
   type: string;
   toolName?: string;
   isError?: boolean;
-  result?: { question?: string; summary?: string };
+  result?: AgentToolResult<{ question: string; summary: string }>;
   toolCallId?: string;
   assistantMessageEvent?: { type?: string; delta?: string };
 }
@@ -69,6 +70,21 @@ function emit(hub: ChatHub, event: FakeAgentSessionEvent): void {
   anyHub.onEvent(event);
 }
 
+/**
+ * Ejecuta la tool REAL y devuelve su AgentToolResult: la forma exacta que el
+ * SDK coloca en `tool_execution_end.result` (content + details + terminate).
+ * Los tests alimentan al Hub con este resultado, nunca con una forma inventada.
+ */
+async function runAskTool(question: string, summary: string): Promise<AgentToolResult<{ question: string; summary: string }>> {
+  return askHumanTool.execute(
+    "call-1",
+    { question, summary },
+    undefined,
+    undefined,
+    {} as unknown as ExtensionContext,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 1. Schema y límites
 // ---------------------------------------------------------------------------
@@ -99,13 +115,15 @@ test("askHumanTool.parameters define question y summary con límites y sin extra
 // 2. terminate: true
 // ---------------------------------------------------------------------------
 
-test("askHumanTool.execute devuelve terminate: true con ack", async () => {
+test("askHumanTool.execute devuelve terminate: true con ack y los params en details", async () => {
   const result = await askHumanTool.execute("call-1", {
     question: "¿Qué hora es?",
     summary: "Preguntando la hora",
   });
   assert.equal(result.terminate, true, "execute debe devolver terminate: true");
   assert.ok(Array.isArray(result.content) && result.content.length > 0, "execute devuelve content");
+  assert.equal(result.details.question, "¿Qué hora es?", "details.question íntegro");
+  assert.equal(result.details.summary, "Preguntando la hora", "details.summary íntegro");
 });
 
 // ---------------------------------------------------------------------------
@@ -133,7 +151,7 @@ test("tool_execution_start para ask_human no emite human_input_required", async 
 // 4. Emisión en tool_execution_end (después de incorporar el resultado)
 // ---------------------------------------------------------------------------
 
-test("tool_execution_end de ask_human emite tool_end y luego human_input_required", async () => {
+test("tool_execution_end de ask_human emite tool_end y luego human_input_required con el resultado real", async () => {
   const { factory, state } = fakeFactory();
   const hub = new ChatHub(factory);
   await hub.ensureSession();
@@ -141,11 +159,12 @@ test("tool_execution_end de ask_human emite tool_end y luego human_input_require
   const messages: Array<{ type: string; question?: string; summary?: string; toolCallId?: string }> = [];
   hub.subscribe((m) => messages.push(m));
 
+  const result = await runAskTool("¿Continúo?", "Resumen de la tarea");
   emit(hub, {
     type: "tool_execution_end",
     toolName: ASK_HUMAN_TOOL_NAME,
     isError: false,
-    result: { question: "¿Continúo?", summary: "Resumen de la tarea" },
+    result,
     toolCallId: "call-42",
   });
 
@@ -166,11 +185,12 @@ test("tool_execution_end de ask_human con isError no emite human_input_required"
   const messages: Array<{ type: string }> = [];
   hub.subscribe((m) => messages.push(m));
 
+  const result = await runAskTool("x", "y");
   emit(hub, {
     type: "tool_execution_end",
     toolName: ASK_HUMAN_TOOL_NAME,
     isError: true,
-    result: { question: "x", summary: "y" },
+    result,
     toolCallId: "call-err",
   });
 
@@ -192,9 +212,9 @@ test("human_input_required se emite una sola vez por prompt (latch)", async () =
   hub.subscribe((m) => messages.push(m));
 
   // Primer tool_execution_end para ask_human -> emite
-  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: { question: "a", summary: "b" }, toolCallId: "1" });
+  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: await runAskTool("a", "b"), toolCallId: "1" });
   // Segundo tool_execution_end para ask_human en el MISMO prompt -> NO emite
-  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: { question: "c", summary: "d" }, toolCallId: "2" });
+  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: await runAskTool("c", "d"), toolCallId: "2" });
 
   const asks = messages.filter((m) => m.type === "human_input_required");
   assert.equal(asks.length, 1, "solo un human_input_required por prompt");
@@ -209,9 +229,9 @@ test("un prompt nuevo resetea el latch y permite otra emisión", async () => {
   const messages: Array<{ type: string; toolCallId?: string }> = [];
   hub.subscribe((m) => messages.push(m));
 
-  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: { question: "a", summary: "b" }, toolCallId: "1" });
+  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: await runAskTool("a", "b"), toolCallId: "1" });
   await hub.prompt("siguiente");
-  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: { question: "c", summary: "d" }, toolCallId: "2" });
+  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: await runAskTool("c", "d"), toolCallId: "2" });
 
   const asks = messages.filter((m) => m.type === "human_input_required");
   assert.equal(asks.length, 2, "cada prompt puede emitir un human_input_required");
@@ -233,7 +253,7 @@ test("ask_human en un batch mixto aborta la sesión tras tool_execution_end", as
   emit(hub, { type: "tool_execution_start", toolName: "memoria_leer" });
   emit(hub, { type: "tool_execution_end", toolName: "memoria_leer", isError: false, toolCallId: "t-reg" });
   emit(hub, { type: "tool_execution_start", toolName: ASK_HUMAN_TOOL_NAME });
-  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: { question: "¿Sigo?", summary: "Resumen" }, toolCallId: "t-ask" });
+  emit(hub, { type: "tool_execution_end", toolName: ASK_HUMAN_TOOL_NAME, isError: false, result: await runAskTool("¿Sigo?", "Resumen"), toolCallId: "t-ask" });
 
   assert.ok(messages.some((m) => m.type === "human_input_required"), "emite human_input_required");
   assert.equal(state.aborted, true, "la sesión se aborta después de tool_execution_end (cinturón de seguridad)");
