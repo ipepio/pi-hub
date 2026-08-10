@@ -9,9 +9,11 @@
  * (Fase 3.5) llamará al mismo `startTurn` y consumirá solo `completion`, sin
  * traducir SSE.
  *
- * Fase 3.2 — "Cerrar el hueco del terminal" (§9.3.2): **todo turno aceptado
- * produce exactamente un terminal**. `completion` resuelve siempre con un
- * evento terminal, nunca con `undefined`:
+ * Fase 3.2 — "Cerrar el hueco del terminal" (§9.3.2): todo turno que termina
+ * produce exactamente un terminal SSE. P3.3 añade una única salida no terminal:
+ * una Initiative pausada durablemente resuelve `waitingHuman` y conserva
+ * `completion` pendiente, para no publicar un terminal falso al cliente SSE.
+ * En los demás caminos `completion` resuelve con un evento terminal:
  * - `agent_end` → `turn-complete` (o `turn-aborted` si hubo abort);
  * - `error` del Runner → `turn-error` (causa `turn_failed`);
  * - `close` del Runner sin terminal limpio, error de conexión o timeout de
@@ -35,6 +37,7 @@
  * (`routes.ts:1103-1134` → `abort`).
  */
 
+import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { hasLiveTurnForAgent } from "../api-v1/restart-policy.ts";
 import {
@@ -44,12 +47,15 @@ import {
 } from "../api-v1/turns.ts";
 import { DomainError } from "./errors.ts";
 import { TurnRepository, type FailureCause, type TurnFinalState } from "./turns.ts";
+import type { HumanRequest, HumanRequestRepository } from "./human-requests.ts";
 import type { RunnerCapability } from "@pihub/shared";
 
 /** Turno vivo con WS abierto contra el Runner (clave `agentName:turnId`). */
 interface TurnoVivo {
   ws: WebSocket;
   abortRequested: boolean;
+  /** Latch de la tx de pausa: ningún terminal tardío puede ganarle al COMMIT. */
+  pausing: boolean;
 }
 
 /**
@@ -103,10 +109,16 @@ export interface StartTurnCommand {
 /** Handle de un turno en curso (plan §4.2). */
 export interface TurnHandle {
   /**
-   * Resuelve **exactamente una vez**, siempre con el terminal del turno
-   * (Fase 3.2: ningún `startTurn` aceptado queda sin terminal).
+   * Cuando hay terminal SSE público, resuelve **exactamente una vez**. Una
+   * Initiative que pausa para esperar al humano usa `waitingHuman` y deja esta
+   * Promise pendiente; nunca fabrica un `turn-complete`/`turn-error`.
    */
   readonly completion: Promise<TurnSseEvent>;
+  /**
+   * Canal interno de Initiatives. Ausente en turnos humanos; resuelve solo
+   * después de confirmar durablemente `waiting_human`.
+   */
+  readonly waitingHuman?: Promise<{ initiativeId: string; requestId: string } | null>;
   /** El cliente se fue (abort del stream SSE): corta el WS contra el Runner y produce terminal. */
   disconnect(): void;
 }
@@ -125,8 +137,16 @@ export interface TurnExecutionOptions {
    * terminal con `turns.complete` y su causa.
    */
   readonly repository?: Pick<TurnRepository, "complete">;
-  /** Reloj para el `now` del terminal durable (tests sin tiempo real). */
+  /** Pausa durable `turn + Initiative` de P3.2. Producción la inyecta desde Agenda. */
+  readonly humanRequests?: Pick<HumanRequestRepository, "pauseRunningForHuman">;
+  /** Reloj compartido por terminales y pausa humana (tests sin tiempo real). */
   readonly now?: () => number;
+  /** Generador del `human_request_id`; criptográfico por defecto, fijo en tests. */
+  readonly requestId?: () => string;
+  /** Duración capturada en `human_expires_at` al confirmar la pausa. */
+  readonly expiryMs?: number;
+  /** Entrega posterior al COMMIT; callback fire-and-forget, nunca Promise. */
+  readonly onHumanRequest?: (request: HumanRequest) => void;
   /**
    * Watchdog de apertura/silencio (§4.6): si no llega `agent_start` en este
    * plazo desde `startTurn`, el turno se aborta con `turn-error`
@@ -177,7 +197,11 @@ export class TurnExecution {
   private readonly turnosVivos = new Map<string, TurnoVivo>();
   private readonly apiToken: string;
   private readonly repository: Pick<TurnRepository, "complete"> | undefined;
+  private readonly humanRequests: Pick<HumanRequestRepository, "pauseRunningForHuman"> | undefined;
   private readonly now: () => number;
+  private readonly requestId: () => string;
+  private readonly expiryMs: number;
+  private readonly onHumanRequest: ((request: HumanRequest) => void) | undefined;
   private readonly dispatchTimeoutMs: number;
   private readonly handshakeTimeoutMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
@@ -187,7 +211,13 @@ export class TurnExecution {
   constructor(options: TurnExecutionOptions) {
     this.apiToken = options.apiToken;
     this.repository = options.repository;
+    this.humanRequests = options.humanRequests;
     this.now = options.now ?? Date.now;
+    this.requestId = options.requestId ?? randomUUID;
+    // La política se inyecta en producción. Ausente = fail-closed en el repo,
+    // no duplicar aquí el default de configuración de `loadEnv`.
+    this.expiryMs = options.expiryMs ?? 0;
+    this.onHumanRequest = options.onHumanRequest;
     this.dispatchTimeoutMs = options.dispatchTimeoutMs ?? 0;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     this.schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
@@ -209,9 +239,10 @@ export class TurnExecution {
 
   /**
    * Abre el WS contra el Runner, registra el turno como vivo y traduce los
-   * mensajes del Runner a eventos. Todo turno aceptado resuelve `completion`
-   * con **exactamente un** terminal (Fase 3.2): un `close` del Runner sin
-   * terminal limpio, un error de conexión o un timeout de despacho publican
+   * mensajes del Runner a eventos. Todo turno que termina resuelve `completion`
+   * con **exactamente un** terminal (Fase 3.2); la excepción deliberada es una
+   * Initiative pausada, que resuelve solo el canal interno `waitingHuman`.
+   * Un `close` sin terminal limpio, error de conexión o timeout publican
    * `turn-error` en vez del cierre mudo de la ruta original.
    */
   startTurn(command: StartTurnCommand): TurnHandle {
@@ -235,6 +266,15 @@ export class TurnExecution {
     const completion = new Promise<TurnSseEvent>((resolve) => {
       resolveCompletion = resolve;
     });
+
+    let resolveWaitingHuman:
+      | ((terminal: { initiativeId: string; requestId: string } | null) => void)
+      | undefined;
+    const waitingHuman = command.origin.kind === "initiative"
+      ? new Promise<{ initiativeId: string; requestId: string } | null>((resolve) => {
+          resolveWaitingHuman = resolve;
+        })
+      : undefined;
 
     let cerrado = false;
     let timeoutHandle: TimerHandle | undefined;
@@ -318,7 +358,7 @@ export class TurnExecution {
 
     /** Emite el terminal, cierra el socket, escribe T6 y resuelve `completion`. */
     const finalizar = (terminal: TurnSseEvent, failureCause?: FailureCause) => {
-      if (cerrado) return;
+      if (cerrado || this.turnosVivos.get(clave)?.pausing) return;
       cerrado = true;
       cancelarTimeout();
       cancelarHandshakeTimeout();
@@ -336,6 +376,63 @@ export class TurnExecution {
           resolveCompletion(terminal);
         },
       );
+    };
+
+    /**
+     * Intercepta el mensaje crudo antes de `toTurnEvent`: ese traductor no
+     * conoce `human_input_required`. La llamada durable es síncrona y retorna
+     * solo después del COMMIT de `paused_for_human + waiting_human`.
+     */
+    const pausarPorHumano = (mensaje: Pick<MensajeRunner, "question" | "summary" | "toolCallId">): void => {
+      if (cerrado) return;
+      if (command.origin.kind !== "initiative" || !this.humanRequests) {
+        finalizar(turnError("turn_failed"), "turn_failed");
+        return;
+      }
+
+      const turno = this.turnosVivos.get(clave);
+      if (!turno || turno.pausing) return;
+      turno.pausing = true;
+
+      const requestId = this.requestId();
+      let request: HumanRequest;
+      try {
+        request = this.humanRequests.pauseRunningForHuman({
+          agentName,
+          initiativeId: command.origin.initiativeId,
+          turnId,
+          requestId,
+          toolCallId: String(mensaje.toolCallId ?? ""),
+          question: String(mensaje.question ?? ""),
+          summary: String(mensaje.summary ?? ""),
+          now: this.now(),
+          expiryMs: this.expiryMs,
+        });
+      } catch {
+        // El repositorio hizo rollback. Desarmar el latch permite que el único
+        // terminal público de fallo escriba T6; nunca se fabrica waiting_human.
+        turno.pausing = false;
+        finalizar(turnError("turn_failed"), "turn_failed");
+        return;
+      }
+
+      // Orden cerrado P3.3: COMMIT (arriba) → liberar vivo → canal interno →
+      // cerrar WS → entrega fire-and-forget. No emitir SSE ni llamar T6: la
+      // pausa durable ya escribió `paused_for_human` y `waiting_human`.
+      cerrado = true;
+      cancelarTimeout();
+      cancelarHandshakeTimeout();
+      this.turnosVivos.delete(clave);
+      resolveWaitingHuman?.({ initiativeId: request.initiativeId, requestId: request.requestId });
+      cerrarSocket();
+      queueMicrotask(() => {
+        try {
+          this.onHumanRequest?.(request);
+        } catch {
+          // El callback no puede devolver la pausa a running ni filtrar su payload.
+          console.error(`[pihub] HUMAN_REQUEST_CALLBACK_FAILED ${clave}`);
+        }
+      });
     };
 
     let handshakeDone = false;
@@ -368,7 +465,7 @@ export class TurnExecution {
       }
       // Registrado solo tras `open`: mandar `{type:"abort"}` antes de que el
       // WS esté realmente conectado no es seguro.
-      this.turnosVivos.set(clave, { ws, abortRequested: false });
+      this.turnosVivos.set(clave, { ws, abortRequested: false, pausing: false });
 
       // No se envía el prompt inmediatamente: se espera `ready` del Runner.
       // El handshake tiene su propio watchdog (P3.1): si el Runner no envía
@@ -397,6 +494,15 @@ export class TurnExecution {
       }
 
       const turno = this.turnosVivos.get(clave);
+      // El latch gana frente a agent_end/error/close reentrantes mientras la
+      // transacción durable de pausa está confirmando.
+      if (turno?.pausing) return;
+
+      if (mensaje.type === "human_input_required") {
+        pausarPorHumano(mensaje);
+        return;
+      }
+
       const evento = toTurnEvent(mensaje, turnId, eventProfile, turno?.abortRequested === true);
       if (!evento) return;
 
@@ -455,6 +561,7 @@ export class TurnExecution {
 
     return {
       completion,
+      ...(waitingHuman ? { waitingHuman } : {}),
       disconnect: () => finalizar(turnError("runner_unavailable"), "runner_unavailable"),
     };
   }

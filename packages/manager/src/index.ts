@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { loadEnv } from "@pihub/shared";
 import { bootstrap } from "./bootstrap.js";
@@ -54,6 +55,12 @@ const runtime = await runStartup(
       new TurnExecution({
         apiToken: env.apiToken,
         repository: store.agenda.turns,
+        humanRequests: store.agenda.humanRequests,
+        now: () => Date.now(),
+        requestId: () => randomUUID(),
+        expiryMs: env.waitingHumanExpiryMs,
+        // A12 sustituye este no-op por HumanRequestDelivery fire-and-forget.
+        onHumanRequest: () => {},
         dispatchTimeoutMs: env.turnDispatchTimeoutMs,
       }),
     createOAuth: (providers) => new OAuthService(providers),

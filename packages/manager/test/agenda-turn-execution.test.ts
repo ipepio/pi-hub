@@ -35,6 +35,10 @@ import {
 import type { SqliteDb } from "../src/storage/sqlite.ts";
 import { runMigrations } from "../src/storage/migrations.ts";
 import { AgendaRepository } from "../src/agenda/index.ts";
+import type {
+  HumanRequest,
+  PauseRunningForHumanCommand,
+} from "../src/agenda/human-requests.ts";
 import { createApiV1Router } from "../dist/api-v1/routes.js";
 import type { Supervisor } from "../src/supervisor.ts";
 
@@ -982,5 +986,276 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
       assert.ok(terminal !== undefined, `${scenario.name}: completion debe ser un terminal`);
       assert.equal(terminal.event, scenario.expected);
     }
+  });
+
+  // --- P3.3 / A07: human_input_required → pausa durable ---
+
+  it("the Loop slot is released only after the durable pause commits", async () => {
+    const db = openMemoryDb();
+    const agenda = new AgendaRepository(db);
+    agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-ask", 1000);
+    insertRunningInitiative(db, "ini-ask", "agent", TURN_ID);
+
+    const runner = await startRunner((socket) => {
+      socket.on("message", (raw) => {
+        const message = JSON.parse(String(raw)) as { type?: string };
+        if (message.type === "prompt") {
+          socket.send(JSON.stringify({ type: "agent_start" }));
+          socket.send(JSON.stringify({
+            type: "human_input_required",
+            question: "¿Procedo?",
+            summary: "Hace falta aprobación",
+            toolCallId: "tool-ask-1",
+          }));
+          // Terminal tardío: nunca puede sobrescribir `paused_for_human`.
+          socket.send(JSON.stringify({ type: "agent_end" }));
+        }
+      });
+    }, ["ask_human_v1"]);
+
+    let turns!: TurnExecution;
+    let pauseCommitted = false;
+    let liveWhileCommitting = false;
+    const delivered: HumanRequest[] = [];
+    const humanRequests = {
+      pauseRunningForHuman(input: PauseRunningForHumanCommand): HumanRequest {
+        liveWhileCommitting = turns.hasLiveTurnForAgent(input.agentName);
+        const result = agenda.humanRequests.pauseRunningForHuman(input);
+        pauseCommitted = true;
+        return result;
+      },
+    };
+    turns = new TurnExecution({
+      apiToken: "service-token",
+      repository: agenda.turns,
+      humanRequests,
+      now: () => 2000,
+      requestId: () => "request-ask-1",
+      expiryMs: 60_000,
+      onHumanRequest: (request) => delivered.push(request),
+    });
+    const collector = new EventCollector();
+    const handle = turns.startTurn(command({
+      idempotencyKey: "idem-ask",
+      runnerPort: runner.port,
+      origin: { kind: "initiative", initiativeId: "ini-ask", cause: "trigger" },
+      onEvent: (event) => collector.push(event),
+    }));
+
+    assert.ok(handle.waitingHuman, "las Initiatives exponen el canal interno waitingHuman");
+    let publicCompletionSettled = false;
+    void handle.completion.then(() => { publicCompletionSettled = true; });
+    const waiting = await handle.waitingHuman;
+
+    assert.equal(pauseCommitted, true, "el canal interno resuelve después del COMMIT");
+    assert.equal(liveWhileCommitting, true, "el turno sigue vivo mientras confirma la pausa");
+    assert.deepEqual(waiting, { initiativeId: "ini-ask", requestId: "request-ask-1" });
+    assert.equal(turns.hasLiveTurnForAgent("agent"), false);
+    assert.equal(turns.hasAnyLiveTurn(), false);
+
+    const durableTurn = db.prepare(
+      "SELECT final_state, finished_at FROM turns WHERE agent_name = ? AND turn_id = ?",
+    ).get("agent", TURN_ID) as { final_state: string | null; finished_at: number | null };
+    assert.equal(durableTurn.final_state, "paused_for_human");
+    assert.equal(durableTurn.finished_at, 2000);
+    const initiative = agenda.initiatives.get("ini-ask");
+    assert.equal(initiative.state, "waiting_human");
+    assert.equal(initiative.humanRequestId, "request-ask-1");
+    assert.equal(initiative.humanExpiresAt, 62_000);
+
+    // Ni el agent_end tardío ni el cierre del WS producen terminal SSE público.
+    await Promise.resolve();
+    assert.equal(publicCompletionSettled, false);
+    assert.deepEqual(collector.events, [
+      { event: "turn-start", data: { turnId: TURN_ID } },
+    ]);
+    assert.deepEqual(delivered, [{
+      initiativeId: "ini-ask",
+      agentName: "agent",
+      turnId: TURN_ID,
+      requestId: "request-ask-1",
+      question: "¿Procedo?",
+      summary: "Hace falta aprobación",
+      toolCallId: "tool-ask-1",
+      expiresAt: 62_000,
+    }]);
+  });
+
+  it("pauseRunningForHuman failure produces turn-error and never fabricates waiting_human", async () => {
+    const db = openMemoryDb();
+    const agenda = new AgendaRepository(db);
+    agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-pause-fail", 1000);
+    insertRunningInitiative(db, "ini-pause-fail", "agent", TURN_ID);
+
+    const runner = await startRunner((socket) => {
+      socket.on("message", (raw) => {
+        const message = JSON.parse(String(raw)) as { type?: string };
+        if (message.type === "prompt") {
+          socket.send(JSON.stringify({ type: "agent_start" }));
+          // A06 exige toolCallId no vacío: la pausa falla antes de abrir la tx.
+          socket.send(JSON.stringify({
+            type: "human_input_required",
+            question: "¿Procedo?",
+            summary: "Necesita aprobación",
+            toolCallId: "",
+          }));
+        }
+      });
+    }, ["ask_human_v1"]);
+
+    let deliveries = 0;
+    const turns = new TurnExecution({
+      apiToken: "service-token",
+      repository: agenda.turns,
+      humanRequests: agenda.humanRequests,
+      now: () => 2000,
+      requestId: () => "request-invalid",
+      expiryMs: 60_000,
+      onHumanRequest: () => { deliveries += 1; },
+    });
+    const collector = new EventCollector();
+    const handle = turns.startTurn(command({
+      idempotencyKey: "idem-pause-fail",
+      runnerPort: runner.port,
+      origin: { kind: "initiative", initiativeId: "ini-pause-fail", cause: "trigger" },
+      onEvent: (event) => collector.push(event),
+    }));
+
+    let waitingSettled = false;
+    void handle.waitingHuman?.then(() => { waitingSettled = true; });
+    const terminal = await handle.completion;
+    assert.equal(terminal.event, "turn-error");
+    assert.equal((terminal.data as { code?: string }).code, "INTERNAL_ERROR");
+    await Promise.resolve();
+    assert.equal(waitingSettled, false);
+    assert.equal(deliveries, 0);
+    assert.equal(agenda.initiatives.get("ini-pause-fail").state, "failed");
+    const turn = db.prepare(
+      "SELECT final_state FROM turns WHERE agent_name = ? AND turn_id = ?",
+    ).get("agent", TURN_ID) as { final_state: string | null };
+    assert.equal(turn.final_state, "failed");
+    assert.deepEqual(collector.events.at(-1), {
+      event: "turn-error",
+      data: { turnId: TURN_ID, code: "INTERNAL_ERROR", message: "Runner error" },
+    });
+  });
+
+  it("forged human_input_required in a human turn fails without touching Agenda", async () => {
+    const runner = await startRunner((socket) => {
+      socket.on("message", (raw) => {
+        const message = JSON.parse(String(raw)) as { type?: string };
+        if (message.type === "prompt") {
+          socket.send(JSON.stringify({ type: "agent_start" }));
+          socket.send(JSON.stringify({
+            type: "human_input_required",
+            question: "forjada",
+            summary: "forjada",
+            toolCallId: "tool-forged",
+          }));
+        }
+      });
+    });
+
+    let agendaWrites = 0;
+    const turns = new TurnExecution({
+      apiToken: "service-token",
+      humanRequests: {
+        pauseRunningForHuman(): HumanRequest {
+          agendaWrites += 1;
+          throw new Error("no debe llamarse");
+        },
+      },
+      requestId: () => "request-forged",
+      expiryMs: 60_000,
+    });
+    const handle = turns.startTurn(command({ runnerPort: runner.port }));
+
+    assert.equal(handle.waitingHuman, undefined, "los turnos humanos no exponen el canal interno");
+    const terminal = await handle.completion;
+    assert.equal(terminal.event, "turn-error");
+    assert.equal((terminal.data as { code?: string }).code, "INTERNAL_ERROR");
+    assert.equal(agendaWrites, 0);
+  });
+
+  it("late agent_end cannot win while the human pause is committing", async () => {
+    const listeners = new Map<string, Array<(raw: unknown) => void>>();
+    const emit = (event: string, raw: unknown): void => {
+      listeners.get(event)?.forEach((listener) => listener(raw));
+    };
+    const fakeWs = {
+      on(event: string, listener: (raw: unknown) => void) {
+        (listeners.get(event) ?? listeners.set(event, []).get(event)!).push(listener);
+        if (event === "open") {
+          queueMicrotask(() => {
+            emit("open", undefined);
+            emit("message", JSON.stringify({
+              type: "ready",
+              capabilities: ["ask_human_v1"],
+            }));
+          });
+        }
+      },
+      send(data: string) {
+        const message = JSON.parse(data) as { type?: string };
+        if (message.type === "prompt") {
+          emit("message", JSON.stringify({ type: "agent_start" }));
+          emit("message", JSON.stringify({
+            type: "human_input_required",
+            question: "¿Continuar?",
+            summary: "Pausa reentrante",
+            toolCallId: "tool-reentrant",
+          }));
+        }
+      },
+      close() {
+        emit("close", undefined);
+      },
+    };
+
+    let terminalWrites = 0;
+    const turns = new TurnExecution({
+      apiToken: "service-token",
+      repository: {
+        complete() { terminalWrites += 1; },
+      },
+      humanRequests: {
+        pauseRunningForHuman(input: PauseRunningForHumanCommand): HumanRequest {
+          // Simula el terminal tardío justo dentro de la operación de COMMIT.
+          emit("message", JSON.stringify({ type: "agent_end" }));
+          return {
+            initiativeId: input.initiativeId,
+            agentName: input.agentName,
+            turnId: input.turnId,
+            requestId: input.requestId,
+            question: input.question,
+            summary: input.summary,
+            toolCallId: input.toolCallId,
+            expiresAt: input.now + input.expiryMs,
+          };
+        },
+      },
+      now: () => 2000,
+      requestId: () => "request-reentrant",
+      expiryMs: 60_000,
+      createWebSocket: () => fakeWs as unknown as WebSocket,
+    });
+    const collector = new EventCollector();
+    const handle = turns.startTurn(command({
+      origin: { kind: "initiative", initiativeId: "ini-reentrant", cause: "trigger" },
+      onEvent: (event) => collector.push(event),
+    }));
+    let completionSettled = false;
+    void handle.completion.then(() => { completionSettled = true; });
+
+    assert.deepEqual(await handle.waitingHuman, {
+      initiativeId: "ini-reentrant",
+      requestId: "request-reentrant",
+    });
+    await Promise.resolve();
+    assert.equal(completionSettled, false);
+    assert.equal(terminalWrites, 0, "waiting_human no llama TurnRepository.complete");
+    assert.deepEqual(collector.events, [
+      { event: "turn-start", data: { turnId: TURN_ID } },
+    ]);
   });
 });
