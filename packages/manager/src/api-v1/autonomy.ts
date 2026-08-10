@@ -81,6 +81,7 @@ export interface PublicInitiative {
   readonly intent: string;
   readonly summary: string | null;
   readonly question: string | null;
+  readonly notificationStatus: "delivered" | "not_delivered" | null;
   readonly availableAt: number;
   readonly createdAt: number;
   readonly stateChangedAt: number;
@@ -293,6 +294,8 @@ function presentInitiative(initiative: InternalInitiative): PublicInitiative {
     intent: initiative.intent,
     summary: initiative.summary,
     question: initiative.humanQuestion,
+    notificationStatus:
+      initiative.state === "waiting_human" ? initiative.notificationStatus : null,
     availableAt: initiative.availableAt,
     createdAt: initiative.createdAt,
     stateChangedAt: initiative.stateChangedAt,
@@ -303,9 +306,9 @@ function presentInitiative(initiative: InternalInitiative): PublicInitiative {
   };
   // Prohibido: { ...initiative }, JSON.parse(JSON.stringify(...)), blacklist
   // No salen: sessionKey, turnId, boundModel, askCorrelation, pendingHumanInput,
-  //           result, humanRequestId, humanResponseIdempotencyKey,
-  //           humanResponseCommandHash, chainDepth, chainDeadlineAt,
-  //           visibleEffectsDeclared
+  //           result, humanRequestId, coordenadas de delivery,
+  //           humanResponseIdempotencyKey, humanResponseCommandHash,
+  //           chainDepth, chainDeadlineAt, visibleEffectsDeclared
 }
 
 function presentSchedule(definition: InternalTrigger["definition"]): PublicSchedule {

@@ -133,6 +133,34 @@ function insertInitiative(db: SqliteDb, seed: InitiativeSeed): void {
   );
 }
 
+interface DeliverySeed {
+  humanRequestId: string;
+  initiativeId: string;
+  agentName?: string;
+  channel?: "telegram";
+  chatId?: string;
+  messageId?: string;
+  createdAt?: number;
+}
+
+/** Siembra una coordenada durable de entrega (fixture de schema v2). */
+function insertDelivery(db: SqliteDb, seed: DeliverySeed): void {
+  db.prepare(
+    `INSERT INTO human_request_deliveries
+       (human_request_id, agent_name, initiative_id, channel,
+        external_chat_id, external_message_id, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).run(
+    seed.humanRequestId,
+    seed.agentName ?? "alice",
+    seed.initiativeId,
+    seed.channel ?? "telegram",
+    seed.chatId ?? "1001",
+    seed.messageId ?? "42",
+    seed.createdAt ?? 1000,
+  );
+}
+
 interface TriggerSeed {
   id: string;
   agent_name?: string;
@@ -284,6 +312,144 @@ describe("AutonomyProjection.snapshotForAgent (P1.2, plan P1 §3)", () => {
     assert.deepEqual(inboxIds(snapshot), ["w2", "w3", "w1"]);
     assert.ok(ids(snapshot).includes("wa"), "waiting_agent presente en initiatives");
     assert.ok(!inboxIds(snapshot).includes("wa"), "waiting_agent nunca en inbox");
+  });
+
+  it("sin delivery, waiting_human con request proyecta not_delivered", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "w-no-delivery",
+      state: "waiting_human",
+      summary: "espera sin delivery",
+      human_request_id: "req-no-delivery",
+    });
+    const repo = new AgendaRepository(db);
+
+    const snapshot = repo.projection.snapshotForAgent("alice", 9000);
+
+    assert.equal(snapshot.inbox[0]?.notificationStatus, "not_delivered");
+  });
+
+  it("una delivery en estado pending proyecta not_delivered", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "w-pending",
+      state: "waiting_human",
+      summary: "espera pending",
+      human_request_id: "req-pending",
+    });
+    insertDelivery(db, {
+      humanRequestId: "req-pending",
+      initiativeId: "w-pending",
+      messageId: "pending:req-pending",
+    });
+    const repo = new AgendaRepository(db);
+
+    const snapshot = repo.projection.snapshotForAgent("alice", 9000);
+
+    assert.equal(snapshot.inbox[0]?.notificationStatus, "not_delivered");
+  });
+
+  it("tras sustituir el placeholder por el message ID real proyecta delivered", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "w-delivered",
+      state: "waiting_human",
+      summary: "espera delivered",
+      human_request_id: "req-delivered",
+    });
+    insertDelivery(db, {
+      humanRequestId: "req-delivered",
+      initiativeId: "w-delivered",
+      messageId: "pending:req-delivered",
+    });
+    const repo = new AgendaRepository(db);
+    assert.equal(
+      repo.projection.snapshotForAgent("alice", 8999).inbox[0]?.notificationStatus,
+      "not_delivered",
+    );
+
+    db.prepare(
+      `UPDATE human_request_deliveries
+          SET external_message_id = '4242'
+        WHERE human_request_id = 'req-delivered'
+          AND external_message_id = 'pending:req-delivered'`,
+    ).run();
+    const snapshot = repo.projection.snapshotForAgent("alice", 9000);
+
+    assert.equal(snapshot.inbox[0]?.notificationStatus, "delivered");
+  });
+
+  it("delivery de otro Agent o de un request anterior no cuenta como entregada", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "w-wrong-agent",
+      state: "waiting_human",
+      summary: "espera scope Agent",
+      human_request_id: "req-wrong-agent",
+      created_at: 100,
+    });
+    insertDelivery(db, {
+      humanRequestId: "req-wrong-agent",
+      initiativeId: "w-wrong-agent",
+      agentName: "bob",
+      chatId: "2001",
+      messageId: "51",
+    });
+    insertInitiative(db, {
+      id: "w-old-request",
+      state: "waiting_human",
+      summary: "espera request actual",
+      human_request_id: "req-current",
+      created_at: 200,
+    });
+    insertDelivery(db, {
+      humanRequestId: "req-old",
+      initiativeId: "w-old-request",
+      chatId: "2002",
+      messageId: "52",
+    });
+    const repo = new AgendaRepository(db);
+
+    const snapshot = repo.projection.snapshotForAgent("alice", 9000);
+
+    assert.deepEqual(
+      snapshot.inbox.map((initiative) => initiative.notificationStatus),
+      ["not_delivered", "not_delivered"],
+    );
+  });
+
+  it("sin espera humana o sin request notificationStatus es null aunque exista una delivery", () => {
+    const db = openMemoryDb();
+    insertInitiative(db, {
+      id: "queued-with-delivery",
+      state: "queued",
+      human_request_id: "req-queued",
+      created_at: 100,
+    });
+    insertDelivery(db, {
+      humanRequestId: "req-queued",
+      initiativeId: "queued-with-delivery",
+      messageId: "53",
+    });
+    insertInitiative(db, {
+      id: "waiting-without-request",
+      state: "waiting_human",
+      summary: "espera sin request",
+      human_request_id: null,
+      created_at: 200,
+    });
+    const repo = new AgendaRepository(db);
+
+    const snapshot = repo.projection.snapshotForAgent("alice", 9000);
+
+    assert.equal(
+      snapshot.initiatives.find((initiative) => initiative.id === "queued-with-delivery")?.notificationStatus,
+      null,
+    );
+    assert.equal(
+      snapshot.initiatives.find((initiative) => initiative.id === "waiting-without-request")?.notificationStatus,
+      null,
+    );
   });
 
   it("con historyLimit=2 los no terminales siguen presentes completos", () => {

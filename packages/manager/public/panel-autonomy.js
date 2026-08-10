@@ -408,6 +408,15 @@ export function createAutonomyPanel({
     }
     card.appendChild(meta);
 
+    if (init.notificationStatus === "not_delivered") {
+      const warning = el("div", {
+        className: "autonomy-respond-status",
+        textContent: "No se pudo enviar la notificación por Telegram. Responde aquí en el panel.",
+      });
+      warning.setAttribute("role", "alert");
+      card.appendChild(warning);
+    }
+
     if (init.id) {
       const respondArea = el("div", { className: "autonomy-respond-area" });
       const textarea = el("textarea", {

@@ -278,7 +278,50 @@ test("P2.6.5: campos internos no filtran en DOM", async () => {
 });
 
 // ====================================================================
-// 6. documento oculto no hace fetch; activate/focus sí; sin duplicados
+// 6. notificationStatus not_delivered avisa sin bloquear la respuesta
+// ====================================================================
+test("P3.4/A11: notificationStatus not_delivered muestra alert y conserva Responder", async () => {
+  const { document } = setupDom();
+  const api = fakeApi();
+  api.getAutonomy = async () => {
+    const waiting = {
+      id: "i-not-delivered",
+      status: "waiting_human",
+      mode: "ask",
+      question: "¿Procedemos?",
+      notificationStatus: "not_delivered",
+      createdAt: 1699998000000,
+      expiresAt: 1700100000000,
+    };
+    return {
+      asOf: 1700000000000,
+      initiatives: [waiting],
+      agenda: [],
+      inbox: [waiting],
+      triggers: [],
+      historyTruncated: false,
+    };
+  };
+
+  const panel = createAutonomyPanel({ api, document, confirm: () => true });
+  panel.selectAgent("linus");
+  panel.activate();
+  await panel.refresh();
+
+  const alert = document.querySelector('.autonomy-inbox-card [role="alert"]');
+  assert.ok(alert, "warning accionable con role=alert en el inbox real");
+  assert.match(alert.textContent, /Telegram/);
+  assert.match(alert.textContent, /Responde aquí en el panel/);
+  const inboxCard = alert.closest(".autonomy-inbox-card");
+  const respondButton = Array.from(inboxCard.querySelectorAll("button"))
+    .find((button) => button.textContent.trim() === "Responder");
+  assert.ok(respondButton, "el warning no elimina el botón Responder");
+
+  panel.deactivate();
+});
+
+// ====================================================================
+// 7. documento oculto no hace fetch; activate/focus sí; sin duplicados
 // ====================================================================
 test("P2.6.6: documento oculto no hace fetch; activate con visible sí", async () => {
   const { document } = setupDom();
@@ -306,7 +349,7 @@ test("P2.6.6: documento oculto no hace fetch; activate con visible sí", async (
 });
 
 // ====================================================================
-// 7. badge suma inbox de varios agents y tolera fallo parcial
+// 8. badge suma inbox de varios agents y tolera fallo parcial
 // ====================================================================
 test("P2.6.7: badge suma inbox, fallo parcial conserva valor stale", async () => {
   const { document } = setupDom();
@@ -354,7 +397,7 @@ test("P2.6.7: badge suma inbox, fallo parcial conserva valor stale", async () =>
 });
 
 // ====================================================================
-// 8. 409/401 desde getAutonomy
+// 9. 409/401 desde getAutonomy
 // ====================================================================
 test("P2.6.8: 409/401 desde getAutonomy", async () => {
   const { document } = setupDom();

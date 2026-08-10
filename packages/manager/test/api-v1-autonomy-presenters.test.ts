@@ -63,6 +63,7 @@ function makeInternalInitiative(overrides?: Partial<InternalInitiative>): Intern
     humanQuestion: null,
     humanExpiresAt: null,
     humanRequestId: null,
+    notificationStatus: null,
     pendingHumanInput: null,
     humanResponseIdempotencyKey: null,
     humanResponseCommandHash: null,
@@ -126,6 +127,7 @@ const EXPECTED_INITIATIVE_KEYS = [
   "intent",
   "summary",
   "question",
+  "notificationStatus",
   "availableAt",
   "createdAt",
   "stateChangedAt",
@@ -187,6 +189,7 @@ const INITIATIVE_PRESENTER_READS = new Set([
   "availableAt", "createdAt", "stateChangedAt",
   "startedAt", "finishedAt",
   "humanExpiresAt",     // → expiresAt
+  "notificationStatus",
   "failureReason",
 ]);
 
@@ -247,6 +250,25 @@ describe("autonomy presenters — shape exacta", () => {
     const initiative = pub.initiatives[0];
     const keys = Object.keys(initiative).sort();
     assert.deepEqual(keys, EXPECTED_INITIATIVE_KEYS);
+  });
+
+  it("notificationStatus conserva delivered/not_delivered solo durante waiting_human", () => {
+    for (const notificationStatus of ["delivered", "not_delivered"] as const) {
+      const initiative = makeInternalInitiative({
+        state: "waiting_human",
+        humanRequestId: "req-current",
+        notificationStatus,
+      });
+      const pub = presentSnapshot(makeSnapshot({ initiatives: [initiative] }));
+      assert.equal(pub.initiatives[0].notificationStatus, notificationStatus);
+    }
+
+    const notWaiting = makeInternalInitiative({
+      state: "queued",
+      notificationStatus: "delivered",
+    });
+    const pub = presentSnapshot(makeSnapshot({ initiatives: [notWaiting] }));
+    assert.equal(pub.initiatives[0].notificationStatus, null);
   });
 
   it("PublicTrigger tiene las claves exactas (allowlist)", () => {
@@ -402,7 +424,13 @@ describe("autonomy presenters — taint automática (§3.2)", () => {
     //    que NO está en la allowlist — el taint automático la descubre.
     const futureProps = {
       telegramDeliveryId: "LEAK::telegramDeliveryId",
+      human_request_id: "LEAK::human_request_id",
+      external_chat_id: "LEAK::external_chat_id",
+      external_message_id: "LEAK::external_message_id",
+      chatId: "LEAK::chatId",
+      messageId: "LEAK::messageId",
       token: "LEAK::token",
+      deliveryError: "LEAK::deliveryError",
       transcript: "LEAK::transcript",
       secretCorrelation: "LEAK::secretCorrelation",
     };
@@ -458,6 +486,50 @@ describe("autonomy presenters — taint automática (§3.2)", () => {
       "telegramDeliveryId no debe aparecer en el JSON de service");
     assert.equal(panelJson.includes("telegramDeliveryId"), false,
       "telegramDeliveryId no debe aparecer en el JSON de panel");
+  });
+});
+
+describe("autonomy presenters — delivery coordinates taint", () => {
+  it("autonomy presenters never serialize tainted delivery coordinates", () => {
+    const forbidden = {
+      human_request_id: "LEAK::human_request_id",
+      external_chat_id: "LEAK::external_chat_id",
+      external_message_id: "LEAK::external_message_id",
+      chatId: "LEAK::chatId",
+      messageId: "LEAK::messageId",
+      token: "LEAK::token",
+      deliveryError: "LEAK::deliveryError",
+    };
+    const initiative = taintSecrets(
+      makeInternalInitiative({
+        state: "waiting_human",
+        humanRequestId: "LEAK::humanRequestId",
+        notificationStatus: "delivered",
+      }),
+      INITIATIVE_PRESENTER_READS,
+      forbidden,
+    );
+    const snapshot = makeSnapshot({
+      initiatives: [initiative],
+      agenda: [],
+      inbox: [initiative],
+      triggers: [],
+    });
+
+    for (const [principal, presenter] of [
+      ["service", SERVICE_AUTONOMY_PRESENTER],
+      ["panel", PANEL_AUTONOMY_PRESENTER],
+    ] as const) {
+      const presented = presenter.presentSnapshot(snapshot);
+      const json = JSON.stringify(presented);
+      assert.equal(presented.initiatives[0].notificationStatus, "delivered");
+      for (const [key, value] of Object.entries(forbidden)) {
+        assert.equal(json.includes(key), false, `${principal} serializó la coordenada ${key}`);
+        assert.equal(json.includes(value), false, `${principal} serializó el taint ${value}`);
+      }
+      assert.equal(json.includes("humanRequestId"), false, `${principal} serializó humanRequestId`);
+      assert.equal(json.includes("LEAK::humanRequestId"), false, `${principal} serializó el request interno`);
+    }
   });
 });
 

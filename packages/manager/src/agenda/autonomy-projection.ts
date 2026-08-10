@@ -46,6 +46,7 @@ export interface InternalInitiative extends Initiative {
   readonly humanQuestion: string | null;
   readonly humanExpiresAt: number | null;
   readonly humanRequestId: string | null;
+  readonly notificationStatus: "delivered" | "not_delivered" | null;
   readonly pendingHumanInput: string | null;
   readonly humanResponseIdempotencyKey: string | null;
   readonly humanResponseCommandHash: string | null;
@@ -144,6 +145,7 @@ interface InitiativeRow {
   human_question: string | null;
   human_expires_at: number | null;
   human_request_id: string | null;
+  notification_status: "delivered" | "not_delivered" | null;
   pending_human_input: string | null;
   human_response_idempotency_key: string | null;
   human_response_command_hash: string | null;
@@ -154,8 +156,23 @@ const SELECT_INITIATIVE = `
          available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
          visible_effects_declared, summary, ask_correlation, failure_reason,
          result, created_at, state_changed_at, started_at, finished_at,
-         human_question, human_expires_at, human_request_id, pending_human_input,
-         human_response_idempotency_key, human_response_command_hash
+         human_question, human_expires_at, human_request_id,
+         CASE
+           WHEN initiatives.state <> 'waiting_human'
+             OR initiatives.human_request_id IS NULL
+             THEN NULL
+           WHEN EXISTS (
+             SELECT 1
+               FROM human_request_deliveries d
+              WHERE d.human_request_id = initiatives.human_request_id
+                AND d.agent_name = initiatives.agent_name
+                AND d.channel = 'telegram'
+                AND d.external_message_id <> 'pending:' || initiatives.human_request_id
+           ) THEN 'delivered'
+           ELSE 'not_delivered'
+         END AS notification_status,
+         pending_human_input, human_response_idempotency_key,
+         human_response_command_hash
     FROM initiatives
 `;
 
@@ -210,6 +227,7 @@ function mapInitiative(row: InitiativeRow): InternalInitiative {
     humanQuestion: row.human_question,
     humanExpiresAt: row.human_expires_at,
     humanRequestId: row.human_request_id,
+    notificationStatus: row.notification_status,
     pendingHumanInput: row.pending_human_input,
     humanResponseIdempotencyKey: row.human_response_idempotency_key,
     humanResponseCommandHash: row.human_response_command_hash,
