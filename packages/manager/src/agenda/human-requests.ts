@@ -27,6 +27,7 @@
 import type { SqliteDb } from "../storage/sqlite.ts";
 import { canTransition, canChangeMode } from "./state.ts";
 import { DomainError } from "./errors.ts";
+import { ASK_HUMAN_QUESTION_MAX, ASK_HUMAN_SUMMARY_MAX } from "@pihub/shared";
 
 /** Resultado de `pauseRunningForHuman`: la Initiative ya en `waiting_human`. */
 export interface HumanRequest {
@@ -73,17 +74,41 @@ export class HumanRequestRepository {
   pauseRunningForHuman(command: PauseRunningForHumanCommand): HumanRequest {
     const { agentName, initiativeId, turnId, requestId, toolCallId, question, summary, now, expiryMs } = command;
 
-    // Validación tipada antes de abrir tx: cotas de la tool (plan §1.3).
-    if (typeof question !== "string" || question.length === 0 || question.length > 1000) {
+    // Validación tipada ANTES de abrir la tx (plan §1.3): IDs no vacíos, cotas
+    // de la tool reutilizadas de @pihub/shared (no literales duplicados) y
+    // aritmética de deadline sin desbordar.
+    for (const [name, value] of Object.entries({ agentName, initiativeId, turnId, requestId, toolCallId })) {
+      if (typeof value !== "string" || value.length === 0) {
+        throw new DomainError(
+          "INITIATIVE_INVARIANT_VIOLATION",
+          `pauseRunningForHuman: ${name} vacío o ausente`,
+        );
+      }
+    }
+    if (typeof expiryMs !== "number" || !Number.isSafeInteger(expiryMs) || expiryMs <= 0) {
       throw new DomainError(
         "INITIATIVE_INVARIANT_VIOLATION",
-        `pauseRunningForHuman: question vacía o fuera de límite (1..1000)`,
+        `pauseRunningForHuman: expiryMs debe ser un entero positivo (${String(expiryMs)})`,
       );
     }
-    if (typeof summary !== "string" || summary.length === 0 || summary.length > 500) {
+    // La suma no debe desbordar: `human_expires_at = now + expiryMs` debe seguir
+    // siendo un entero seguro (un `now`/`expiryMs` absurdo no lo es).
+    if (!Number.isSafeInteger(now + expiryMs)) {
       throw new DomainError(
         "INITIATIVE_INVARIANT_VIOLATION",
-        `pauseRunningForHuman: summary vacío o fuera de límite (1..500)`,
+        `pauseRunningForHuman: now + expiryMs desborda (${String(now)} + ${String(expiryMs)})`,
+      );
+    }
+    if (typeof question !== "string" || question.length === 0 || question.length > ASK_HUMAN_QUESTION_MAX) {
+      throw new DomainError(
+        "INITIATIVE_INVARIANT_VIOLATION",
+        `pauseRunningForHuman: question vacía o fuera de límite (1..${ASK_HUMAN_QUESTION_MAX})`,
+      );
+    }
+    if (typeof summary !== "string" || summary.length === 0 || summary.length > ASK_HUMAN_SUMMARY_MAX) {
+      throw new DomainError(
+        "INITIATIVE_INVARIANT_VIOLATION",
+        `pauseRunningForHuman: summary vacío o fuera de límite (1..${ASK_HUMAN_SUMMARY_MAX})`,
       );
     }
 

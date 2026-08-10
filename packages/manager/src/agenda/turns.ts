@@ -32,8 +32,8 @@ import type { SqliteDb } from "../storage/sqlite.ts";
 import { canTransition } from "./state.ts";
 import { DomainError } from "./errors.ts";
 
-/** Terminal de turno (§8.1): `turn-complete/error/aborted` → `succeeded/failed/cancelled`. */
-export type TurnFinalState = "succeeded" | "failed" | "cancelled";
+/** Terminal de turno (§8.1): `turn-complete/error/aborted` → `succeeded/failed/cancelled`; P3.2 añade `paused_for_human`. */
+export type TurnFinalState = "succeeded" | "failed" | "cancelled" | "paused_for_human";
 
 /**
  * Causa del terminal `failed` (plan de Fase 3 §5.2, Fase 3.2): el catálogo
@@ -154,6 +154,16 @@ export class TurnRepository {
     now: number,
     failureCause: FailureCause = "turn_failed",
   ): void {
+    // P3.2: `paused_for_human` es un terminal de turno que NO pasa por T6.
+    // `pauseRunningForHuman` (human-requests.ts) escribe ambas filas en una
+    // transacción separada y nunca llama a `complete`. Si alguien lo intenta,
+    // se rechaza explícitamente antes de tocar disco.
+    if (finalState === "paused_for_human") {
+      throw new DomainError(
+        "INITIATIVE_TRANSITION_ILLEGAL",
+        `turno (${agentName}, ${turnId}): paused_for_human no se escribe por T6 (§1.4)`,
+      );
+    }
     // Autoridad declarativa (§5.1): el UPDATE de la Initiative es una
     // transición `running → finalState` y pasa por la función pura antes de
     // tocar disco.

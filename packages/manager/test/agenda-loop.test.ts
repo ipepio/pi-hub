@@ -258,6 +258,7 @@ interface InsertInit {
   summary?: string | null;
   state_changed_at?: number;
   pending_human_input?: string | null;
+  human_expires_at?: number | null;
 }
 
 /** Siembra una fila `initiatives` (setup de fixture, no comportamiento bajo prueba). */
@@ -268,13 +269,14 @@ function insertInitiative(db: SqliteDb, init: InsertInit): void {
         available_at, bound_model, turn_id, chain_depth, chain_deadline_at,
         visible_effects_declared, summary, ask_correlation, failure_reason,
         result, created_at, state_changed_at, started_at, finished_at,
-        pending_human_input)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        pending_human_input, human_expires_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     init.id, init.agent_name ?? "alice", init.state ?? "queued", "human", null,
     "di hola", "solo", "sk-1", init.available_at ?? 0, null, init.turn_id ?? null,
     0, null, 0, init.summary ?? null, null, null, null, 1000, init.state_changed_at ?? 1000, 1000, null,
     init.pending_human_input ?? null,
+    init.human_expires_at ?? null,
   );
 }
 
@@ -805,20 +807,20 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     assert.equal(maxActive, 1);
   });
 
-  it("el barrido T10 recibe el CORTE (now - waitingHumanExpiryMs), no `now` — una pregunta de hace 1 minuto NO caduca", () => {
+  it("el barrido T10 recibe `now` — human_expires_at es la autoridad por fila", () => {
     const db = openMemoryDb();
     const repo = new AgendaRepository(db);
     const DAY_MS = 86_400_000;
-    // Entró en `waiting_human` 1 minuto antes del primer tick (t=1000).
+    const now = 1000;
+    // Pregunta de hace 1 minuto con deadline lejano: no caduca.
     insertInitiative(db, {
       id: "wh-reciente",
       state: "waiting_human",
       summary: "s",
-      state_changed_at: 1000 - 60_000,
+      human_expires_at: now + DAY_MS,
     });
     const cortes: number[] = [];
-    // Spy del barrido: registra el argumento que el Loop le pasa, sin tocar
-    // el reloj de pared (§7.1).
+    // Spy del barrido: registra el argumento que el Loop le pasa.
     const initiatives = new Proxy(repo.initiatives, {
       get(target, prop, receiver) {
         if (prop === "sweepWaitingHumanExpiry") {
@@ -844,9 +846,8 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     clock.advance(1000); // t=1000: el tick ejecuta el barrido
 
     assert.equal(cortes.length, 1);
-    // El Loop pasa el corte, no `now`: con `now` (=1000) la pregunta de hace
-    // 1 minuto caducaría en el tick siguiente (el bug).
-    assert.equal(cortes[0], 1000 - 7 * DAY_MS);
+    // P3.2: el Loop pasa `now` directamente; human_expires_at es la autoridad.
+    assert.equal(cortes[0], now);
     assert.equal(repo.initiatives.get("wh-reciente").state, "waiting_human");
   });
 });
