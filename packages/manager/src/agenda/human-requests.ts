@@ -217,3 +217,199 @@ export class HumanRequestRepository {
     };
   }
 }
+// ---------------------------------------------------------------------------
+// P3.4 — HumanRequestDeliveries (tabla v2 `human_request_deliveries`, A10).
+//
+// Seam durable de entrega de preguntas humanas al canal primario (Telegram).
+// La spec A10 congela la interfaz `HumanRequestDeliveries`: `lookupDelivery`
+// hace SIEMPRE el SQL exacto agent-scoped
+// `WHERE agent_name = ? AND channel = ? AND external_chat_id = ? AND
+// external_message_id = ?` — nunca un lookup global + filtro JS — y los IDs
+// externos se normalizan con `String()`. `markDelivered` incluye TODOS los
+// campos de scope y el placeholder en el `WHERE`, para que un retry tardío no
+// sobrescriba otra fila.
+//
+// Semántica at-least-once: la reserva `external_message_id = pending:<requestId>`
+// cuenta como **not_delivered** (nunca como delivered); el placeholder solo se
+// sustituye por el `message_id` real tras un `sendMessage` confirmado.
+// ---------------------------------------------------------------------------
+
+/** Canal de entrega soportado (solo Telegram en schema v2). */
+export type DeliveryChannel = "telegram";
+
+/** Fila durable de `human_request_deliveries` (tabla v2, P1 §2). */
+export interface HumanRequestDeliveryRow {
+  readonly humanRequestId: string;
+  readonly agentName: string;
+  readonly initiativeId: string;
+  readonly channel: DeliveryChannel;
+  readonly externalChatId: string;
+  readonly externalMessageId: string;
+  readonly createdAt: number;
+}
+
+/**
+ * Pending reconstruido: la fila de deliveries sola no basta para reintentar
+ * (A10 §"Si el proceso cae entre send y update"), así que `listPendingDeliveries`
+ * une agent-scoped con `initiatives` por `initiative_id` **y request actual**
+ * para recuperar question/summary/expiresAt originales.
+ */
+export interface PendingHumanRequestDelivery extends HumanRequestDeliveryRow {
+  readonly question: string;
+  readonly summary: string;
+  readonly expiresAt: number;
+}
+
+/** Seam durable de entregas que A10 expone (interfaz congelada por la spec). */
+export interface HumanRequestDeliveries {
+  recordDelivery(row: HumanRequestDeliveryRow): void;
+  lookupDelivery(
+    agentName: string,
+    channel: DeliveryChannel,
+    externalChatId: string,
+    externalMessageId: string,
+  ): HumanRequestDeliveryRow | null;
+  markDelivered(
+    agentName: string,
+    humanRequestId: string,
+    channel: DeliveryChannel,
+    externalChatId: string,
+    pendingExternalMessageId: string,
+    deliveredExternalMessageId: string,
+  ): void;
+  listPendingDeliveries(agentName: string): readonly PendingHumanRequestDelivery[];
+}
+
+interface RawDeliveryRow {
+  human_request_id: string;
+  agent_name: string;
+  initiative_id: string;
+  channel: string;
+  external_chat_id: string;
+  external_message_id: string;
+  created_at: number;
+}
+
+interface RawPendingRow extends RawDeliveryRow {
+  question: string | null;
+  summary: string | null;
+  expires_at: number | null;
+}
+
+export class HumanRequestDeliveriesRepository implements HumanRequestDeliveries {
+  private readonly sqlite: SqliteDb;
+
+  constructor(sqlite: SqliteDb) {
+    this.sqlite = sqlite;
+  }
+
+  recordDelivery(row: HumanRequestDeliveryRow): void {
+    this.sqlite
+      .prepare(
+        `INSERT INTO human_request_deliveries
+           (human_request_id, agent_name, initiative_id, channel,
+            external_chat_id, external_message_id, created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run(
+        row.humanRequestId,
+        row.agentName,
+        row.initiativeId,
+        row.channel,
+        String(row.externalChatId),
+        String(row.externalMessageId),
+        row.createdAt,
+      );
+  }
+
+  lookupDelivery(
+    agentName: string,
+    channel: DeliveryChannel,
+    externalChatId: string,
+    externalMessageId: string,
+  ): HumanRequestDeliveryRow | null {
+    // SQL exacto de la spec: scope completo por agent_name + channel + coords.
+    // NUNCA un lookup global seguido de filtro JS (A10).
+    const raw = this.sqlite
+      .prepare(
+        `SELECT human_request_id, agent_name, initiative_id, channel,
+                external_chat_id, external_message_id, created_at
+           FROM human_request_deliveries
+          WHERE agent_name = ? AND channel = ? AND external_chat_id = ?
+            AND external_message_id = ?`,
+      )
+      .get(agentName, channel, String(externalChatId), String(externalMessageId)) as
+      | RawDeliveryRow
+      | undefined;
+    if (!raw) return null;
+    return {
+      humanRequestId: raw.human_request_id,
+      agentName: raw.agent_name,
+      initiativeId: raw.initiative_id,
+      channel: raw.channel as DeliveryChannel,
+      externalChatId: raw.external_chat_id,
+      externalMessageId: raw.external_message_id,
+      createdAt: raw.created_at,
+    };
+  }
+
+  markDelivered(
+    agentName: string,
+    humanRequestId: string,
+    channel: DeliveryChannel,
+    externalChatId: string,
+    pendingExternalMessageId: string,
+    deliveredExternalMessageId: string,
+  ): void {
+    // El WHERE lleva todos los campos de scope MÁS el placeholder: un retry
+    // tardío solo sustituye la fila pending exacta, nunca una ya entregada.
+    this.sqlite
+      .prepare(
+        `UPDATE human_request_deliveries
+            SET external_message_id = ?
+          WHERE agent_name = ? AND human_request_id = ? AND channel = ?
+            AND external_chat_id = ? AND external_message_id = ?`,
+      )
+      .run(
+        String(deliveredExternalMessageId),
+        agentName,
+        humanRequestId,
+        channel,
+        String(externalChatId),
+        String(pendingExternalMessageId),
+      );
+  }
+
+  listPendingDeliveries(agentName: string): readonly PendingHumanRequestDelivery[] {
+    // Join agent-scoped con initiatives por initiative_id Y request actual
+    // (i.human_request_id = d.human_request_id): una pregunta nueva sobre la
+    // misma Initiative no reconstruye el contenido de un pending viejo.
+    const rows = this.sqlite
+      .prepare(
+        `SELECT d.human_request_id, d.agent_name, d.initiative_id, d.channel,
+                d.external_chat_id, d.external_message_id, d.created_at,
+                i.human_question AS question, i.summary AS summary,
+                i.human_expires_at AS expires_at
+           FROM human_request_deliveries d
+           JOIN initiatives i
+             ON i.id = d.initiative_id AND i.agent_name = d.agent_name
+            AND i.human_request_id = d.human_request_id
+          WHERE d.agent_name = ? AND d.channel = 'telegram'
+            AND d.external_message_id LIKE 'pending:%'
+          ORDER BY d.created_at, d.external_message_id`,
+      )
+      .all(agentName) as RawPendingRow[];
+    return rows.map((raw) => ({
+      humanRequestId: raw.human_request_id,
+      agentName: raw.agent_name,
+      initiativeId: raw.initiative_id,
+      channel: raw.channel as DeliveryChannel,
+      externalChatId: raw.external_chat_id,
+      externalMessageId: raw.external_message_id,
+      createdAt: raw.created_at,
+      question: raw.question ?? "",
+      summary: raw.summary ?? "",
+      expiresAt: raw.expires_at ?? 0,
+    }));
+  }
+}
