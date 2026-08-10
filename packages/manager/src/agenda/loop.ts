@@ -34,9 +34,11 @@
  * `stopped` (tensión señalada en §5.1, no resuelta: se queda `queued`).
  *
  * Despacho (§4.5, §4.2): claim unificado (`claimInitiative`, T7+T2 en una
- * sola tx) y después `TurnExecution.startTurn`. El Loop consume **solo**
- * `completion`: al recibir el terminal no cierra nada — `turns.complete` ya
- * cerró la Initiative en la misma tx de T6 (§4.4). Nada más que log y wakeup.
+ * sola tx) y después `TurnExecution.startTurn`. El Loop espera el primer canal
+ * que resuelva entre el terminal SSE público (`completion`) y la pausa durable
+ * interna (`waitingHuman`). En ambos casos libera su handle local y hace
+ * wakeup; no cierra nada: T6 o `pauseRunningForHuman` ya hicieron la escritura
+ * durable correspondiente antes de resolver el canal.
  * Un `startTurn` que lanza **tras** el claim escribe `failed` vía T6 con
  * `dispatch_failed` (§5.2); un claim que falla se descarta y el siguiente
  * `tick` reevalúa la fotografía durable. `bound_model` queda sin fijar (D17):
@@ -140,6 +142,17 @@ interface TurnoLocal {
   readonly handle: TurnHandle;
   readonly agentName: string;
   readonly turnId: string;
+}
+
+/** Rama inerte para turnos sin canal interno (los humanos y fakes legacy). */
+const neverResolves = new Promise<never>(() => {});
+
+/** Primer desenlace observable por el Loop: terminal SSE o pausa durable. */
+function loopOutcome(handle: TurnHandle): Promise<unknown> {
+  return Promise.race([
+    handle.completion,
+    handle.waitingHuman ?? neverResolves,
+  ]);
 }
 
 export class AgendaLoop {
@@ -424,7 +437,10 @@ export class AgendaLoop {
 
     const local: TurnoLocal = { handle, agentName: running.agentName, turnId };
     this.enVueloLocal.add(local);
-    void handle.completion.then(
+    // P3.3: el primer desenlace gana. `waitingHuman` solo resuelve después del
+    // COMMIT de `waiting_human`; quitar el handle aquí libera el dial sin
+    // fabricar un terminal público ni llamar `cerrarFallido`.
+    void loopOutcome(handle).then(
       () => {
         this.enVueloLocal.delete(local);
         this.wakeup();
@@ -461,7 +477,7 @@ export class AgendaLoop {
   private async awaitTurnosO(ms: number): Promise<void> {
     const vivos = [...this.enVueloLocal];
     if (vivos.length === 0) return;
-    const terminaron = Promise.all(vivos.map((t) => t.handle.completion)).then(() => undefined);
+    const terminaron = Promise.all(vivos.map((t) => loopOutcome(t.handle))).then(() => undefined);
     const plazo = new Promise<void>((resolve) => {
       this.schedule(() => resolve(), ms);
     });

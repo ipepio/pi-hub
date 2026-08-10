@@ -20,7 +20,7 @@ import { AgendaRepository } from "../src/agenda/index.ts";
 import { AgendaLoop, type AgendaLoopOptions, type LoopAgenda, type LoopSupervisor, type LoopTurnExecution } from "../src/agenda/loop.ts";
 import type { Initiative } from "../src/agenda/initiatives.ts";
 import type { FailureCause, TurnFinalState } from "../src/agenda/turns.ts";
-import type { StartTurnCommand, TimerHandle, TurnHandle } from "../src/agenda/turn-execution.ts";
+import { TurnExecution, type StartTurnCommand, type TimerHandle, type TurnHandle } from "../src/agenda/turn-execution.ts";
 import type { TurnSseEvent } from "../src/api-v1/turns.ts";
 
 const HOUR_MS = 3_600_000;
@@ -115,6 +115,8 @@ interface PendingTurn {
   readonly command: StartTurnCommand;
   readonly completion: Promise<TurnSseEvent>;
   readonly resolveCompletion: (terminal: TurnSseEvent) => void;
+  readonly waitingHuman?: Promise<{ initiativeId: string; requestId: string } | null>;
+  readonly resolveWaitingHuman?: (waiting: { initiativeId: string; requestId: string } | null) => void;
   resolved: boolean;
   aborted: boolean;
   timeoutHandle?: TimerHandle;
@@ -158,10 +160,19 @@ class FakeTurnExecution implements LoopTurnExecution {
     const completion = new Promise<TurnSseEvent>((resolve) => {
       resolveCompletion = resolve;
     });
+    let resolveWaitingHuman:
+      | ((waiting: { initiativeId: string; requestId: string } | null) => void)
+      | undefined;
+    const waitingHuman = command.origin.kind === "initiative"
+      ? new Promise<{ initiativeId: string; requestId: string } | null>((resolve) => {
+          resolveWaitingHuman = resolve;
+        })
+      : undefined;
     const pending: PendingTurn = {
       command,
       completion,
       resolveCompletion,
+      ...(waitingHuman ? { waitingHuman, resolveWaitingHuman } : {}),
       resolved: false,
       aborted: false,
     };
@@ -175,6 +186,7 @@ class FakeTurnExecution implements LoopTurnExecution {
     }
     return {
       completion,
+      ...(waitingHuman ? { waitingHuman } : {}),
       disconnect: () => this.resolve(pending, turnError(command.turnId, "runner_unavailable"), "runner_unavailable"),
     };
   }
@@ -213,6 +225,21 @@ class FakeTurnExecution implements LoopTurnExecution {
     const pending = this.pending.find((p) => !p.resolved && p.command.agentName === agentName && p.command.turnId === turnId);
     assert.ok(pending, `turno (${agentName}, ${turnId}) no está pendiente`);
     this.resolve(pending, terminal, cause);
+  }
+
+  resolveWaitingHumanFor(
+    agentName: string,
+    turnId: string,
+    waiting: { initiativeId: string; requestId: string },
+  ): void {
+    const pending = this.pending.find((p) =>
+      !p.resolved && p.command.agentName === agentName && p.command.turnId === turnId
+    );
+    assert.ok(pending, `turno (${agentName}, ${turnId}) no está pendiente`);
+    assert.ok(pending.resolveWaitingHuman, "el turno de Initiative debe exponer waitingHuman");
+    pending.resolved = true;
+    if (pending.timeoutHandle !== undefined) this.deps.cancel(pending.timeoutHandle);
+    pending.resolveWaitingHuman(waiting);
   }
 }
 
@@ -433,6 +460,154 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     clock.advance(0); // wakeup: no espera tickIntervalMs
     assert.equal(fake.started.length, 2);
     assert.equal(fake.started[1].agentName, "bob");
+  });
+
+  it("waiting_human libera el dial y el wakeup arranca B sin redespachar A", async () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const clock = new ManualClock();
+    const { loop, fake, supervisor } = makeLoop(repo, clock);
+    insertInitiative(db, { id: "A1", agent_name: "alice", available_at: 0 });
+    insertInitiative(db, { id: "B1", agent_name: "bob", available_at: 1 });
+    supervisor.set("alice", "running", 4100);
+    supervisor.set("bob", "running", 4101);
+
+    loop.start();
+    clock.advance(1000);
+    assert.equal(fake.started.length, 1);
+    const a = fake.started[0];
+    assert.deepEqual(a.origin, { kind: "initiative", initiativeId: "A1", cause: "human" });
+
+    // El fake respeta el orden real: primero COMMIT multi-fila y solo después
+    // resuelve el canal interno que observa el Loop.
+    repo.humanRequests.pauseRunningForHuman({
+      agentName: "alice",
+      initiativeId: "A1",
+      turnId: a.turnId,
+      requestId: "request-A1",
+      toolCallId: "tool-A1",
+      question: "¿Sigo?",
+      summary: "Alice necesita aprobación",
+      now: clock.now(),
+      expiryMs: 60_000,
+    });
+    fake.resolveWaitingHumanFor("alice", a.turnId, {
+      initiativeId: "A1",
+      requestId: "request-A1",
+    });
+    await flush();
+    clock.advance(0);
+
+    assert.equal(fake.started.length, 2, "B arranca en el wakeup inmediato");
+    assert.equal(fake.started[1].agentName, "bob");
+    assert.equal(repo.initiatives.get("A1").state, "waiting_human");
+    assert.equal(repo.initiatives.get("A1").failureReason, null);
+    assert.equal(
+      fake.started.filter((started) =>
+        started.origin.kind === "initiative" && started.origin.initiativeId === "A1"
+      ).length,
+      1,
+      "A no se vuelve a despachar",
+    );
+  });
+
+  it("a blocked Primary Channel never blocks the next Initiative", async () => {
+    const db = openMemoryDb();
+    const repo = new AgendaRepository(db);
+    const clock = new ManualClock();
+    const supervisor = new FakeSupervisor();
+    insertInitiative(db, { id: "A1", agent_name: "alice", available_at: 0 });
+    insertInitiative(db, { id: "B1", agent_name: "bob", available_at: 1 });
+    supervisor.set("alice", "running", 4100);
+    supervisor.set("bob", "running", 4101);
+
+    let socketNumber = 0;
+    const promptedSockets: number[] = [];
+    const createWebSocket = () => {
+      const number = socketNumber++;
+      const listeners = new Map<string, Array<(raw: unknown) => void>>();
+      const emit = (event: string, raw: unknown): void => {
+        listeners.get(event)?.forEach((listener) => listener(raw));
+      };
+      let closed = false;
+      return {
+        on(event: string, listener: (raw: unknown) => void) {
+          (listeners.get(event) ?? listeners.set(event, []).get(event)!).push(listener);
+          if (event === "open") {
+            queueMicrotask(() => {
+              emit("open", undefined);
+              emit("message", JSON.stringify({
+                type: "ready",
+                capabilities: ["ask_human_v1"],
+              }));
+            });
+          }
+        },
+        send(data: string) {
+          const message = JSON.parse(data) as { type?: string };
+          if (message.type !== "prompt") return;
+          promptedSockets.push(number);
+          emit("message", JSON.stringify({ type: "agent_start" }));
+          if (number === 0) {
+            emit("message", JSON.stringify({
+              type: "human_input_required",
+              question: "¿Autorizas A?",
+              summary: "A espera al humano",
+              toolCallId: "tool-blocked-delivery",
+            }));
+          }
+        },
+        close() {
+          if (closed) return;
+          closed = true;
+          emit("close", undefined);
+        },
+      };
+    };
+
+    let deliveryAttempts = 0;
+    const originalConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      if (!String(args[0]).includes("HUMAN_REQUEST_CALLBACK_FAILED")) {
+        originalConsoleError(...args);
+      }
+    };
+    try {
+      const turns = new TurnExecution({
+        apiToken: "service-token",
+        repository: repo.turns,
+        humanRequests: repo.humanRequests,
+        now: clock.now,
+        requestId: () => "request-blocked-delivery",
+        expiryMs: 60_000,
+        onHumanRequest: () => {
+          deliveryAttempts += 1;
+          throw new Error("Primary Channel bloqueado");
+        },
+        schedule: clock.schedule,
+        cancel: clock.cancel,
+        createWebSocket: () => createWebSocket() as never,
+      });
+      const loop = new AgendaLoop(repo, supervisor, turns, {
+        now: clock.now,
+        schedule: clock.schedule,
+        cancel: clock.cancel,
+        tickIntervalMs: 1000,
+      });
+
+      loop.start();
+      clock.advance(1000); // A se reclama; el fake WS abre en microtarea.
+      await flush(); // Ask → COMMIT → waitingHuman → callback que lanza → wakeup.
+      assert.equal(repo.initiatives.get("A1").state, "waiting_human");
+      assert.equal(deliveryAttempts, 1, "el seam de entrega sí se intentó");
+
+      clock.advance(0); // wakeup inmediato, sin esperar al periódico.
+      await flush();
+      assert.equal(repo.initiatives.get("B1").state, "running");
+      assert.deepEqual(promptedSockets, [0, 1]);
+    } finally {
+      console.error = originalConsoleError;
+    }
   });
 
   it("dial 2: A1 y B1 arrancan; nunca A1+A2; B1 libera C1 y A1 libera A2", async () => {

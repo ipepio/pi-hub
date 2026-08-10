@@ -13,7 +13,9 @@
  * produce exactamente un terminal SSE. P3.3 añade una única salida no terminal:
  * una Initiative pausada durablemente resuelve `waitingHuman` y conserva
  * `completion` pendiente, para no publicar un terminal falso al cliente SSE.
- * En los demás caminos `completion` resuelve con un evento terminal:
+ * En los demás caminos que alcanzan un terminal `completion` resuelve con un
+ * evento SSE terminal. Si la escritura de la pausa falla, ambos canales quedan
+ * pendientes y el slot se conserva para no publicar ni liberar sin COMMIT:
  * - `agent_end` → `turn-complete` (o `turn-aborted` si hubo abort);
  * - `error` del Runner → `turn-error` (causa `turn_failed`);
  * - `close` del Runner sin terminal limpio, error de conexión o timeout de
@@ -241,7 +243,8 @@ export class TurnExecution {
    * Abre el WS contra el Runner, registra el turno como vivo y traduce los
    * mensajes del Runner a eventos. Todo turno que termina resuelve `completion`
    * con **exactamente un** terminal (Fase 3.2); la excepción deliberada es una
-   * Initiative pausada, que resuelve solo el canal interno `waitingHuman`.
+   * Initiative pausada, que resuelve solo el canal interno `waitingHuman`, y
+   * una pausa cuyo write falla, que conserva ambos canales pendientes.
    * Un `close` sin terminal limpio, error de conexión o timeout publican
    * `turn-error` en vez del cierre mudo de la ruta original.
    */
@@ -408,11 +411,12 @@ export class TurnExecution {
           now: this.now(),
           expiryMs: this.expiryMs,
         });
-      } catch {
-        // El repositorio hizo rollback. Desarmar el latch permite que el único
-        // terminal público de fallo escriba T6; nunca se fabrica waiting_human.
-        turno.pausing = false;
-        finalizar(turnError("turn_failed"), "turn_failed");
+      } catch (error) {
+        // El repositorio hizo rollback: no hay pausa durable que permita
+        // liberar el slot ni terminal waiting_human que publicar. El latch se
+        // conserva para que agent_end/error/close tardíos tampoco fabriquen un
+        // terminal público y dejen la Initiative `running` a la recuperación.
+        console.error(`[pihub] HUMAN_PAUSE_WRITE_FAILED ${clave}:`, error);
         return;
       }
 

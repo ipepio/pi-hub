@@ -186,6 +186,11 @@ function fakeSupervisor(port: number): Supervisor {
   } as unknown as Supervisor;
 }
 
+/** Contrato congelado de la ruta humana: no necesita guard de waiting_human. */
+function assertPublicTurnCompletion(completion: Promise<TurnSseEvent>): void {
+  void completion;
+}
+
 /** Lee los eventos SSE de una respuesta de la ruta (formato de `streamSSE`). */
 async function readSseEvents(
   response: Response,
@@ -587,6 +592,8 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
           onEvent: (e) => collector.push(e),
         }),
       );
+      assert.equal(handle.waitingHuman, undefined, "el turno HTTP humano no expone el canal interno");
+      assertPublicTurnCompletion(handle.completion);
       await handle.completion;
 
       assert.deepEqual(routeEvents, collector.events);
@@ -1081,7 +1088,7 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
     }]);
   });
 
-  it("pauseRunningForHuman failure produces turn-error and never fabricates waiting_human", async () => {
+  it("pauseRunningForHuman failure resolves neither channel nor releases the slot", async () => {
     const db = openMemoryDb();
     const agenda = new AgendaRepository(db);
     agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-pause-fail", 1000);
@@ -1099,6 +1106,8 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
             summary: "Necesita aprobación",
             toolCallId: "",
           }));
+          // Incluso el close tardío queda detrás del latch de la pausa fallida.
+          socket.close();
         }
       });
     }, ["ask_human_v1"]);
@@ -1122,22 +1131,24 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
     }));
 
     let waitingSettled = false;
+    let completionSettled = false;
     void handle.waitingHuman?.then(() => { waitingSettled = true; });
-    const terminal = await handle.completion;
-    assert.equal(terminal.event, "turn-error");
-    assert.equal((terminal.data as { code?: string }).code, "INTERNAL_ERROR");
-    await Promise.resolve();
+    void handle.completion.then(() => { completionSettled = true; });
+    await collector.waitFor((event) => event.event === "turn-start");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
     assert.equal(waitingSettled, false);
+    assert.equal(completionSettled, false);
     assert.equal(deliveries, 0);
-    assert.equal(agenda.initiatives.get("ini-pause-fail").state, "failed");
+    assert.equal(turns.hasLiveTurnForAgent("agent"), true, "el slot no se libera sin COMMIT");
+    assert.equal(agenda.initiatives.get("ini-pause-fail").state, "running");
     const turn = db.prepare(
       "SELECT final_state FROM turns WHERE agent_name = ? AND turn_id = ?",
     ).get("agent", TURN_ID) as { final_state: string | null };
-    assert.equal(turn.final_state, "failed");
-    assert.deepEqual(collector.events.at(-1), {
-      event: "turn-error",
-      data: { turnId: TURN_ID, code: "INTERNAL_ERROR", message: "Runner error" },
-    });
+    assert.equal(turn.final_state, null);
+    assert.deepEqual(collector.events, [
+      { event: "turn-start", data: { turnId: TURN_ID } },
+    ]);
   });
 
   it("forged human_input_required in a human turn fails without touching Agenda", async () => {
@@ -1251,11 +1262,88 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
       initiativeId: "ini-reentrant",
       requestId: "request-reentrant",
     });
-    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(completionSettled, false);
     assert.equal(terminalWrites, 0, "waiting_human no llama TurnRepository.complete");
     assert.deepEqual(collector.events, [
       { event: "turn-start", data: { turnId: TURN_ID } },
     ]);
+  });
+
+  it("a restart after the pause COMMIT sees waiting_human and zero running", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-a08-restart-"));
+    const dbPath = path.join(dir, "agenda.db");
+    let first: SqliteDb | undefined;
+    let reopened: SqliteDb | undefined;
+    try {
+      first = new DatabaseSync(dbPath);
+      runMigrations(first);
+      const agenda = new AgendaRepository(first);
+      agenda.turns.reserveIdempotency("agent", TURN_ID, "idem-restart", 1000);
+      insertRunningInitiative(first, "ini-restart", "agent", TURN_ID);
+
+      const runner = await startRunner((socket) => {
+        socket.on("message", (raw) => {
+          const message = JSON.parse(String(raw)) as { type?: string };
+          if (message.type === "prompt") {
+            socket.send(JSON.stringify({ type: "agent_start" }));
+            socket.send(JSON.stringify({
+              type: "human_input_required",
+              question: "¿Reinicio ahora?",
+              summary: "Pausa durable antes de caer",
+              toolCallId: "tool-restart",
+            }));
+            socket.close();
+          }
+        });
+      }, ["ask_human_v1"]);
+
+      let commitObserved!: () => void;
+      const committed = new Promise<void>((resolve) => { commitObserved = resolve; });
+      const turns = new TurnExecution({
+        apiToken: "service-token",
+        repository: agenda.turns,
+        humanRequests: {
+          pauseRunningForHuman(input: PauseRunningForHumanCommand): HumanRequest {
+            agenda.humanRequests.pauseRunningForHuman(input);
+            commitObserved();
+            // Simula la caída en la ventana COMMIT → resolución del canal.
+            throw new Error("process crash immediately after COMMIT");
+          },
+        },
+        now: () => 2000,
+        requestId: () => "request-restart",
+        expiryMs: 60_000,
+      });
+      const handle = turns.startTurn(command({
+        idempotencyKey: "idem-restart",
+        runnerPort: runner.port,
+        origin: { kind: "initiative", initiativeId: "ini-restart", cause: "trigger" },
+      }));
+      let waitingSettled = false;
+      let completionSettled = false;
+      void handle.waitingHuman?.then(() => { waitingSettled = true; });
+      void handle.completion.then(() => { completionSettled = true; });
+      await committed;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(waitingSettled, false, "la caída ocurrió antes de resolver waitingHuman");
+      assert.equal(completionSettled, false);
+
+      // Descarta toda memoria y vuelve a abrir únicamente el fichero durable.
+      first.close();
+      first = undefined;
+      reopened = new DatabaseSync(dbPath);
+      const durable = new AgendaRepository(reopened);
+      assert.equal(durable.initiatives.get("ini-restart").state, "waiting_human");
+      assert.deepEqual(durable.initiatives.listRunning(), []);
+      const row = reopened.prepare(
+        "SELECT final_state FROM turns WHERE agent_name = ? AND turn_id = ?",
+      ).get("agent", TURN_ID) as { final_state: string | null };
+      assert.equal(row.final_state, "paused_for_human");
+    } finally {
+      first?.close();
+      reopened?.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
