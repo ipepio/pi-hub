@@ -51,6 +51,7 @@ let DEFAULT_AGENT: string;
 let PANEL_COOKIE: string;
 let PANEL_CSRF: string;
 let AUTONOMY_AGENT: string;
+let JOURNEY_AGENT: string | undefined;
 
 function headerCookies(response: Response): string[] {
   const headers = response.headers as Headers & { getSetCookie?: () => string[] };
@@ -80,7 +81,7 @@ async function loginPanel(): Promise<void> {
 
 async function panelRequest(
   path: string,
-  options: { method?: string; body?: unknown; origin?: string } = {},
+  options: { method?: string; body?: unknown; origin?: string; headersExtra?: Record<string, string> } = {},
 ): Promise<{ status: number; body: unknown; rawText: string }> {
   const method = options.method ?? "GET";
   const headers: Record<string, string> = {
@@ -91,6 +92,7 @@ async function panelRequest(
     headers["X-CSRF-Token"] = PANEL_CSRF;
   }
   if (options.origin) headers.Origin = options.origin;
+  if (options.headersExtra) Object.assign(headers, options.headersExtra);
 
   const response = await fetch(new URL(path, MANAGER_URL), {
     method,
@@ -154,6 +156,7 @@ after(async () => {
   if (TURN_AGENT) await request(`/api/v1/agents/${TURN_AGENT}`, { method: "DELETE" });
   if (UPLOAD_AGENT) await request(`/api/v1/agents/${UPLOAD_AGENT}`, { method: "DELETE" });
   if (AUTONOMY_AGENT) await request(`/api/v1/agents/${AUTONOMY_AGENT}`, { method: "DELETE" });
+  if (JOURNEY_AGENT) await request(`/api/v1/agents/${JOURNEY_AGENT}`, { method: "DELETE" });
 });
 
 async function uploadRequest(
@@ -1044,12 +1047,160 @@ describe("T01.03 — Contract Red: /api/v1 (spec docs/manager-api-v1.md)", () =>
       );
     });
 
-    it("Bearer funciona en GET autonomy contra Manager Gobernado", { skip: true }, async () => {
-      // Requiere Gobernado con el Agent creado.
-      const { status, body, rawText } = await request(`/api/v1/agents/${AUTONOMY_AGENT}/autonomy`);
-      assert.strictEqual(status, 200, `Bearer falló en Gobernado: ${rawText}`);
-      assert.ok((body as { asOf?: number }).asOf);
-      assertNoInternalsLeaked(rawText);
+  // ---------------------------------------------------------------------------
+  // P3.7 — Journey Governor contractual (black-box HTTP): Trigger → running →
+  // Ask → inbox → respond panel → misma sesión → terminal.
+  // ---------------------------------------------------------------------------
+  //
+  // Esta capa valida el contrato público y el journey observable contra un
+  // Manager REAL arrancado en :4000 (Gobernador, panel activado). El modelo
+  // real recibe un intent que le ordena llamar `ask_human` exactamente una
+  // vez; `PIHUB_CONTRACT_MODEL` inyecta el seam determinista de la
+  // verificación local (no es un modelo fake de dominio). Telegram no se
+  // configura en esta capa (fail-closed A10): el panel sigue siendo operativo
+  // y `notificationStatus` se proyecta sin coordenadas de delivery. Las
+  // variantes Telegram fake (entregada + reply correlacionada, y fallo de
+  // entrega) viven en la capa in-process `p3-journey.test.ts`.
+
+  describe("P3.7 — Journey Governor: trigger → running → Ask → inbox → respond panel → terminal", { concurrency: false }, () => {
+    const triggerTime = (): string => {
+      // Próximo minuto civil en Europe/Madrid (el Loop dispara por
+      // `next_fire_at` en cada tick de 1s).
+      const civil = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Europe/Madrid",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(new Date(Date.now() + 120_000));
+      const get = (type: string): string => civil.find((p) => p.type === type)?.value ?? "00";
+      return `${get("hour")}:${get("minute")}`;
+    };
+
+    interface PublicInitiativeShape {
+      id?: string;
+      origin?: string;
+      triggerId?: string | null;
+      status?: string;
+      question?: string | null;
+      expiresAt?: number | null;
+      notificationStatus?: "delivered" | "not_delivered" | null;
+    }
+
+    const initiativesOf = (body: unknown): PublicInitiativeShape[] =>
+      ((body as { initiatives?: unknown[] }).initiatives ?? []) as PublicInitiativeShape[];
+
+    /** Espera a que el snapshot tenga una Initiative del trigger con `status`. */
+    const waitForStatus = async (
+      agent: string,
+      triggerId: string,
+      status: string,
+      timeoutMs: number,
+    ): Promise<PublicInitiativeShape> => {
+      const deadline = Date.now() + timeoutMs;
+      let lastBody: unknown;
+      for (;;) {
+        const result = await request(`/api/v1/agents/${agent}/autonomy`);
+        assert.strictEqual(result.status, 200, `snapshot del Agent falló: ${result.rawText}`);
+        lastBody = result.body;
+        const found = initiativesOf(result.body).find(
+          (ini) => ini.triggerId === triggerId && ini.status === status,
+        );
+        if (found) return found;
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `timeout ${timeoutMs}ms: la Initiative del trigger ${triggerId} no llegó a ${status}; ` +
+              `último snapshot: ${JSON.stringify(lastBody).slice(0, 400)}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    };
+
+    it("P3 journey from trigger to terminal via the panel in the same session", async () => {
+      // (0) Agent fresco del journey (modelo inyectado por PIHUB_CONTRACT_MODEL).
+      JOURNEY_AGENT = `p37-journey-${Date.now()}`;
+      const created = await request("/api/v1/agents", {
+        method: "POST",
+        body: { name: JOURNEY_AGENT, model: CONTRACT_MODEL, thinkingLevel: "low" },
+      });
+      assert.strictEqual(created.status, 201, `no se pudo crear el Agent del journey: ${created.rawText}`);
+      await waitForAgentRunning(JOURNEY_AGENT);
+
+      // (1) Trigger diario en el próximo minuto, mode ask, intent que ordena
+      //     pedir aprobación humana con la tool ask_human (P3.1).
+      const triggerResult = await request(`/api/v1/agents/${JOURNEY_AGENT}/triggers`, {
+        method: "POST",
+        body: {
+          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: triggerTime() },
+          intent:
+            "STOP: you must ask the human for approval before continuing. " +
+            "Call the ask_human tool EXACTLY ONCE with question='May I continue with the plan?' " +
+            "and summary='I need your approval to continue'. Do not output any text. " +
+            "Stop immediately after the tool call.",
+          mode: "ask",
+          suggestedSkill: null,
+        },
+        headersExtra: { "Idempotency-Key": `p37-trigger-${Date.now()}` },
+      });
+      assert.strictEqual(triggerResult.status, 201, `crear Trigger falló: ${triggerResult.rawText}`);
+      const triggerId = (triggerResult.body as { trigger?: { id?: string } }).trigger?.id;
+      assert.ok(triggerId, "falta trigger.id");
+
+      // (2) running → Ask (waiting_human con pregunta y deadline por fila).
+      await waitForStatus(JOURNEY_AGENT, triggerId, "running", 240_000);
+      const waiting = await waitForStatus(JOURNEY_AGENT, triggerId, "waiting_human", 240_000);
+      assert.ok(waiting.id, "la Initiative en waiting_human debe tener id");
+      assert.match(waiting.question ?? "", /May I continue/, "el panel debe ver la pregunta del ask_human");
+      assert.ok(
+        typeof waiting.expiresAt === "number" && waiting.expiresAt > Date.now() / 2,
+        "el panel debe ver el deadline por fila",
+      );
+
+      // (3) El inbox (vía cookie de panel) ve la Initiative esperando sin
+      //     internals y con la clave `notificationStatus` allowlisted.
+      const panelSnapshot = await panelRequest(`/api/v1/agents/${JOURNEY_AGENT}/autonomy`);
+      assert.strictEqual(panelSnapshot.status, 200, `panel snapshot falló: ${panelSnapshot.rawText}`);
+      const inboxInis = ((panelSnapshot.body as { inbox?: PublicInitiativeShape[] }).inbox ?? []);
+      const inboxIni = inboxInis.find((ini) => ini.id === waiting.id);
+      assert.ok(inboxIni, "la Initiative esperando debe estar en el inbox del panel");
+      assert.equal(
+        inboxIni.notificationStatus,
+        "not_delivered",
+        "sin Primary Channel no hay tarjeta: la Initiative se ve como not_delivered (fail-closed) sin coordenadas",
+      );
+      assert.equal(inboxIni.status, "waiting_human");
+      assertNoInternalsLeaked(panelSnapshot.rawText);
+      for (const field of ["sessionKey", "turnId", "humanRequestId", "askCorrelation", "chatId", "messageId"]) {
+        assert.doesNotMatch(panelSnapshot.rawText, new RegExp(field), `el snapshot no debe contener "${field}"`);
+      }
+
+      // (4) Respond por panel (cookie + CSRF + Idempotency-Key): reencola
+      //     (queued), no despacha.
+      const respond = await panelRequest(`/api/v1/agents/${JOURNEY_AGENT}/initiatives/${waiting.id}/respond`, {
+        method: "POST",
+        body: { answer: "Yes, continue and finish the task now. Complete your work and stop." },
+        headersExtra: { "Idempotency-Key": `p37-respond-${Date.now()}` },
+      });
+      assert.strictEqual(respond.status, 200, `respond del panel falló: ${respond.rawText}`);
+      const respondBody = respond.body as {
+        initiative?: PublicInitiativeShape;
+        replayed?: boolean;
+      };
+      assert.equal(respondBody.replayed, false);
+      assert.equal(respondBody.initiative?.status, "queued", "respond solo reencola; el Loop es el único dispatcher");
+
+      // (5) Misma sesión (mismo id de Initiative, mismo trigger) → terminal.
+      //     El `respond` ya afirmó el reencolado a queued (paso 4); aquí el
+      //     Loop reclama y la misma Initiative llega a terminal.
+      const terminal = await waitForStatus(JOURNEY_AGENT, triggerId, "succeeded", 240_000);
+      assert.equal(terminal.id, waiting.id, "la misma Initiative llega a terminal (misma sesión)");
+
+      // (6) Una sola Initiative del trigger en todo el journey (sin duplicados).
+      const finalSnapshot = await request(`/api/v1/agents/${JOURNEY_AGENT}/autonomy`);
+      const fromTrigger = initiativesOf(finalSnapshot.body).filter((ini) => ini.triggerId === triggerId);
+      assert.equal(fromTrigger.length, 1, `el trigger no debe crear más de una Initiative: ${JSON.stringify(fromTrigger)}`);
+      assertNoInternalsLeaked(finalSnapshot.rawText);
     });
   });
+});
 });
