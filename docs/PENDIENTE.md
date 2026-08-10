@@ -13,12 +13,6 @@ Runtime: Loop, Agenda, Initiative, Trigger, callback, ejecución por turnos y pe
 `/api/v1.../autonomy` expone el snapshot público con presenters por allowlist, auth dual (Bearer + cookie/CSRF), y el
 panel tiene una pestaña de Autonomía.
 
-**Lo que queda (P3 pendiente):** `waiting_human` end-to-end. El estado de dominio
-se proyecta (`status: "waiting_human"`, `question`, `availableAt`), pero ningún
-camino real lo produce desde el Runner (tool `ask_human`, entrega por Telegram).
-Para ello hace falta el adapter de Runtime que invoque la tool y el camino de
-entrega externa.
-
 **Lo que queda (P4 pendiente):** admisión y draining reales. Las rutas
 `/api/v1/runtime/admission` existen y devuelven `503 RESOURCE_UNAVAILABLE` a
 propósito; P4 sustituirá el port de admisión ausente por un adapter real.
@@ -111,11 +105,6 @@ ausencia de secretos/paths en las respuestas. La matriz unitaria cubre además
 atomicidad, rollback, OAuth y proyección idempotente.
 
 **Verificado:** intercambio OAuth real con `openai-codex`, catálogo Manager/Runner coherente, turno real, logout durante turno con recarga diferida, rechazo posterior de credencial revocada y restart con estado persistido correcto.
-
-**Pendiente:** autorización para publicar la imagen y actualizar explícitamente el digest del dashboard. Para ello:
-La imagen debe publicarse como release separada y el dashboard debe actualizarse
-explícitamente. Hasta entonces el dashboard mantiene su camino legacy y no se
-cambia el digest publicado v0.7.0.
 
 ## 8. Diagnóstico de errores de Provider en turnos
 

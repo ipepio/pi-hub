@@ -1,8 +1,8 @@
 # Estado de pihub
 
-> Última verificación: **2026-08-10** · versión **v0.9.0** · ocho commits sobre la
-> candidate de Providers publicada con digest
-> `sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
+> Última verificación: **2026-08-10** · versión **v0.9.1** · release publicada
+> desde HEAD `2309dc94708429680d085d42801b3d2f4f8c6441` con digest
+> `ghcr.io/ipepio/pi-hub@sha256:892322db268ee54978fc824723650f2fb4d0aa73880b3b6ffcd9f00b15eb0151`.
 
 ## Verificado
 
@@ -20,9 +20,8 @@
 | Instalación Docker y servicio systemd | Funciona |
 
 ```text
-npm run typecheck  # limpio
-npm test           # 220 tests passed
-# imagen local pihub:providers-candidate: sha256:903a195206c4979443ffa3ebc3313bbf2875b99a605fdfd32425395f2a51720f
+npm run verify     # typecheck + build limpios, 657 tests passed, 0 failed
+# imagen publicada v0.9.1: ghcr.io/ipepio/pi-hub@sha256:892322db268ee54978fc824723650f2fb4d0aa73880b3b6ffcd9f00b15eb0151
 ```
 
 Antes de publicarse, la imagen candidata también se verificó contra Manager y
@@ -35,6 +34,11 @@ El 2026-08-05 se publicó como `v0.8.0-rc.1` con digest
 `sha256:703cf0fef3ff54cefaa8abd4f527f5739b91fa1af3e48452d3cf8dcf9201c2b5`.
 El dashboard fijó esa imagen con `providerProjection: managed_http` y el drill M4
 de upgrade de flota pasó.
+
+El 2026-08-10 se publicó la release **v0.9.1** (tag `v0.9.1`, HEAD
+`2309dc94708429680d085d42801b3d2f4f8c6441`) como
+`ghcr.io/ipepio/pi-hub@sha256:892322db268ee54978fc824723650f2fb4d0aa73880b3b6ffcd9f00b15eb0151`
+con P3 (autonomía `waiting_human` end-to-end) cerrado.
 
 `npm run test:contract-red --workspace packages/manager` sigue siendo una
 verificación separada contra un Manager real; no forma parte de `npm test`.
@@ -101,11 +105,18 @@ de panel con CSRF), presenters por allowlist que redactan campos internos, y
 panel con pestaña de Autonomía. Las rutas de Trigger e Initiative se prueban
 en `contract-red.test.ts` contra un Manager real.
 
-### P3 pendiente
+### P3 terminada (v0.9.1)
 
-`waiting_human` end-to-end: camino Runner→Manager, tool `ask_human`, entrega
-por Telegram. El estado existe en dominio y se proyecta, pero nada lo produce
-por un camino real.
+`waiting_human` end-to-end: la tool `ask_human` pausa una Initiative en
+`mode:"ask"` validando cotas e IDs (P3.2); la espera es un terminal durable que
+sobrevive al reinicio del Manager, con expiración **por fila**
+(`human_expires_at`) y CAS de respuesta que impone el request id y su plazo.
+La pregunta se entrega al canal primario de Telegram (P3.4) con
+`notificationStatus` en el snapshot; las respuestas entran por el panel o por
+la ruta interna `POST /internal/runner/telegram-reply`, y el runner retoma la
+misma sesión tras reiniciar (P3.6). El consumo de la respuesta ocurre en la
+misma transacción que reclama el turno: la entrega es **at-least-once**, una
+respuesta a mitad de carrera no se pierde en silencio.
 
 ### P4 pendiente
 
