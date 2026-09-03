@@ -3,6 +3,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { promises as fs } from "node:fs";
 import {
   agentPaths,
   isProtectedEnvKey,
@@ -27,18 +28,30 @@ import {
   type ModelInfo,
   type PihubEnv,
 } from "@pihub/shared";
-import { createAgent, deleteAgent, listPackages, readSystemPrompt, updateAgent } from "../agents.js";
+import {
+  createAgent,
+  deleteAgent,
+  listPackages,
+  readSystemPrompt,
+  updateAgent,
+} from "../agents.js";
 import { TurnExecution } from "../agenda/turn-execution.js";
+import { DomainError } from "../agenda/errors.js";
 import { listModels } from "../models.js";
-import { createRuntimeProviders, type RuntimeProviders } from "@pihub/providers";
+import {
+  createRuntimeProviders,
+  type RuntimeProviders,
+} from "@pihub/providers";
 import type { Supervisor } from "../supervisor.js";
 import type { OAuthService } from "../oauth.js";
 import { apiError, HTTP_STATUS_BY_CODE, type ApiErrorCode } from "./errors.js";
-import { classifyApiV1Auth, classifyServiceAuth, cookieValue, CSRF_COOKIE } from "./auth.js";
 import {
-  registerAutonomyRoutes,
-  type AutonomyRouteDeps,
-} from "./autonomy.js";
+  classifyApiV1Auth,
+  classifyServiceAuth,
+  cookieValue,
+  CSRF_COOKIE,
+} from "./auth.js";
+import { registerAutonomyRoutes, type AutonomyRouteDeps } from "./autonomy.js";
 import type { AutonomyProjection } from "../agenda/autonomy-projection.js";
 import type { AutonomyControl } from "../agenda/autonomy-control.js";
 import {
@@ -48,7 +61,11 @@ import {
   projectUpdatedAgent,
   type RuntimeAction,
 } from "./restart-policy.js";
-import { isDuplicateTurn, rememberTurn, type TurnEventProfile } from "./turns.js";
+import {
+  isDuplicateTurn,
+  rememberTurn,
+  type TurnEventProfile,
+} from "./turns.js";
 import { diffPackages } from "./package-sync.js";
 import {
   createAgentV1Schema,
@@ -160,8 +177,15 @@ export function createApiV1Router(
       return fail(c, "INVALID_AUTH", "Service credential required");
     }
     if (verdict.kind === "csrf_invalid") {
-      const code = c.req.header("x-csrf-token") && csrfCookie ? "CSRF_INVALID" : "CSRF_REQUIRED";
-      return fail(c, code, code === "CSRF_REQUIRED" ? "CSRF token required" : "CSRF token invalid");
+      const code =
+        c.req.header("x-csrf-token") && csrfCookie
+          ? "CSRF_INVALID"
+          : "CSRF_REQUIRED";
+      return fail(
+        c,
+        code,
+        code === "CSRF_REQUIRED" ? "CSRF token required" : "CSRF token invalid",
+      );
     }
     // Guardar el principal autenticado para los handlers.
     c.set("principal", { kind: verdict.kind });
@@ -175,13 +199,19 @@ export function createApiV1Router(
   // Panel/operator extension: OAuth de providers. Estas rutas comparten el
   // OAuthService del Manager, pero no forman parte de la Interface del
   // dashboard/control plane.
-  app.get("/auth/providers", async (c) => c.json({ providers: await oauth.providers() }));
+  app.get("/auth/providers", async (c) =>
+    c.json({ providers: await oauth.providers() }),
+  );
 
   app.post("/auth/login/:provider", async (c) => {
     try {
       return c.json(await oauth.startLogin(c.req.param("provider")));
     } catch (error) {
-      console.error("[api-v1] fallo iniciando login OAuth:", c.get("correlationId"), error);
+      console.error(
+        "[api-v1] fallo iniciando login OAuth:",
+        c.get("correlationId"),
+        error,
+      );
       return fail(c, "BAD_REQUEST", "OAuth login could not be started");
     }
   });
@@ -194,9 +224,15 @@ export function createApiV1Router(
   app.post("/auth/flows/:id/input", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { value?: string };
     try {
-      return c.json(await oauth.submitInput(c.req.param("id"), body.value ?? ""));
+      return c.json(
+        await oauth.submitInput(c.req.param("id"), body.value ?? ""),
+      );
     } catch (error) {
-      console.error("[api-v1] fallo enviando input al flujo OAuth:", c.get("correlationId"), error);
+      console.error(
+        "[api-v1] fallo enviando input al flujo OAuth:",
+        c.get("correlationId"),
+        error,
+      );
       return fail(c, "BAD_REQUEST", "OAuth flow input was rejected");
     }
   });
@@ -207,7 +243,11 @@ export function createApiV1Router(
   });
 
   app.get("/health", (c) =>
-    c.json({ status: "ok", version: MANAGER_VERSION, timestamp: new Date().toISOString() }),
+    c.json({
+      status: "ok",
+      version: MANAGER_VERSION,
+      timestamp: new Date().toISOString(),
+    }),
   );
 
   app.get("/readiness", async (c) => {
@@ -231,13 +271,22 @@ export function createApiV1Router(
     };
     // El formato de la credencial lo fija §3.1: al menos 32 caracteres.
     if (!body.oldToken || !body.newToken || body.newToken.length < 32) {
-      return fail(c, "BAD_REQUEST", "oldToken and newToken (min 32 chars) are required");
+      return fail(
+        c,
+        "BAD_REQUEST",
+        "oldToken and newToken (min 32 chars) are required",
+      );
     }
-    if (body.oldToken !== env.apiToken) return fail(c, "INVALID_AUTH", "Old token does not match");
+    if (body.oldToken !== env.apiToken)
+      return fail(c, "INVALID_AUTH", "Old token does not match");
     // La rotación efectiva exige reiniciar el Manager con el nuevo valor en
     // el entorno: aceptar el cambio en memoria daría una falsa sensación de
     // haber rotado y se perdería al reiniciar.
-    return fail(c, "RESOURCE_UNAVAILABLE", "Rotation requires a Manager restart with the new token");
+    return fail(
+      c,
+      "RESOURCE_UNAVAILABLE",
+      "Rotation requires a Manager restart with the new token",
+    );
   });
 
   // --- §4.7 Modelos disponibles (solo lectura, Fase 1 §1.3 del plan) ---
@@ -247,7 +296,11 @@ export function createApiV1Router(
     try {
       models = await listModels(providers);
     } catch (error) {
-      console.error("[api-v1] fallo listando modelos:", c.get("correlationId"), error);
+      console.error(
+        "[api-v1] fallo listando modelos:",
+        c.get("correlationId"),
+        error,
+      );
       return fail(c, "RESOURCE_UNAVAILABLE", "Model catalog unavailable");
     }
     return c.json({ models });
@@ -260,24 +313,40 @@ export function createApiV1Router(
     try {
       snapshot = await providers.snapshot();
     } catch (error) {
-      console.error("[api-v1] fallo listando providers:", c.get("correlationId"), error);
+      console.error(
+        "[api-v1] fallo listando providers:",
+        c.get("correlationId"),
+        error,
+      );
       return fail(c, "RESOURCE_UNAVAILABLE", "Provider catalog unavailable");
     }
     return c.json({ providers: snapshot.providers });
   });
 
   app.put("/providers/custom/:providerId", async (c) => {
-    const parsed = customProviderV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid custom Provider definition");
+    const parsed = customProviderV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid custom Provider definition");
     try {
       const change = await providers.apply({
         type: "upsert-custom-provider",
         providerId: c.req.param("providerId"),
-        definition: { baseUrl: parsed.data.baseUrl, models: parsed.data.models },
-        ...(parsed.data.apiKey !== undefined ? { apiKey: parsed.data.apiKey } : {}),
+        definition: {
+          baseUrl: parsed.data.baseUrl,
+          models: parsed.data.models,
+        },
+        ...(parsed.data.apiKey !== undefined
+          ? { apiKey: parsed.data.apiKey }
+          : {}),
       });
-      const provider = change.snapshot.providers.find((item) => item.id === c.req.param("providerId"));
-      return provider ? c.json({ provider }) : fail(c, "INTERNAL_ERROR", "Provider state unavailable");
+      const provider = change.snapshot.providers.find(
+        (item) => item.id === c.req.param("providerId"),
+      );
+      return provider
+        ? c.json({ provider })
+        : fail(c, "INTERNAL_ERROR", "Provider state unavailable");
     } catch {
       return fail(c, "BAD_REQUEST", "Invalid custom Provider definition");
     }
@@ -285,7 +354,10 @@ export function createApiV1Router(
 
   app.delete("/providers/custom/:providerId", async (c) => {
     try {
-      await providers.apply({ type: "delete-custom-provider", providerId: c.req.param("providerId") });
+      await providers.apply({
+        type: "delete-custom-provider",
+        providerId: c.req.param("providerId"),
+      });
       return c.json({ ok: true });
     } catch {
       return fail(c, "BAD_REQUEST", "Custom Provider could not be deleted");
@@ -293,20 +365,33 @@ export function createApiV1Router(
   });
 
   app.put("/managed/providers", async (c) => {
-    const serviceAuth = classifyServiceAuth(c.req.header("authorization"), env.apiToken);
-    if (serviceAuth !== "ok") return fail(c, serviceAuth, "Service credential required");
-    const parsed = managedProviderProjectionV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid managed Provider projection");
+    const serviceAuth = classifyServiceAuth(
+      c.req.header("authorization"),
+      env.apiToken,
+    );
+    if (serviceAuth !== "ok")
+      return fail(c, serviceAuth, "Service credential required");
+    const parsed = managedProviderProjectionV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid managed Provider projection");
     try {
       const change = await providers.apply({
         type: "replace-managed-providers",
         providers: parsed.data.providers,
       });
       return c.json({
-        providers: change.snapshot.providers.filter((provider) => provider.origin === "managed"),
+        providers: change.snapshot.providers.filter(
+          (provider) => provider.origin === "managed",
+        ),
       });
     } catch {
-      return fail(c, "BAD_REQUEST", "Managed Provider projection could not be applied");
+      return fail(
+        c,
+        "BAD_REQUEST",
+        "Managed Provider projection could not be applied",
+      );
     }
   });
 
@@ -341,19 +426,30 @@ export function createApiV1Router(
     } catch {
       return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
     }
-    if (status.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+    if (status.state !== "running")
+      return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
 
     try {
-      const response = await fetch(`http://127.0.0.1:${status.port}/api/commands`, {
-        headers: { authorization: `Bearer ${env.apiToken}` },
-      });
-      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
-      const body = (await response.json().catch(() => undefined)) as {
-        skills?: unknown;
-        prompts?: unknown;
-      } | undefined;
+      const response = await fetch(
+        `http://127.0.0.1:${status.port}/api/commands`,
+        {
+          headers: { authorization: `Bearer ${env.apiToken}` },
+        },
+      );
+      if (!response.ok)
+        return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+      const body = (await response.json().catch(() => undefined)) as
+        | {
+            skills?: unknown;
+            prompts?: unknown;
+          }
+        | undefined;
       if (!Array.isArray(body?.skills) || !Array.isArray(body?.prompts)) {
-        return fail(c, "RESOURCE_UNAVAILABLE", "Runner returned an invalid command catalog");
+        return fail(
+          c,
+          "RESOURCE_UNAVAILABLE",
+          "Runner returned an invalid command catalog",
+        );
       }
       return c.json({ skills: body.skills, prompts: body.prompts });
     } catch {
@@ -365,12 +461,16 @@ export function createApiV1Router(
 
   app.get("/agents", async (c) => {
     const agents = await listAgents(env.dataDir);
-    const statuses = await Promise.all(agents.map((agent) => supervisor.statusOf(agent)));
+    const statuses = await Promise.all(
+      agents.map((agent) => supervisor.statusOf(agent)),
+    );
     return c.json(statuses.map(toAgentV1));
   });
 
   app.post("/agents", async (c) => {
-    const parsed = createAgentV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = createAgentV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
     try {
       const config = await createAgent(env, parsed.data);
@@ -422,7 +522,9 @@ export function createApiV1Router(
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const parsed = updateAgentV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = updateAgentV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
 
     try {
@@ -449,7 +551,8 @@ export function createApiV1Router(
         wasEnabled: config.enabled,
         isEnabled: proyectado.enabled,
         fingerprintChanged:
-          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
+          agentRuntimeFingerprint(antes) !==
+          agentRuntimeFingerprint(despuesProyectado),
       });
 
       // Reiniciar o parar tumbaría el WS del turno en curso (spec de bug 1:
@@ -457,7 +560,11 @@ export function createApiV1Router(
       // el caller puede reintentar cuando el turno termine, o abortarlo
       // primero con POST .../turns/:turnId/abort si de verdad quiere forzarlo.
       if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
-        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
       }
 
       const actualizado = await updateAgent(env, name, parsed.data);
@@ -496,7 +603,9 @@ export function createApiV1Router(
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const parsed = replaceEnvV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = replaceEnvV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
 
     try {
@@ -512,11 +621,16 @@ export function createApiV1Router(
         wasEnabled: config.enabled,
         isEnabled: config.enabled,
         fingerprintChanged:
-          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
+          agentRuntimeFingerprint(antes) !==
+          agentRuntimeFingerprint(despuesProyectado),
       });
 
       if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
-        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
       }
 
       await replaceEnvStore(env.dataDir, parsed.data.env, name);
@@ -535,24 +649,35 @@ export function createApiV1Router(
     const key = c.req.param("key");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key))
+      return fail(c, "BAD_REQUEST", "Invalid env key");
 
-    const parsed = setEnvValueV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = setEnvValueV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
 
     try {
       const wasRunning = supervisor.state(name).state === "running";
       const antes = await snapshotRuntimeInput(env, config);
-      const despuesProyectado = { ...antes, env: { ...antes.env, [key]: parsed.data.value } };
+      const despuesProyectado = {
+        ...antes,
+        env: { ...antes.env, [key]: parsed.data.value },
+      };
       const action = decideRuntimeAction({
         wasRunning,
         wasEnabled: config.enabled,
         isEnabled: config.enabled,
         fingerprintChanged:
-          agentRuntimeFingerprint(antes) !== agentRuntimeFingerprint(despuesProyectado),
+          agentRuntimeFingerprint(antes) !==
+          agentRuntimeFingerprint(despuesProyectado),
       });
       if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
-        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
       }
 
       await setEnv(env.dataDir, key, parsed.data.value, name);
@@ -568,7 +693,8 @@ export function createApiV1Router(
     const key = c.req.param("key");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key))
+      return fail(c, "BAD_REQUEST", "Invalid env key");
 
     try {
       const wasRunning = supervisor.state(name).state === "running";
@@ -584,7 +710,11 @@ export function createApiV1Router(
           agentRuntimeFingerprint({ ...antes, env: projectedEnv }),
       });
       if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
-        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
       }
 
       await unsetEnv(env.dataDir, key, name);
@@ -598,12 +728,17 @@ export function createApiV1Router(
   // Store global del panel: solo claves en lectura y operaciones por clave.
   // Un cambio global se aplica a los Runners activos mediante el mismo reload
   // diferido que usaba la superficie legacy, sin mezclarlo con un Agent.
-  app.get("/env", async (c) => c.json({ keys: await listEnvKeys(env.dataDir) }));
+  app.get("/env", async (c) =>
+    c.json({ keys: await listEnvKeys(env.dataDir) }),
+  );
 
   app.put("/env/:key", async (c) => {
     const key = c.req.param("key");
-    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
-    const parsed = setEnvValueV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key))
+      return fail(c, "BAD_REQUEST", "Invalid env key");
+    const parsed = setEnvValueV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid env payload");
 
     try {
@@ -617,7 +752,8 @@ export function createApiV1Router(
 
   app.delete("/env/:key", async (c) => {
     const key = c.req.param("key");
-    if (!isValidEnvKey(key) || isProtectedEnvKey(key)) return fail(c, "BAD_REQUEST", "Invalid env key");
+    if (!isValidEnvKey(key) || isProtectedEnvKey(key))
+      return fail(c, "BAD_REQUEST", "Invalid env key");
 
     try {
       const existed = await unsetEnv(env.dataDir, key);
@@ -646,11 +782,17 @@ export function createApiV1Router(
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const parsed = replacePackagesV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid packages payload");
+    const parsed = replacePackagesV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid packages payload");
 
     const actuales = await listPackages(env, name);
-    const { toInstall, toRemove } = diffPackages(actuales, parsed.data.packages);
+    const { toInstall, toRemove } = diffPackages(
+      actuales,
+      parsed.data.packages,
+    );
 
     // Sin diferencia: no hay nada que instalar/quitar ni Runner que
     // reiniciar. Responde ya, sin tocar pi ni el registro de turnos.
@@ -662,13 +804,18 @@ export function createApiV1Router(
     // Instalar/quitar un paquete solo tiene efecto si el Runner se reinicia
     // para recogerlo — mismo riesgo que el PATCH: no tumbar un turno vivo.
     if (wasRunning && hayTurnoVivo(name)) {
-      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "Agent has a turn in progress; retry after it finishes",
+      );
     }
 
     const workspaceDir = agentPaths(env.dataDir, name).workspaceDir;
     for (const source of toInstall) {
       const result = await piInstall(env.dataDir, source, workspaceDir);
-      if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
+      if (!result.ok)
+        return fail(c, "BAD_REQUEST", "Could not install package");
     }
     for (const source of toRemove) {
       const result = await piRemove(env.dataDir, source, workspaceDir);
@@ -685,18 +832,30 @@ export function createApiV1Router(
     const name = c.req.param("name");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+    const parsed = packageItemV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid package payload");
 
     const actuales = await listPackages(env, name);
-    if (actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    if (actuales.includes(parsed.data.source))
+      return c.json({ packages: actuales }, 202);
 
     const wasRunning = supervisor.state(name).state === "running";
     if (wasRunning && hayTurnoVivo(name)) {
-      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "Agent has a turn in progress; retry after it finishes",
+      );
     }
 
-    const result = await piInstall(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
+    const result = await piInstall(
+      env.dataDir,
+      parsed.data.source,
+      agentPaths(env.dataDir, name).workspaceDir,
+    );
     if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
     scheduleAgentReload(supervisor, name);
     return c.json({ packages: await listPackages(env, name) }, 202);
@@ -706,18 +865,30 @@ export function createApiV1Router(
     const name = c.req.param("name");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+    const parsed = packageItemV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid package payload");
 
     const actuales = await listPackages(env, name);
-    if (!actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    if (!actuales.includes(parsed.data.source))
+      return c.json({ packages: actuales }, 202);
 
     const wasRunning = supervisor.state(name).state === "running";
     if (wasRunning && hayTurnoVivo(name)) {
-      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "Agent has a turn in progress; retry after it finishes",
+      );
     }
 
-    const result = await piRemove(env.dataDir, parsed.data.source, agentPaths(env.dataDir, name).workspaceDir);
+    const result = await piRemove(
+      env.dataDir,
+      parsed.data.source,
+      agentPaths(env.dataDir, name).workspaceDir,
+    );
     if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove package");
     scheduleAgentReload(supervisor, name);
     return c.json({ packages: await listPackages(env, name) }, 202);
@@ -732,7 +903,12 @@ export function createApiV1Router(
     if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
       return fail(c, "AGENT_NOT_FOUND", "Agent not found");
     }
-    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) });
+    return c.json({
+      skills: await listMaterializedSkillIds(
+        env.dataDir,
+        agentPaths(env.dataDir, name).workspaceDir,
+      ),
+    });
   });
 
   app.post("/agents/:name/skills", async (c) => {
@@ -741,16 +917,35 @@ export function createApiV1Router(
       return fail(c, "AGENT_NOT_FOUND", "Agent not found");
     }
     const content = await skillContentOf(c);
-    if (!content) return fail(c, "BAD_REQUEST", "Invalid skill content payload");
+    if (!content)
+      return fail(c, "BAD_REQUEST", "Invalid skill content payload");
 
     const wasRunning = supervisor.state(name).state === "running";
     if (wasRunning && hayTurnoVivo(name)) {
-      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "Agent has a turn in progress; retry after it finishes",
+      );
     }
-    const result = await piInstallFromContent(env.dataDir, content.skillId, content.files, agentPaths(env.dataDir, name).workspaceDir);
-    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install skill content");
+    const result = await piInstallFromContent(
+      env.dataDir,
+      content.skillId,
+      content.files,
+      agentPaths(env.dataDir, name).workspaceDir,
+    );
+    if (!result.ok)
+      return fail(c, "BAD_REQUEST", "Could not install skill content");
     if (wasRunning) scheduleAgentReload(supervisor, name);
-    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) }, 202);
+    return c.json(
+      {
+        skills: await listMaterializedSkillIds(
+          env.dataDir,
+          agentPaths(env.dataDir, name).workspaceDir,
+        ),
+      },
+      202,
+    );
   });
 
   app.delete("/agents/:name/skills/:skillId", async (c) => {
@@ -758,40 +953,78 @@ export function createApiV1Router(
     if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
       return fail(c, "AGENT_NOT_FOUND", "Agent not found");
     }
-    if (!isValidSkillId(skillId)) return fail(c, "BAD_REQUEST", "Invalid skillId");
+    if (!isValidSkillId(skillId))
+      return fail(c, "BAD_REQUEST", "Invalid skillId");
 
     const wasRunning = supervisor.state(name).state === "running";
     if (wasRunning && hayTurnoVivo(name)) {
-      return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "Agent has a turn in progress; retry after it finishes",
+      );
     }
-    const result = await piRemoveContentSkill(env.dataDir, skillId, agentPaths(env.dataDir, name).workspaceDir);
-    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove skill content");
+    const result = await piRemoveContentSkill(
+      env.dataDir,
+      skillId,
+      agentPaths(env.dataDir, name).workspaceDir,
+    );
+    if (!result.ok)
+      return fail(c, "BAD_REQUEST", "Could not remove skill content");
     if (wasRunning) scheduleAgentReload(supervisor, name);
-    return c.json({ skills: await listMaterializedSkillIds(env.dataDir, agentPaths(env.dataDir, name).workspaceDir) }, 202);
+    return c.json(
+      {
+        skills: await listMaterializedSkillIds(
+          env.dataDir,
+          agentPaths(env.dataDir, name).workspaceDir,
+        ),
+      },
+      202,
+    );
   });
 
-  app.get("/skills", async (c) => c.json({ skills: await listMaterializedSkillIds(env.dataDir) }));
+  app.get("/skills", async (c) =>
+    c.json({ skills: await listMaterializedSkillIds(env.dataDir) }),
+  );
 
   app.post("/skills", async (c) => {
     const content = await skillContentOf(c);
-    if (!content) return fail(c, "BAD_REQUEST", "Invalid skill content payload");
+    if (!content)
+      return fail(c, "BAD_REQUEST", "Invalid skill content payload");
     // Una recarga global reinicia todos los Runners; no puede cortar el
     // turno vivo de ningún Agent, igual que la variante local.
-    if (hayAlgunTurnoVivo()) return fail(c, "TURN_IN_PROGRESS", "An Agent has a turn in progress; retry after it finishes");
+    if (hayAlgunTurnoVivo())
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "An Agent has a turn in progress; retry after it finishes",
+      );
 
-    const result = await piInstallFromContent(env.dataDir, content.skillId, content.files);
-    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install skill content");
+    const result = await piInstallFromContent(
+      env.dataDir,
+      content.skillId,
+      content.files,
+    );
+    if (!result.ok)
+      return fail(c, "BAD_REQUEST", "Could not install skill content");
     scheduleGlobalReload(supervisor);
     return c.json({ skills: await listMaterializedSkillIds(env.dataDir) }, 202);
   });
 
   app.delete("/skills/:skillId", async (c) => {
     const skillId = c.req.param("skillId");
-    if (!isValidSkillId(skillId)) return fail(c, "BAD_REQUEST", "Invalid skillId");
-    if (hayAlgunTurnoVivo()) return fail(c, "TURN_IN_PROGRESS", "An Agent has a turn in progress; retry after it finishes");
+    if (!isValidSkillId(skillId))
+      return fail(c, "BAD_REQUEST", "Invalid skillId");
+    if (hayAlgunTurnoVivo())
+      return fail(
+        c,
+        "TURN_IN_PROGRESS",
+        "An Agent has a turn in progress; retry after it finishes",
+      );
 
     const result = await piRemoveContentSkill(env.dataDir, skillId);
-    if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove skill content");
+    if (!result.ok)
+      return fail(c, "BAD_REQUEST", "Could not remove skill content");
     scheduleGlobalReload(supervisor);
     return c.json({ skills: await listMaterializedSkillIds(env.dataDir) }, 202);
   });
@@ -807,18 +1040,53 @@ export function createApiV1Router(
       control: autonomy.control,
       agentExists,
       now: () => Date.now(),
+      // P2.4a: política de Triggers del agente (autonomy.triggers, aditivo) para
+      // el gate de la autoridad `agent`. El repositorio aplica los defaults si no
+      // viene o si el Agent no la declara. Lectura fail-closed (R4-004): solo
+      // ENOENT (agente sin config) devuelve undefined (defaults); cualquier otro
+      // error de lectura o un JSON inválido lanza AUTONOMY_DISABLED.
+      readAgentTriggerPolicy: async (name) => {
+        let raw: string;
+        try {
+          raw = await fs.readFile(
+            agentPaths(env.dataDir, name).configFile,
+            "utf8",
+          );
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") return undefined;
+          throw new DomainError(
+            "AUTONOMY_DISABLED",
+            `lectura de la config del agente ${name} falló (${String(code ?? error)}): fail-closed`,
+          );
+        }
+        try {
+          return (JSON.parse(raw) as AgentConfig).autonomy?.triggers;
+        } catch {
+          throw new DomainError(
+            "AUTONOMY_DISABLED",
+            `config del agente ${name} no es JSON válido: fail-closed`,
+          );
+        }
+      },
     };
     registerAutonomyRoutes(app, autonomyDeps);
   }
 
-  app.get("/packages", async (c) => c.json({ packages: await listPackages(env) }));
+  app.get("/packages", async (c) =>
+    c.json({ packages: await listPackages(env) }),
+  );
 
   app.post("/packages", async (c) => {
-    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+    const parsed = packageItemV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid package payload");
 
     const actuales = await listPackages(env);
-    if (actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    if (actuales.includes(parsed.data.source))
+      return c.json({ packages: actuales }, 202);
     const result = await piInstall(env.dataDir, parsed.data.source);
     if (!result.ok) return fail(c, "BAD_REQUEST", "Could not install package");
     scheduleGlobalReload(supervisor);
@@ -826,11 +1094,15 @@ export function createApiV1Router(
   });
 
   app.delete("/packages", async (c) => {
-    const parsed = packageItemV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid package payload");
+    const parsed = packageItemV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid package payload");
 
     const actuales = await listPackages(env);
-    if (!actuales.includes(parsed.data.source)) return c.json({ packages: actuales }, 202);
+    if (!actuales.includes(parsed.data.source))
+      return c.json({ packages: actuales }, 202);
     const result = await piRemove(env.dataDir, parsed.data.source);
     if (!result.ok) return fail(c, "BAD_REQUEST", "Could not remove package");
     scheduleGlobalReload(supervisor);
@@ -850,7 +1122,11 @@ export function createApiV1Router(
       if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
       if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
-        return fail(c, "TURN_IN_PROGRESS", "Agent has a turn in progress; retry after it finishes");
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
       }
 
       let actualizado = config;
@@ -877,8 +1153,11 @@ export function createApiV1Router(
     // revelar si el payload era válido.
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const parsed = createSessionV1Schema.safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid session payload");
+    const parsed = createSessionV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return fail(c, "BAD_REQUEST", "Invalid session payload");
 
     return c.json(
       {
@@ -904,27 +1183,41 @@ export function createApiV1Router(
     } catch {
       return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
     }
-    if (status.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+    if (status.state !== "running")
+      return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
 
     try {
-      const response = await fetch(`http://127.0.0.1:${status.port}/api/transcribe`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${env.apiToken}`,
-          ...(c.req.header("content-type") ? { "content-type": c.req.header("content-type")! } : {}),
-        },
-        body: c.req.raw.body,
-        duplex: "half",
-      } as RequestInit);
+      const response = await fetch(
+        `http://127.0.0.1:${status.port}/api/transcribe`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${env.apiToken}`,
+            ...(c.req.header("content-type")
+              ? { "content-type": c.req.header("content-type")! }
+              : {}),
+          },
+          body: c.req.raw.body,
+          duplex: "half",
+        } as RequestInit,
+      );
 
-      if (response.status === 501) return c.json({ error: "STT no configurado" }, 501);
-      if (response.status === 413) return fail(c, "PAYLOAD_TOO_LARGE", "Audio too large");
-      if (response.status === 400) return fail(c, "BAD_REQUEST", "Invalid audio upload");
-      if (response.status >= 500) return fail(c, "VOICE_PROVIDER_ERROR", "Voice provider failed");
-      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+      if (response.status === 501)
+        return c.json({ error: "STT no configurado" }, 501);
+      if (response.status === 413)
+        return fail(c, "PAYLOAD_TOO_LARGE", "Audio too large");
+      if (response.status === 400)
+        return fail(c, "BAD_REQUEST", "Invalid audio upload");
+      if (response.status >= 500)
+        return fail(c, "VOICE_PROVIDER_ERROR", "Voice provider failed");
+      if (!response.ok)
+        return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
 
-      const body = (await response.json().catch(() => undefined)) as { text?: unknown } | undefined;
-      if (typeof body?.text !== "string") return fail(c, "INTERNAL_ERROR", "Invalid transcription response");
+      const body = (await response.json().catch(() => undefined)) as
+        | { text?: unknown }
+        | undefined;
+      if (typeof body?.text !== "string")
+        return fail(c, "INTERNAL_ERROR", "Invalid transcription response");
       return c.json({ text: body.text });
     } catch {
       return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
@@ -945,25 +1238,34 @@ export function createApiV1Router(
     } catch {
       return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
     }
-    if (estado.state !== "running") return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
+    if (estado.state !== "running")
+      return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
 
     try {
-      const response = await fetch(`http://127.0.0.1:${estado.port}/api/upload`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${env.apiToken}`,
-          ...(c.req.header("content-type") ? { "content-type": c.req.header("content-type")! } : {}),
-        },
-        body: c.req.raw.body,
-        duplex: "half",
-      } as RequestInit);
+      const response = await fetch(
+        `http://127.0.0.1:${estado.port}/api/upload`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${env.apiToken}`,
+            ...(c.req.header("content-type")
+              ? { "content-type": c.req.header("content-type")! }
+              : {}),
+          },
+          body: c.req.raw.body,
+          duplex: "half",
+        } as RequestInit,
+      );
 
       // Codigo propio: el caller necesita distinguir "pasa del limite" de
       // "la peticion es invalida" para poder decirselo al usuario, y el
       // mensaje no es contrato — el catalogo cerrado si.
-      if (response.status === 413) return fail(c, "PAYLOAD_TOO_LARGE", "File too large");
-      if (response.status === 400) return fail(c, "BAD_REQUEST", "Invalid upload");
-      if (!response.ok) return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
+      if (response.status === 413)
+        return fail(c, "PAYLOAD_TOO_LARGE", "File too large");
+      if (response.status === 400)
+        return fail(c, "BAD_REQUEST", "Invalid upload");
+      if (!response.ok)
+        return fail(c, "RESOURCE_UNAVAILABLE", "Runner unavailable");
 
       const upload = toUploadV1(await response.json().catch(() => undefined));
       if (!upload) return fail(c, "INTERNAL_ERROR", "Invalid upload response");
@@ -979,7 +1281,10 @@ export function createApiV1Router(
 
   app.post("/agents/:name/turns", async (c) => {
     const requestedEventProfile = c.req.query("eventProfile");
-    if (requestedEventProfile !== undefined && !["basic", "verbose"].includes(requestedEventProfile)) {
+    if (
+      requestedEventProfile !== undefined &&
+      !["basic", "verbose"].includes(requestedEventProfile)
+    ) {
       return fail(c, "BAD_REQUEST", "eventProfile must be basic or verbose");
     }
     const eventProfile = (requestedEventProfile ?? "basic") as TurnEventProfile;
@@ -987,9 +1292,15 @@ export function createApiV1Router(
     // El body se valida PRIMERO: turnId/idempotencyKey/correlationId son
     // obligatorios (H01.04) y su ausencia es 400 aunque el agente tampoco
     // exista — así lo fija el contract test de §4.5.
-    const parsed = createTurnV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = createTurnV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     if (!parsed.success) {
-      return fail(c, "BAD_REQUEST", "turnId, idempotencyKey and correlationId are required");
+      return fail(
+        c,
+        "BAD_REQUEST",
+        "turnId, idempotencyKey and correlationId are required",
+      );
     }
 
     const name = c.req.param("name");
@@ -1030,7 +1341,10 @@ export function createApiV1Router(
         eventProfile,
         origin: { kind: "human" },
         onEvent: (evento) =>
-          stream.writeSSE({ event: evento.event, data: JSON.stringify(evento.data) }),
+          stream.writeSSE({
+            event: evento.event,
+            data: JSON.stringify(evento.data),
+          }),
       });
 
       // Si el cliente se va, se corta el turno: mantener el WS abierto
@@ -1071,22 +1385,43 @@ export function createApiV1Router(
  * `skillId` y `archive`. Ambos convergen en ficheros relativos a la raíz de
  * la Skill. Nunca se acepta un source/path que el caller pueda reutilizar.
  */
-async function skillContentOf(c: Context<ApiV1Env>): Promise<
-  { skillId: string; files: Array<{ path: string; content: string | Buffer }> } | undefined
+async function skillContentOf(
+  c: Context<ApiV1Env>,
+): Promise<
+  | {
+      skillId: string;
+      files: Array<{ path: string; content: string | Buffer }>;
+    }
+  | undefined
 > {
   try {
-    if (c.req.header("content-type")?.toLowerCase().startsWith("multipart/form-data")) {
+    if (
+      c.req
+        .header("content-type")
+        ?.toLowerCase()
+        .startsWith("multipart/form-data")
+    ) {
       const form = await c.req.formData();
       const skillId = form.get("skillId");
       const archive = form.get("archive");
-      if (typeof skillId !== "string" || !isValidSkillId(skillId) || !(archive instanceof File)) return undefined;
+      if (
+        typeof skillId !== "string" ||
+        !isValidSkillId(skillId) ||
+        !(archive instanceof File)
+      )
+        return undefined;
       // El límite comprimido evita aceptar un body arbitrario; filesFromSkillZip
       // verifica además cada tamaño *descomprimido* antes de extraerlo.
       if (archive.size > 20 * 1024 * 1024) return undefined;
-      return { skillId, files: filesFromSkillZip(Buffer.from(await archive.arrayBuffer())) };
+      return {
+        skillId,
+        files: filesFromSkillZip(Buffer.from(await archive.arrayBuffer())),
+      };
     }
 
-    const parsed = skillContentV1Schema.safeParse(await c.req.json().catch(() => ({})));
+    const parsed = skillContentV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
     return parsed.success ? parsed.data : undefined;
   } catch {
     return undefined;
@@ -1102,7 +1437,8 @@ interface UploadV1Response {
 
 /** Solo se permite el path que el Runner devuelve relativo al workspace. */
 function toUploadV1(value: unknown): UploadV1Response | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
   const body = value as Record<string, unknown>;
   if (
     !isWorkspaceRelativeUploadPath(body.path) ||
@@ -1123,13 +1459,20 @@ function toUploadV1(value: unknown): UploadV1Response | undefined {
 }
 
 function isWorkspaceRelativeUploadPath(value: unknown): value is string {
-  if (typeof value !== "string" || !value.startsWith("uploads/") || value.includes("\\") || value.includes("\0")) {
+  if (
+    typeof value !== "string" ||
+    !value.startsWith("uploads/") ||
+    value.includes("\\") ||
+    value.includes("\0")
+  ) {
     return false;
   }
   return value
     .split("/")
     .slice(1)
-    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+    .every(
+      (segment) => segment.length > 0 && segment !== "." && segment !== "..",
+    );
 }
 
 /**
@@ -1140,7 +1483,10 @@ function isWorkspaceRelativeUploadPath(value: unknown): value is string {
  */
 async function snapshotRuntimeInput(
   env: PihubEnv,
-  config: Pick<AgentConfig, "name" | "model" | "thinkingLevel" | "telegramToken" | "ttsVoice" | "memory">,
+  config: Pick<
+    AgentConfig,
+    "name" | "model" | "thinkingLevel" | "telegramToken" | "ttsVoice" | "memory"
+  >,
 ) {
   const [systemPrompt, envStore, packages] = await Promise.all([
     readSystemPrompt(env, config.name),
@@ -1206,7 +1552,11 @@ function scheduleGlobalReload(supervisor: Supervisor): void {
 }
 
 /** Helper compartido por las rutas: traduce un código a su respuesta. */
-export function fail(c: Context<ApiV1Env>, code: ApiErrorCode, message: string) {
+export function fail(
+  c: Context<ApiV1Env>,
+  code: ApiErrorCode,
+  message: string,
+) {
   return c.json(
     apiError(code, message, c.get("correlationId")),
     HTTP_STATUS_BY_CODE[code] as ContentfulStatusCode,

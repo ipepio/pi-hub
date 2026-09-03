@@ -21,8 +21,13 @@ import { runnerEntry } from "./paths.js";
  * para el proceso si el acceso no es "none": la extensión deniega por nivel y,
  * además, sin la ruta no hay nada que resolver (doble capa).
  */
-export function memoryEnvFor(env: PihubEnv, config: AgentConfig): Record<string, string> {
-  const access = env.memoryEnabled ? resolveSharedMemoryAccess(config, env) : "none";
+export function memoryEnvFor(
+  env: PihubEnv,
+  config: AgentConfig,
+): Record<string, string> {
+  const access = env.memoryEnabled
+    ? resolveSharedMemoryAccess(config, env)
+    : "none";
   const memoryEnv: Record<string, string> = {
     PIHUB_AGENT_MEMORY_DIR: agentPaths(env.dataDir, config.name).memoryDir,
     PIHUB_SHARED_MEMORY_ACCESS: access,
@@ -52,8 +57,18 @@ export function runnerEnvFor(
     PIHUB_TELEGRAM_ALLOWED_USERS: env.telegramAllowedUsers.join(","),
     PIHUB_RUNNER_CALLBACK_TOKEN: callbackToken,
     PIHUB_MANAGER_PORT: String(env.managerPort),
+    // The Runner needs the service credential in its own env to (a) authorize
+    // its inbound auth (server.ts /api/* middleware, WS upgrade, session) and
+    // (b) let the governed tools (schedule_trigger/revoke_trigger in
+    // agent-tools.ts) send the Authorization header to the Manager. The boot
+    // scrub (R1-001, scrubProtectedProcessEnv in runner/index.ts) deletes
+    // API_TOKEN from process.env before the pi-agent runs, so the credential
+    // never reaches child bash processes. Do NOT reuse the callback token:
+    // that authorizes a different surface.
+    ...(env.apiToken ? { API_TOKEN: env.apiToken } : {}),
   };
-  if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none") delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
+  if (runnerEnv.PIHUB_SHARED_MEMORY_ACCESS === "none")
+    delete runnerEnv.PIHUB_GLOBAL_MEMORY_DIR;
   return runnerEnv;
 }
 
@@ -96,7 +111,10 @@ export class Supervisor {
         try {
           await this.start(agent.name);
         } catch (error) {
-          console.error(`[supervisor] no se pudo arrancar ${agent.name}:`, error);
+          console.error(
+            `[supervisor] no se pudo arrancar ${agent.name}:`,
+            error,
+          );
         }
       }
     }
@@ -116,11 +134,17 @@ export class Supervisor {
 
   private async spawnRunner(config: AgentConfig): Promise<void> {
     const paths = agentPaths(this.env.dataDir, config.name);
-    const log = createWriteStream(path.join(paths.root, "runner.log"), { flags: "a" });
+    const log = createWriteStream(path.join(paths.root, "runner.log"), {
+      flags: "a",
+    });
 
     // Solo el entorno del sistema permitido y los stores explícitos llegan al
     // Runner; las vars internas de pihub se añaden en la composición final.
-    const storeEnv = await resolveRunnerEnv(this.env.dataDir, config.name, process.env);
+    const storeEnv = await resolveRunnerEnv(
+      this.env.dataDir,
+      config.name,
+      process.env,
+    );
     const callbackToken = this.callbackTokenSource();
     const runnerEnv = runnerEnvFor(storeEnv, this.env, config, callbackToken);
     const proc = spawn(process.execPath, [runnerEntry], {
@@ -136,13 +160,17 @@ export class Supervisor {
       callbackToken,
       port: config.port,
       intentionalStop: false,
-      restarts: this.withinWindow(config.name) ? (this.processes.get(config.name)?.restarts ?? 0) + 1 : 0,
+      restarts: this.withinWindow(config.name)
+        ? (this.processes.get(config.name)?.restarts ?? 0) + 1
+        : 0,
       lastStart: Date.now(),
       errored: false,
       exited: false,
     };
     this.processes.set(config.name, managed);
-    console.log(`[supervisor] ${config.name} arrancado en :${config.port} (pid ${proc.pid})`);
+    console.log(
+      `[supervisor] ${config.name} arrancado en :${config.port} (pid ${proc.pid})`,
+    );
 
     proc.on("exit", (code) => {
       managed.exited = true;
@@ -150,11 +178,15 @@ export class Supervisor {
       if (managed.intentionalStop) return;
       if (managed.restarts >= MAX_RESTARTS) {
         managed.errored = true;
-        console.error(`[supervisor] ${config.name} falló ${MAX_RESTARTS} veces seguidas; no se reinicia (código ${code})`);
+        console.error(
+          `[supervisor] ${config.name} falló ${MAX_RESTARTS} veces seguidas; no se reinicia (código ${code})`,
+        );
         return;
       }
       const delay = Math.min(1000 * 2 ** managed.restarts, 15_000);
-      console.warn(`[supervisor] ${config.name} terminó (código ${code}); reinicio en ${delay}ms`);
+      console.warn(
+        `[supervisor] ${config.name} terminó (código ${code}); reinicio en ${delay}ms`,
+      );
       setTimeout(() => {
         void readAgent(this.env.dataDir, config.name).then((fresh) => {
           if (fresh?.enabled) void this.spawnRunner(fresh);
@@ -221,10 +253,15 @@ export class Supervisor {
   private async reloadProviderStateFor(config: AgentConfig): Promise<void> {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       try {
-        const response = await fetch(`http://127.0.0.1:${config.port}/api/providers/reload`, {
-          method: "POST",
-          headers: this.env.apiToken ? { authorization: `Bearer ${this.env.apiToken}` } : {},
-        });
+        const response = await fetch(
+          `http://127.0.0.1:${config.port}/api/providers/reload`,
+          {
+            method: "POST",
+            headers: this.env.apiToken
+              ? { authorization: `Bearer ${this.env.apiToken}` }
+              : {},
+          },
+        );
         if (response.status === 200) return;
         if (response.status !== 202) return;
       } catch {
@@ -232,7 +269,9 @@ export class Supervisor {
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    console.warn(`[supervisor] no se pudo recargar credenciales del Agent ${config.name}`);
+    console.warn(
+      `[supervisor] no se pudo recargar credenciales del Agent ${config.name}`,
+    );
   }
 
   state(name: string): { state: AgentRunState; pid?: number } {
@@ -255,10 +294,12 @@ export class Supervisor {
 
   /** Resuelve una credencial efímera de callback únicamente contra Runners vivos. */
   verifyCallbackToken(candidate: unknown): string | undefined {
-    if (typeof candidate !== "string" || !CALLBACK_TOKEN_RE.test(candidate)) return undefined;
+    if (typeof candidate !== "string" || !CALLBACK_TOKEN_RE.test(candidate))
+      return undefined;
     const candidateBuffer = Buffer.from(candidate, "hex");
     for (const [agentName, managed] of this.processes) {
-      if (managed.exited || !CALLBACK_TOKEN_RE.test(managed.callbackToken)) continue;
+      if (managed.exited || !CALLBACK_TOKEN_RE.test(managed.callbackToken))
+        continue;
       const expectedBuffer = Buffer.from(managed.callbackToken, "hex");
       if (
         expectedBuffer.length === candidateBuffer.length &&
@@ -278,6 +319,8 @@ export class Supervisor {
   }
 
   async stopAll(): Promise<void> {
-    await Promise.all([...this.processes.keys()].map((name) => this.stop(name)));
+    await Promise.all(
+      [...this.processes.keys()].map((name) => this.stop(name)),
+    );
   }
 }

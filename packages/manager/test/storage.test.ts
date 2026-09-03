@@ -22,7 +22,12 @@ import {
   type ManagerStore,
   type SqliteDb,
 } from "../src/storage/sqlite.ts";
-import { runMigrations, MIGRATIONS, SCHEMA_VERSION, type Migration } from "../src/storage/migrations.ts";
+import {
+  runMigrations,
+  MIGRATIONS,
+  SCHEMA_VERSION,
+  type Migration,
+} from "../src/storage/migrations.ts";
 
 const tempDirs: string[] = [];
 const openStores: ManagerStore[] = [];
@@ -37,7 +42,8 @@ async function tmpDataDir(): Promise<string> {
 afterEach(async () => {
   for (const store of openStores.splice(0)) store.close();
   for (const db of openRawDbs.splice(0)) db.close();
-  for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+  for (const dir of tempDirs.splice(0))
+    await fs.rm(dir, { recursive: true, force: true });
 });
 
 async function openStore(dataDir: string): Promise<ManagerStore> {
@@ -71,7 +77,10 @@ interface TriggerRow {
   updated_at: number;
 }
 
-function insertTrigger(db: SqliteDb, overrides: Partial<TriggerRow> = {}): void {
+function insertTrigger(
+  db: SqliteDb,
+  overrides: Partial<TriggerRow> = {},
+): void {
   const row: TriggerRow = {
     id: "trg-1",
     agent_name: "alice",
@@ -96,9 +105,21 @@ function insertTrigger(db: SqliteDb, overrides: Partial<TriggerRow> = {}): void 
         created_by, authority, proposal_state, enabled, next_fire_at, last_fired_at, created_at, updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
-    row.id, row.agent_name, row.kind, row.definition_json, row.intent, row.mode,
-    row.suggested_skill, row.created_by, row.authority, row.proposal_state, row.enabled,
-    row.next_fire_at, row.last_fired_at, row.created_at, row.updated_at,
+    row.id,
+    row.agent_name,
+    row.kind,
+    row.definition_json,
+    row.intent,
+    row.mode,
+    row.suggested_skill,
+    row.created_by,
+    row.authority,
+    row.proposal_state,
+    row.enabled,
+    row.next_fire_at,
+    row.last_fired_at,
+    row.created_at,
+    row.updated_at,
   );
 }
 
@@ -127,7 +148,10 @@ interface InitiativeRow {
   finished_at: number | null;
 }
 
-function insertInitiative(db: SqliteDb, overrides: Partial<InitiativeRow> = {}): void {
+function insertInitiative(
+  db: SqliteDb,
+  overrides: Partial<InitiativeRow> = {},
+): void {
   const row: InitiativeRow = {
     id: "ini-1",
     agent_name: "alice",
@@ -160,10 +184,27 @@ function insertInitiative(db: SqliteDb, overrides: Partial<InitiativeRow> = {}):
         ask_correlation, failure_reason, result, created_at, state_changed_at, started_at, finished_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
-    row.id, row.agent_name, row.state, row.origin, row.trigger_id, row.intent, row.mode,
-    row.session_key, row.available_at, row.bound_model, row.turn_id, row.chain_depth,
-    row.chain_deadline_at, row.visible_effects_declared, row.summary, row.ask_correlation,
-    row.failure_reason, row.result, row.created_at, row.state_changed_at, row.started_at,
+    row.id,
+    row.agent_name,
+    row.state,
+    row.origin,
+    row.trigger_id,
+    row.intent,
+    row.mode,
+    row.session_key,
+    row.available_at,
+    row.bound_model,
+    row.turn_id,
+    row.chain_depth,
+    row.chain_deadline_at,
+    row.visible_effects_declared,
+    row.summary,
+    row.ask_correlation,
+    row.failure_reason,
+    row.result,
+    row.created_at,
+    row.state_changed_at,
+    row.started_at,
     row.finished_at,
   );
 }
@@ -175,11 +216,20 @@ interface CallbackRow {
   created_at: number;
 }
 
-function insertCallback(db: SqliteDb, overrides: Partial<CallbackRow> = {}): void {
-  const row: CallbackRow = { id: "cb-1", parent_id: "parent-1", result: "{}", created_at: 1000, ...overrides };
-  db.prepare("INSERT INTO callbacks (id, parent_id, result, created_at) VALUES (?,?,?,?)").run(
-    row.id, row.parent_id, row.result, row.created_at,
-  );
+function insertCallback(
+  db: SqliteDb,
+  overrides: Partial<CallbackRow> = {},
+): void {
+  const row: CallbackRow = {
+    id: "cb-1",
+    parent_id: "parent-1",
+    result: "{}",
+    created_at: 1000,
+    ...overrides,
+  };
+  db.prepare(
+    "INSERT INTO callbacks (id, parent_id, result, created_at) VALUES (?,?,?,?)",
+  ).run(row.id, row.parent_id, row.result, row.created_at);
 }
 
 interface TurnRow {
@@ -205,11 +255,22 @@ function insertTurn(db: SqliteDb, overrides: Partial<TurnRow> = {}): void {
   };
   db.prepare(
     "INSERT INTO turns (agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at) VALUES (?,?,?,?,?,?,?)",
-  ).run(row.agent_name, row.turn_id, row.idempotency_key, row.final_state, row.result, row.claimed_at, row.finished_at);
+  ).run(
+    row.agent_name,
+    row.turn_id,
+    row.idempotency_key,
+    row.final_state,
+    row.result,
+    row.claimed_at,
+    row.finished_at,
+  );
 }
 
 function userVersion(db: SqliteDb): number {
-  return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+  return Number(
+    (db.prepare("PRAGMA user_version").get() as { user_version: number })
+      .user_version,
+  );
 }
 
 function indexSql(db: SqliteDb, name: string): string {
@@ -221,19 +282,35 @@ function indexSql(db: SqliteDb, name: string): string {
 }
 
 function tableColumns(db: SqliteDb, table: string): Array<{ name: string }> {
-  return db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
 }
 
 function tableExists(db: SqliteDb, table: string): boolean {
-  return db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+  return (
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(table) !== undefined
+  );
 }
 
 function indexExists(db: SqliteDb, name: string): boolean {
-  return db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").get(name) !== undefined;
+  return (
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+      )
+      .get(name) !== undefined
+  );
 }
 
 function countRows(db: SqliteDb, table: string): number {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+    n: number;
+  };
   return row.n;
 }
 
@@ -243,19 +320,45 @@ const plain = <T extends object>(row: T): T => ({ ...row });
 /** Base v1 sembrada con las cuatro tablas y los ocho estados de Initiative State. */
 function seedV1Base(db: SqliteDb): void {
   insertTrigger(db, { id: "trg-owner" });
-  insertTrigger(db, { id: "trg-control", created_by: "control_plane", authority: "control_plane" });
+  insertTrigger(db, {
+    id: "trg-control",
+    created_by: "control_plane",
+    authority: "control_plane",
+  });
   insertInitiative(db, { id: "i-queued", state: "queued" });
   insertInitiative(db, { id: "i-running", state: "running" });
-  insertInitiative(db, { id: "i-waiting-human", state: "waiting_human", summary: "resumen", state_changed_at: 5000 });
+  insertInitiative(db, {
+    id: "i-waiting-human",
+    state: "waiting_human",
+    summary: "resumen",
+    state_changed_at: 5000,
+  });
   insertInitiative(db, { id: "i-waiting-agent", state: "waiting_agent" });
-  insertInitiative(db, { id: "i-succeeded", state: "succeeded", finished_at: 2000 });
+  insertInitiative(db, {
+    id: "i-succeeded",
+    state: "succeeded",
+    finished_at: 2000,
+  });
   insertInitiative(db, { id: "i-failed", state: "failed", finished_at: 3000 });
-  insertInitiative(db, { id: "i-expired", state: "expired", finished_at: 4000 });
-  insertInitiative(db, { id: "i-cancelled", state: "cancelled", finished_at: 5000 });
+  insertInitiative(db, {
+    id: "i-expired",
+    state: "expired",
+    finished_at: 4000,
+  });
+  insertInitiative(db, {
+    id: "i-cancelled",
+    state: "cancelled",
+    finished_at: 5000,
+  });
   insertInitiative(db, { id: "cb-1", origin: "callback" });
   insertInitiative(db, { id: "parent-1", origin: "human" });
   insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
-  insertTurn(db, { turn_id: "turn-a", idempotency_key: "idem-a", final_state: "succeeded", finished_at: 2000 });
+  insertTurn(db, {
+    turn_id: "turn-a",
+    idempotency_key: "idem-a",
+    final_state: "succeeded",
+    finished_at: 2000,
+  });
   insertTurn(db, { turn_id: "turn-b", idempotency_key: "idem-b" });
 }
 
@@ -267,15 +370,22 @@ describe("almacén SQLite del Manager", () => {
   it("crea la base en ${dataDir}/manager/agenda.sqlite3", async () => {
     const dataDir = await tmpDataDir();
     const store = await openStore(dataDir);
-    assert.strictEqual(store.file, path.join(dataDir, "manager", "agenda.sqlite3"));
+    assert.strictEqual(
+      store.file,
+      path.join(dataDir, "manager", "agenda.sqlite3"),
+    );
     await assert.doesNotReject(fs.access(store.file));
   });
 
   it("aplica los pragmas obligatorios (foreign_keys y WAL)", async () => {
     const db = await openRaw(await tmpDataDir());
-    const fk = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
+    const fk = db.prepare("PRAGMA foreign_keys").get() as {
+      foreign_keys: number;
+    };
     assert.strictEqual(fk.foreign_keys, 1);
-    const journal = db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+    const journal = db.prepare("PRAGMA journal_mode").get() as {
+      journal_mode: string;
+    };
     assert.strictEqual(journal.journal_mode, "wal");
   });
 
@@ -284,8 +394,18 @@ describe("almacén SQLite del Manager", () => {
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all() as Array<{ name: string }>;
-    for (const name of ["triggers", "initiatives", "callbacks", "turns", "human_request_deliveries", "runtime_admission"]) {
-      assert.ok(tables.some((t) => t.name === name), `tabla ${name} presente`);
+    for (const name of [
+      "triggers",
+      "initiatives",
+      "callbacks",
+      "turns",
+      "human_request_deliveries",
+      "runtime_admission",
+    ]) {
+      assert.ok(
+        tables.some((t) => t.name === name),
+        `tabla ${name} presente`,
+      );
     }
     const indexes = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
@@ -306,7 +426,10 @@ describe("almacén SQLite del Manager", () => {
       "human_request_deliveries_by_initiative",
     ];
     for (const name of expected) {
-      assert.ok(indexes.some((i) => i.name === name), `índice ${name} presente`);
+      assert.ok(
+        indexes.some((i) => i.name === name),
+        `índice ${name} presente`,
+      );
     }
   });
 
@@ -373,9 +496,16 @@ describe("almacén SQLite del Manager", () => {
       },
     ];
     assert.throws(() => runMigrations(db, migrations));
-    const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    const version = Number(
+      (db.prepare("PRAGMA user_version").get() as { user_version: number })
+        .user_version,
+    );
     assert.strictEqual(version, 0);
-    const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'").get();
+    const exists = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
+      )
+      .get();
     assert.strictEqual(exists, undefined);
     db.close();
   });
@@ -393,9 +523,16 @@ describe("almacén SQLite del Manager", () => {
       },
     ];
     assert.throws(() => runMigrations(db, migrations));
-    const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    const version = Number(
+      (db.prepare("PRAGMA user_version").get() as { user_version: number })
+        .user_version,
+    );
     assert.strictEqual(version, 1);
-    const t2 = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't2'").get();
+    const t2 = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't2'",
+      )
+      .get();
     assert.strictEqual(t2, undefined);
     db.close();
   });
@@ -403,21 +540,29 @@ describe("almacén SQLite del Manager", () => {
   it("un Manager schema1 simulado rechaza un volumen ya migrado a schema2", () => {
     const db = new DatabaseSync(":memory:");
     db.exec("PRAGMA user_version = 2");
-    assert.throws(() => runMigrations(db, MIGRATIONS, 1), /supera el soportado/);
+    assert.throws(
+      () => runMigrations(db, MIGRATIONS, 1),
+      /supera el soportado/,
+    );
     db.close();
   });
 
-  describe("migración v1 → v2", () => {
-    it("una instalación nueva termina en schema v2 con forma, índices y constraints v2", async () => {
+  describe("migración v1 → v3", () => {
+    it("una instalación nueva termina en el último schema con forma, índices y constraints", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.strictEqual(SCHEMA_VERSION, 2);
-      assert.strictEqual(userVersion(db), 2);
+      assert.strictEqual(SCHEMA_VERSION, 3);
+      assert.strictEqual(userVersion(db), 3);
 
       const triggersCols = tableColumns(db, "triggers").map((c) => c.name);
       for (const col of ["create_idempotency_key", "create_command_hash"]) {
-        assert.ok(triggersCols.includes(col), `columna triggers.${col} presente`);
+        assert.ok(
+          triggersCols.includes(col),
+          `columna triggers.${col} presente`,
+        );
       }
-      const initiativesCols = tableColumns(db, "initiatives").map((c) => c.name);
+      const initiativesCols = tableColumns(db, "initiatives").map(
+        (c) => c.name,
+      );
       for (const col of [
         "human_question",
         "human_expires_at",
@@ -426,7 +571,10 @@ describe("almacén SQLite del Manager", () => {
         "human_response_idempotency_key",
         "human_response_command_hash",
       ]) {
-        assert.ok(initiativesCols.includes(col), `columna initiatives.${col} presente`);
+        assert.ok(
+          initiativesCols.includes(col),
+          `columna initiatives.${col} presente`,
+        );
       }
 
       for (const table of ["human_request_deliveries", "runtime_admission"]) {
@@ -435,18 +583,38 @@ describe("almacén SQLite del Manager", () => {
 
       const admission = db
         .prepare("SELECT singleton, state, changed_at FROM runtime_admission")
-        .all() as Array<{ singleton: number; state: string; changed_at: number }>;
-      assert.deepEqual(admission.map(plain), [{ singleton: 1, state: "open", changed_at: 0 }]);
+        .all() as Array<{
+        singleton: number;
+        state: string;
+        changed_at: number;
+      }>;
+      assert.deepEqual(admission.map(plain), [
+        { singleton: 1, state: "open", changed_at: 0 },
+      ]);
     });
 
     it("schema v2 conserva los CHECK de v1 y amplía turns a paused_for_human", async () => {
       const db = await openRaw(await tmpDataDir());
-      insertTrigger(db, { id: "a", created_by: "agent", proposal_state: "proposed" });
+      insertTrigger(db, {
+        id: "a",
+        created_by: "agent",
+        proposal_state: "proposed",
+      });
       assert.throws(() => insertTrigger(db, { id: "b", created_by: "grupo" }));
-      insertInitiative(db, { id: "wh", state: "waiting_human", summary: "resumen" });
+      insertInitiative(db, {
+        id: "wh",
+        state: "waiting_human",
+        summary: "resumen",
+      });
       assert.throws(() => insertInitiative(db, { id: "x", state: "pending" }));
       insertTurn(db, { final_state: "paused_for_human" });
-      assert.throws(() => insertTurn(db, { turn_id: "t2", idempotency_key: "k2", final_state: "running" }));
+      assert.throws(() =>
+        insertTurn(db, {
+          turn_id: "t2",
+          idempotency_key: "k2",
+          final_state: "running",
+        }),
+      );
     });
 
     it("human_request_deliveries aplica CHECK de canal, FKs y unicidades", async () => {
@@ -458,17 +626,59 @@ describe("almacén SQLite del Manager", () => {
          VALUES (?,?,?,?,?,?,?)`,
       );
       insert.run("hr-1", "alice", "ini-1", "telegram", "chat-1", "msg-1", 1000);
-      assert.throws(() => insert.run("hr-1", "alice", "ini-1", "telegram", "chat-2", "msg-2", 1000));
-      assert.throws(() => insert.run("hr-2", "alice", "ini-1", "telegram", "chat-1", "msg-1", 1000));
-      assert.throws(() => insert.run("hr-3", "alice", "ini-1", "slack", "chat-3", "msg-3", 1000));
-      assert.throws(() => insert.run("hr-4", "alice", "ini-inexistente", "telegram", "chat-4", "msg-4", 1000));
+      assert.throws(() =>
+        insert.run(
+          "hr-1",
+          "alice",
+          "ini-1",
+          "telegram",
+          "chat-2",
+          "msg-2",
+          1000,
+        ),
+      );
+      assert.throws(() =>
+        insert.run(
+          "hr-2",
+          "alice",
+          "ini-1",
+          "telegram",
+          "chat-1",
+          "msg-1",
+          1000,
+        ),
+      );
+      assert.throws(() =>
+        insert.run("hr-3", "alice", "ini-1", "slack", "chat-3", "msg-3", 1000),
+      );
+      assert.throws(() =>
+        insert.run(
+          "hr-4",
+          "alice",
+          "ini-inexistente",
+          "telegram",
+          "chat-4",
+          "msg-4",
+          1000,
+        ),
+      );
     });
 
     it("runtime_admission es singleton y rechaza estados fuera de open/draining", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.throws(() => db.exec("INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (1,'open',1)"));
-      assert.throws(() => db.exec("INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (2,'open',1)"));
-      assert.throws(() => db.exec("UPDATE runtime_admission SET state = 'bogus'"));
+      assert.throws(() =>
+        db.exec(
+          "INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (1,'open',1)",
+        ),
+      );
+      assert.throws(() =>
+        db.exec(
+          "INSERT INTO runtime_admission(singleton,state,changed_at) VALUES (2,'open',1)",
+        ),
+      );
+      assert.throws(() =>
+        db.exec("UPDATE runtime_admission SET state = 'bogus'"),
+      );
       db.exec("UPDATE runtime_admission SET state = 'draining'");
     });
 
@@ -483,8 +693,16 @@ describe("almacén SQLite del Manager", () => {
       assert.strictEqual(userVersion(db), 2);
 
       const trg = db
-        .prepare("SELECT id, created_by, authority, create_idempotency_key, create_command_hash FROM triggers WHERE id = ?")
-        .get("trg-owner") as { id: string; created_by: string; authority: string; create_idempotency_key: string | null; create_command_hash: string | null };
+        .prepare(
+          "SELECT id, created_by, authority, create_idempotency_key, create_command_hash FROM triggers WHERE id = ?",
+        )
+        .get("trg-owner") as {
+        id: string;
+        created_by: string;
+        authority: string;
+        create_idempotency_key: string | null;
+        create_command_hash: string | null;
+      };
       assert.deepEqual(plain(trg), {
         id: "trg-owner",
         created_by: "owner",
@@ -498,13 +716,26 @@ describe("almacén SQLite del Manager", () => {
         .get("i-waiting-human") as { human_expires_at: number | null };
       assert.strictEqual(expires.human_expires_at, 5000 + HUMAN_EXPIRY_MS);
       const noBackfill = db
-        .prepare("SELECT human_expires_at FROM initiatives WHERE id IN (?,?,?,?,?,?,?) ORDER BY id")
-        .all("i-queued", "i-running", "i-waiting-agent", "i-succeeded", "i-failed", "i-expired", "i-cancelled") as Array<{ human_expires_at: number | null }>;
+        .prepare(
+          "SELECT human_expires_at FROM initiatives WHERE id IN (?,?,?,?,?,?,?) ORDER BY id",
+        )
+        .all(
+          "i-queued",
+          "i-running",
+          "i-waiting-agent",
+          "i-succeeded",
+          "i-failed",
+          "i-expired",
+          "i-cancelled",
+        ) as Array<{ human_expires_at: number | null }>;
       assert.strictEqual(noBackfill.length, 7);
-      for (const row of noBackfill) assert.strictEqual(row.human_expires_at, null);
+      for (const row of noBackfill)
+        assert.strictEqual(row.human_expires_at, null);
 
       const wh = db
-        .prepare("SELECT human_question, human_request_id, pending_human_input, human_response_idempotency_key, human_response_command_hash FROM initiatives WHERE id = ?")
+        .prepare(
+          "SELECT human_question, human_request_id, pending_human_input, human_response_idempotency_key, human_response_command_hash FROM initiatives WHERE id = ?",
+        )
         .get("i-waiting-human") as Record<string, null>;
       assert.deepEqual(plain(wh), {
         human_question: null,
@@ -515,23 +746,158 @@ describe("almacén SQLite del Manager", () => {
       });
 
       const run = db
-        .prepare("SELECT state, summary, state_changed_at, finished_at FROM initiatives WHERE id = ?")
-        .get("i-waiting-human") as { state: string; summary: string; state_changed_at: number; finished_at: number | null };
-      assert.deepEqual(plain(run), { state: "waiting_human", summary: "resumen", state_changed_at: 5000, finished_at: null });
+        .prepare(
+          "SELECT state, summary, state_changed_at, finished_at FROM initiatives WHERE id = ?",
+        )
+        .get("i-waiting-human") as {
+        state: string;
+        summary: string;
+        state_changed_at: number;
+        finished_at: number | null;
+      };
+      assert.deepEqual(plain(run), {
+        state: "waiting_human",
+        summary: "resumen",
+        state_changed_at: 5000,
+        finished_at: null,
+      });
 
       const cb = db
-        .prepare("SELECT id, parent_id, result, created_at FROM callbacks WHERE id = ?")
-        .get("cb-1") as { id: string; parent_id: string; result: string; created_at: number };
-      assert.deepEqual(plain(cb), { id: "cb-1", parent_id: "parent-1", result: "{}", created_at: 1000 });
+        .prepare(
+          "SELECT id, parent_id, result, created_at FROM callbacks WHERE id = ?",
+        )
+        .get("cb-1") as {
+        id: string;
+        parent_id: string;
+        result: string;
+        created_at: number;
+      };
+      assert.deepEqual(plain(cb), {
+        id: "cb-1",
+        parent_id: "parent-1",
+        result: "{}",
+        created_at: 1000,
+      });
 
       const turns = db
-        .prepare("SELECT agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at FROM turns ORDER BY turn_id")
-        .all() as Array<{ agent_name: string; turn_id: string; idempotency_key: string; final_state: string | null; result: string | null; claimed_at: number; finished_at: number | null }>;
+        .prepare(
+          "SELECT agent_name, turn_id, idempotency_key, final_state, result, claimed_at, finished_at FROM turns ORDER BY turn_id",
+        )
+        .all() as Array<{
+        agent_name: string;
+        turn_id: string;
+        idempotency_key: string;
+        final_state: string | null;
+        result: string | null;
+        claimed_at: number;
+        finished_at: number | null;
+      }>;
       assert.deepEqual(turns.map(plain), [
-        { agent_name: "alice", turn_id: "turn-a", idempotency_key: "idem-a", final_state: "succeeded", result: null, claimed_at: 1000, finished_at: 2000 },
-        { agent_name: "alice", turn_id: "turn-b", idempotency_key: "idem-b", final_state: null, result: null, claimed_at: 1000, finished_at: null },
+        {
+          agent_name: "alice",
+          turn_id: "turn-a",
+          idempotency_key: "idem-a",
+          final_state: "succeeded",
+          result: null,
+          claimed_at: 1000,
+          finished_at: 2000,
+        },
+        {
+          agent_name: "alice",
+          turn_id: "turn-b",
+          idempotency_key: "idem-b",
+          final_state: null,
+          result: null,
+          claimed_at: 1000,
+          finished_at: null,
+        },
       ]);
       assert.strictEqual(countRows(db, "runtime_admission"), 1);
+
+      db.close();
+    });
+
+    it("migra una base v2 → v3 conservando contenido, relaja el CHECK de agente y rehace índices", () => {
+      const db = new DatabaseSync(":memory:");
+      runMigrations(db, [MIGRATIONS[0], MIGRATIONS[1]]);
+      assert.strictEqual(userVersion(db), 2);
+      // Datos v2: una fila de agente con propuesta (válida v2), un trigger
+      // referenciado por una Initiative (para probar la FK durante el rebuild).
+      seedV1Base(db);
+      insertTrigger(db, {
+        id: "trg-agent-proposed",
+        created_by: "agent",
+        authority: "control_plane",
+        proposal_state: "proposed",
+      });
+      insertInitiative(db, {
+        id: "i-refs-trigger",
+        origin: "trigger",
+        trigger_id: "trg-owner",
+      });
+
+      const v3 = MIGRATIONS.find((m) => m.version === 3)!;
+      runMigrations(db, [v3]);
+
+      assert.strictEqual(userVersion(db), 3);
+      assert.strictEqual(countRows(db, "triggers"), 3);
+      assert.strictEqual(countRows(db, "initiatives"), 11);
+
+      // Contenido conservado (idempotency_key incluida).
+      const kept = db
+        .prepare(
+          "SELECT id, created_by, authority, proposal_state, create_idempotency_key FROM triggers WHERE id = ?",
+        )
+        .get("trg-owner") as Record<string, string | null>;
+      assert.deepEqual(plain(kept), {
+        id: "trg-owner",
+        created_by: "owner",
+        authority: "owner",
+        proposal_state: null,
+        create_idempotency_key: null,
+      });
+
+      // Índices v3 recreados.
+      for (const name of [
+        "schedule_triggers_due",
+        "triggers_by_agent",
+        "triggers_create_idempotency",
+      ]) {
+        assert.ok(indexExists(db, name), `índice ${name} presente tras v3`);
+      }
+
+      // Nuevo CHECK: agente activo con proposal_state NULL ya es válido.
+      insertTrigger(db, {
+        id: "trg-agent-active",
+        created_by: "agent",
+        authority: "agent",
+        proposal_state: null,
+      });
+      insertTrigger(db, {
+        id: "trg-agent-proposed-v2",
+        created_by: "agent",
+        authority: "agent",
+        proposal_state: "proposed",
+      });
+      assert.throws(() =>
+        insertTrigger(db, {
+          id: "trg-bad",
+          created_by: "owner",
+          proposal_state: "proposed",
+        }),
+      );
+      assert.throws(() =>
+        insertTrigger(db, {
+          id: "trg-bad2",
+          created_by: "agent",
+          authority: "root",
+        }),
+      );
+
+      // La FK a triggers sigue RESTRICT tras el rebuild.
+      assert.throws(() =>
+        db.exec("DELETE FROM triggers WHERE id = 'trg-owner'"),
+      );
 
       db.close();
     });
@@ -555,9 +921,17 @@ describe("almacén SQLite del Manager", () => {
       assert.strictEqual(userVersion(db), 1);
 
       const triggersCols = tableColumns(db, "triggers").map((c) => c.name);
-      assert.ok(!triggersCols.includes("create_idempotency_key"), "sin columna v2 en triggers");
-      assert.ok(!triggersCols.includes("create_command_hash"), "sin columna v2 en triggers");
-      const initiativesCols = tableColumns(db, "initiatives").map((c) => c.name);
+      assert.ok(
+        !triggersCols.includes("create_idempotency_key"),
+        "sin columna v2 en triggers",
+      );
+      assert.ok(
+        !triggersCols.includes("create_command_hash"),
+        "sin columna v2 en triggers",
+      );
+      const initiativesCols = tableColumns(db, "initiatives").map(
+        (c) => c.name,
+      );
       for (const col of [
         "human_question",
         "human_expires_at",
@@ -566,7 +940,10 @@ describe("almacén SQLite del Manager", () => {
         "human_response_idempotency_key",
         "human_response_command_hash",
       ]) {
-        assert.ok(!initiativesCols.includes(col), `sin columna v2 initiatives.${col}`);
+        assert.ok(
+          !initiativesCols.includes(col),
+          `sin columna v2 initiatives.${col}`,
+        );
       }
       for (const table of ["human_request_deliveries", "runtime_admission"]) {
         assert.ok(!tableExists(db, table), `sin tabla v2 ${table}`);
@@ -582,7 +959,13 @@ describe("almacén SQLite del Manager", () => {
         assert.ok(!indexExists(db, name), `sin índice v2 ${name}`);
       }
 
-      assert.throws(() => insertTurn(db, { turn_id: "t3", idempotency_key: "idem-c", final_state: "paused_for_human" }));
+      assert.throws(() =>
+        insertTurn(db, {
+          turn_id: "t3",
+          idempotency_key: "idem-c",
+          final_state: "paused_for_human",
+        }),
+      );
 
       assert.strictEqual(countRows(db, "triggers"), 2);
       assert.strictEqual(countRows(db, "initiatives"), 10);
@@ -604,28 +987,131 @@ describe("almacén SQLite del Manager", () => {
         },
       };
       assert.throws(() => runMigrations(db, [m]));
-      assert.strictEqual(userVersion(db), 1, "user_version revertido a 1: la versión es atómica con la tx");
-      assert.strictEqual(tableExists(db, "t"), false, "el DDL también se revierte");
+      assert.strictEqual(
+        userVersion(db),
+        1,
+        "user_version revertido a 1: la versión es atómica con la tx",
+      );
+      assert.strictEqual(
+        tableExists(db, "t"),
+        false,
+        "el DDL también se revierte",
+      );
       db.close();
     });
 
-    it("reabrir un volumen ya migrado a v2 no re-aplica la migración", async () => {
+    it("reabrir un volumen ya migrado al último schema no re-aplica la migración", async () => {
       const dataDir = await tmpDataDir();
       const first = await openRaw(dataDir);
-      assert.strictEqual(userVersion(first), 2);
+      assert.strictEqual(userVersion(first), 3);
       insertTrigger(first, { id: "trg-keep" });
-      first.prepare("UPDATE triggers SET create_idempotency_key = ? WHERE id = ?").run("k-1", "trg-keep");
+      first
+        .prepare("UPDATE triggers SET create_idempotency_key = ? WHERE id = ?")
+        .run("k-1", "trg-keep");
       first.close();
       openRawDbs.splice(openRawDbs.indexOf(first), 1);
 
       const second = await openRaw(dataDir);
-      assert.strictEqual(userVersion(second), 2);
+      assert.strictEqual(userVersion(second), 3);
       assert.ok(tableExists(second, "runtime_admission"));
       assert.ok(tableExists(second, "human_request_deliveries"));
       const kept = second
         .prepare("SELECT id, create_idempotency_key FROM triggers WHERE id = ?")
-        .all("trg-keep") as Array<{ id: string; create_idempotency_key: string | null }>;
-      assert.deepEqual(kept.map(plain), [{ id: "trg-keep", create_idempotency_key: "k-1" }]);
+        .all("trg-keep") as Array<{
+        id: string;
+        create_idempotency_key: string | null;
+      }>;
+      assert.deepEqual(kept.map(plain), [
+        { id: "trg-keep", create_idempotency_key: "k-1" },
+      ]);
+    });
+
+    it("F9/R1-013: la v3 usa lista de columnas explícita y conserva idempotencia en su columna", () => {
+      const db = new DatabaseSync(":memory:");
+      runMigrations(db, [MIGRATIONS[0], MIGRATIONS[1]]);
+      // Fila v2 con idempotencia + hash (columnas de la Fase 2) para detección
+      // de mezcla de columnas en el rebuild v3.
+      db.prepare(
+        `INSERT INTO triggers
+                (id, agent_name, kind, definition_json, intent, mode, suggested_skill,
+                 created_by, authority, proposal_state, enabled, next_fire_at, last_fired_at,
+                 created_at, updated_at, create_idempotency_key, create_command_hash)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        "t-idem",
+        "alice",
+        "schedule",
+        JSON.stringify({
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        }),
+        "intent",
+        "solo",
+        null,
+        "owner",
+        "owner",
+        null,
+        1,
+        1,
+        null,
+        1000,
+        1000,
+        "idem-key-007",
+        "hash-abc",
+      );
+      const v3 = MIGRATIONS.find((m) => m.version === 3)!;
+      runMigrations(db, [v3]);
+      const row = db
+        .prepare(
+          "SELECT id, create_idempotency_key, create_command_hash, created_by, authority FROM triggers WHERE id = ?",
+        )
+        .get("t-idem") as Record<string, string | null>;
+      assert.deepEqual(plain(row), {
+        id: "t-idem",
+        create_idempotency_key: "idem-key-007",
+        create_command_hash: "hash-abc",
+        created_by: "owner",
+        authority: "owner",
+      });
+      db.close();
+    });
+
+    it("F6/R1-010: foreign_key_check dentro de la tx revierte la migración que deja violaciones de FK", () => {
+      const db = new DatabaseSync(":memory:");
+      runMigrations(db, [MIGRATIONS[0]]);
+      const m: Migration = {
+        version: 2,
+        disableForeignKeys: true,
+        up: (d) => {
+          // Con FKs OFF el INSERT con referencia rota se acepta en el momento;
+          // foreign_key_check (dentro de la tx) debe detectarla y revertir todo.
+          d.exec(
+            "CREATE TABLE t_fk (x TEXT REFERENCES triggers (id) ON DELETE RESTRICT)",
+          );
+          d.exec("INSERT INTO t_fk VALUES ('trigger-inexistente')");
+        },
+      };
+      assert.throws(() => runMigrations(db, [m]), /foreign_key_check/);
+      // Revertido de forma durable: ni versión ni tabla quedan confirmadas.
+      assert.strictEqual(userVersion(db), 1);
+      assert.strictEqual(
+        tableExists(db, "t_fk"),
+        false,
+        "tabla revertida por el ROLLBACK",
+      );
+      // La conexión no queda con FKs apagadas (restaura en finally al valor previo;
+      // node:sqlite por defecto tiene foreign_keys=ON).
+      const fk = db.prepare("PRAGMA foreign_keys").get() as {
+        foreign_keys: number;
+      };
+      assert.strictEqual(
+        fk.foreign_keys,
+        1,
+        "FK se restaura al valor previo (ON) tras el fallo",
+      );
+      db.close();
     });
   });
 
@@ -646,24 +1132,70 @@ describe("almacén SQLite del Manager", () => {
       assert.throws(() => insertTrigger(db, { enabled: 2 }));
     });
 
-    it("rechaza que el Agent cree sin propuesta pendiente", async () => {
+    it("v3: el Agent puede crear activo (proposal_state NULL) y rechaza propuesta inválida", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.throws(() => insertTrigger(db, { created_by: "agent" }));
-      assert.throws(() => insertTrigger(db, { created_by: "agent", proposal_state: "bogus" }));
+      // ADR 0035: un Trigger de agente que pasa el gate se activa de inmediato.
+      insertTrigger(db, { id: "a", created_by: "agent", proposal_state: null });
+      // owner/control_plane siguen sin poder crear como propuesta.
+      assert.throws(() =>
+        insertTrigger(db, {
+          id: "b",
+          created_by: "owner",
+          proposal_state: "proposed",
+        }),
+      );
+      assert.throws(() =>
+        insertTrigger(db, {
+          id: "c",
+          created_by: "control_plane",
+          proposal_state: "proposed",
+        }),
+      );
+      // proposal_state inválida sigue rechazándose.
+      assert.throws(() =>
+        insertTrigger(db, {
+          id: "d",
+          created_by: "agent",
+          proposal_state: "bogus",
+        }),
+      );
     });
 
     it("rechaza que owner/control_plane creen como propuesta", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.throws(() => insertTrigger(db, { created_by: "owner", proposal_state: "proposed" }));
-      assert.throws(() => insertTrigger(db, { created_by: "control_plane", proposal_state: "proposed" }));
+      assert.throws(() =>
+        insertTrigger(db, { created_by: "owner", proposal_state: "proposed" }),
+      );
+      assert.throws(() =>
+        insertTrigger(db, {
+          created_by: "control_plane",
+          proposal_state: "proposed",
+        }),
+      );
     });
 
-    it("acepta las combinaciones válidas de autoría y propuesta", async () => {
+    it("acepta las combinaciones válidas (v3: agente activo incl. NULL)", async () => {
       const db = await openRaw(await tmpDataDir());
       insertTrigger(db, { id: "a", created_by: "owner" });
       insertTrigger(db, { id: "b", created_by: "control_plane" });
-      insertTrigger(db, { id: "c", created_by: "agent", proposal_state: "proposed" });
-      insertTrigger(db, { id: "d", created_by: "agent", proposal_state: "approved" });
+      insertTrigger(db, {
+        id: "c",
+        created_by: "agent",
+        proposal_state: "proposed",
+      });
+      insertTrigger(db, {
+        id: "d",
+        created_by: "agent",
+        proposal_state: "approved",
+      });
+      insertTrigger(db, { id: "e", created_by: "agent" });
+      // La autoridad `agent` es válida como columna.
+      insertTrigger(db, {
+        id: "f",
+        created_by: "agent",
+        authority: "agent",
+        proposal_state: null,
+      });
     });
   });
 
@@ -687,10 +1219,20 @@ describe("almacén SQLite del Manager", () => {
       const db = await openRaw(await tmpDataDir());
       insertTrigger(db, { id: "trg-ref" });
       assert.throws(() => insertInitiative(db, { origin: "trigger" }));
-      assert.throws(() => insertInitiative(db, { origin: "trigger", trigger_id: null }));
-      assert.throws(() => insertInitiative(db, { origin: "callback", trigger_id: "trg-ref" }));
-      assert.throws(() => insertInitiative(db, { origin: "human", trigger_id: "trg-ref" }));
-      insertInitiative(db, { id: "ok-trigger", origin: "trigger", trigger_id: "trg-ref" });
+      assert.throws(() =>
+        insertInitiative(db, { origin: "trigger", trigger_id: null }),
+      );
+      assert.throws(() =>
+        insertInitiative(db, { origin: "callback", trigger_id: "trg-ref" }),
+      );
+      assert.throws(() =>
+        insertInitiative(db, { origin: "human", trigger_id: "trg-ref" }),
+      );
+      insertInitiative(db, {
+        id: "ok-trigger",
+        origin: "trigger",
+        trigger_id: "trg-ref",
+      });
       insertInitiative(db, { id: "ok-callback", origin: "callback" });
       insertInitiative(db, { id: "ok-human", origin: "human" });
     });
@@ -700,29 +1242,54 @@ describe("almacén SQLite del Manager", () => {
       for (const terminal of ["succeeded", "failed", "expired", "cancelled"]) {
         assert.throws(() => insertInitiative(db, { state: terminal }));
       }
-      for (const vivo of ["queued", "running", "waiting_human", "waiting_agent"]) {
-        assert.throws(() => insertInitiative(db, { state: vivo, finished_at: 1 }));
+      for (const vivo of [
+        "queued",
+        "running",
+        "waiting_human",
+        "waiting_agent",
+      ]) {
+        assert.throws(() =>
+          insertInitiative(db, { state: vivo, finished_at: 1 }),
+        );
       }
-      insertInitiative(db, { id: "ok-terminal", state: "succeeded", finished_at: 2000 });
-      insertInitiative(db, { id: "ok-vivo", state: "waiting_human", summary: "resumen" });
+      insertInitiative(db, {
+        id: "ok-terminal",
+        state: "succeeded",
+        finished_at: 2000,
+      });
+      insertInitiative(db, {
+        id: "ok-vivo",
+        state: "waiting_human",
+        summary: "resumen",
+      });
     });
 
     it("waiting_human exige summary para conservarlo si caduca", async () => {
       const db = await openRaw(await tmpDataDir());
       assert.throws(() => insertInitiative(db, { state: "waiting_human" }));
-      insertInitiative(db, { id: "ok", state: "waiting_human", summary: "resumen" });
+      insertInitiative(db, {
+        id: "ok",
+        state: "waiting_human",
+        summary: "resumen",
+      });
     });
 
     it("rechaza chain_depth negativo y un booleano no binario", async () => {
       const db = await openRaw(await tmpDataDir());
       assert.throws(() => insertInitiative(db, { chain_depth: -1 }));
-      assert.throws(() => insertInitiative(db, { visible_effects_declared: 2 }));
+      assert.throws(() =>
+        insertInitiative(db, { visible_effects_declared: 2 }),
+      );
     });
 
     it("la FK a triggers usa ON DELETE RESTRICT", async () => {
       const db = await openRaw(await tmpDataDir());
       insertTrigger(db, { id: "trg-fk" });
-      insertInitiative(db, { id: "ini-fk", origin: "trigger", trigger_id: "trg-fk" });
+      insertInitiative(db, {
+        id: "ini-fk",
+        origin: "trigger",
+        trigger_id: "trg-fk",
+      });
       assert.throws(() => db.exec("DELETE FROM triggers WHERE id = 'trg-fk'"));
     });
   });
@@ -731,15 +1298,21 @@ describe("almacén SQLite del Manager", () => {
     it("rechaza que el Callback sea su propio parent (CHECK parent_id <> id)", async () => {
       const db = await openRaw(await tmpDataDir());
       insertInitiative(db, { id: "cb-self", origin: "callback" });
-      assert.throws(() => insertCallback(db, { id: "cb-self", parent_id: "cb-self" }));
+      assert.throws(() =>
+        insertCallback(db, { id: "cb-self", parent_id: "cb-self" }),
+      );
     });
 
     it("la FK a initiatives valida id y parent_id", async () => {
       const db = await openRaw(await tmpDataDir());
       insertInitiative(db, { id: "cb-1", origin: "callback" });
       insertInitiative(db, { id: "parent-1" });
-      assert.throws(() => insertCallback(db, { id: "inexistente", parent_id: "parent-1" }));
-      assert.throws(() => insertCallback(db, { id: "cb-1", parent_id: "inexistente" }));
+      assert.throws(() =>
+        insertCallback(db, { id: "inexistente", parent_id: "parent-1" }),
+      );
+      assert.throws(() =>
+        insertCallback(db, { id: "cb-1", parent_id: "inexistente" }),
+      );
       insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
     });
 
@@ -748,7 +1321,9 @@ describe("almacén SQLite del Manager", () => {
       insertInitiative(db, { id: "cb-1", origin: "callback" });
       insertInitiative(db, { id: "parent-1" });
       insertCallback(db, { id: "cb-1", parent_id: "parent-1" });
-      assert.throws(() => db.exec("DELETE FROM initiatives WHERE id = 'parent-1'"));
+      assert.throws(() =>
+        db.exec("DELETE FROM initiatives WHERE id = 'parent-1'"),
+      );
       db.exec("DELETE FROM initiatives WHERE id = 'cb-1'");
       const restantes = db
         .prepare("SELECT COUNT(*) AS n FROM callbacks WHERE id = 'cb-1'")
@@ -766,14 +1341,34 @@ describe("almacén SQLite del Manager", () => {
 
     it("idempotency_key es única globalmente, cruzando Agents", async () => {
       const db = await openRaw(await tmpDataDir());
-      insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
-      assert.throws(() => insertTurn(db, { agent_name: "bob", turn_id: "turn-2", idempotency_key: "idem-1" }));
+      insertTurn(db, {
+        agent_name: "alice",
+        turn_id: "turn-1",
+        idempotency_key: "idem-1",
+      });
+      assert.throws(() =>
+        insertTurn(db, {
+          agent_name: "bob",
+          turn_id: "turn-2",
+          idempotency_key: "idem-1",
+        }),
+      );
     });
 
     it("la PK compuesta (agent_name, turn_id) rechaza duplicados", async () => {
       const db = await openRaw(await tmpDataDir());
-      insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-1" });
-      assert.throws(() => insertTurn(db, { agent_name: "alice", turn_id: "turn-1", idempotency_key: "idem-2" }));
+      insertTurn(db, {
+        agent_name: "alice",
+        turn_id: "turn-1",
+        idempotency_key: "idem-1",
+      });
+      assert.throws(() =>
+        insertTurn(db, {
+          agent_name: "alice",
+          turn_id: "turn-1",
+          idempotency_key: "idem-2",
+        }),
+      );
     });
   });
 });

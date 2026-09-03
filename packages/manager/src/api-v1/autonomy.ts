@@ -21,7 +21,10 @@ import type {
   AgendaEntry,
   AutonomyProjection,
 } from "../agenda/autonomy-projection.ts";
-import type { CreateTriggerResult } from "../agenda/triggers.ts";
+import type {
+  CreateTriggerResult,
+  EffectiveTriggerAuthority,
+} from "../agenda/triggers.ts";
 import type {
   AutonomyControl,
   CancelInitiativeResult,
@@ -32,6 +35,12 @@ import { DomainError, toApiError } from "../agenda/errors.ts";
 import type { ApiErrorCode } from "./errors.ts";
 import { apiError, HTTP_STATUS_BY_CODE } from "./errors.ts";
 import { MAX_HUMAN_ANSWER_LENGTH } from "../agenda/initiatives.ts";
+import type { TriggerCreationPolicy } from "../agenda/triggers.ts";
+import {
+  PIHUB_PRINCIPAL_HEADER,
+  PIHUB_RUNNER_PRINCIPAL,
+  PIHUB_AGENT_HEADER,
+} from "@pihub/shared";
 
 // ---------------------------------------------------------------------------
 // Tipos públicos (lo que ve el caller)
@@ -66,9 +75,13 @@ const KNOWN_FAILURE_REASONS = new Set<string>([
   "startup_recovery",
 ]);
 
-export function sanitizeFailureReason(raw: string | null): SanitizedFailureReason {
+export function sanitizeFailureReason(
+  raw: string | null,
+): SanitizedFailureReason {
   if (raw === null) return null;
-  return KNOWN_FAILURE_REASONS.has(raw) ? (raw as SanitizedFailureReason) : "unknown";
+  return KNOWN_FAILURE_REASONS.has(raw)
+    ? (raw as SanitizedFailureReason)
+    : "unknown";
 }
 
 /** Initiative pública (allowlist positiva, clave por clave). */
@@ -129,7 +142,7 @@ export interface PublicTrigger {
   readonly mode: PublicInitiativeMode;
   readonly suggestedSkill: string | null;
   readonly createdBy: "owner" | "control_plane" | "agent";
-  readonly authority: "owner" | "control_plane";
+  readonly authority: "owner" | "control_plane" | "agent";
   readonly proposalState: "proposed" | "approved" | null;
   readonly enabled: boolean;
   readonly nextFireAt: number | null;
@@ -222,7 +235,15 @@ export interface AdmissionPort {
 const AT_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /** Día de la semana del catálogo. */
-const WEEKDAY_VALUES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+const WEEKDAY_VALUES = [
+  "mon",
+  "tue",
+  "wed",
+  "thu",
+  "fri",
+  "sat",
+  "sun",
+] as const;
 
 const scheduleV2DailySchema = z
   .object({
@@ -239,10 +260,7 @@ const scheduleV2WeeklySchema = z
     kind: z.literal("weekly"),
     timeZone: z.string().min(1),
     at: z.string().regex(AT_PATTERN, "HH:mm required"),
-    days: z
-      .array(z.enum(WEEKDAY_VALUES))
-      .min(1)
-      .max(7),
+    days: z.array(z.enum(WEEKDAY_VALUES)).min(1).max(7),
   })
   .strict();
 
@@ -295,7 +313,9 @@ function presentInitiative(initiative: InternalInitiative): PublicInitiative {
     summary: initiative.summary,
     question: initiative.humanQuestion,
     notificationStatus:
-      initiative.state === "waiting_human" ? initiative.notificationStatus : null,
+      initiative.state === "waiting_human"
+        ? initiative.notificationStatus
+        : null,
     availableAt: initiative.availableAt,
     createdAt: initiative.createdAt,
     stateChangedAt: initiative.stateChangedAt,
@@ -311,7 +331,9 @@ function presentInitiative(initiative: InternalInitiative): PublicInitiative {
   //           chainDepth, chainDeadlineAt, visibleEffectsDeclared
 }
 
-function presentSchedule(definition: InternalTrigger["definition"]): PublicSchedule {
+function presentSchedule(
+  definition: InternalTrigger["definition"],
+): PublicSchedule {
   // definition ya es ParsedSchedule (unión discriminada)
   if (definition.version === 1) {
     return {
@@ -367,7 +389,9 @@ function presentAgendaEntry(entry: AgendaEntry): PublicAgendaEntry {
 }
 
 /** Presenta un snapshot interno como snapshot público. */
-export function presentSnapshot(snapshot: InternalAutonomySnapshot): PublicAutonomySnapshot {
+export function presentSnapshot(
+  snapshot: InternalAutonomySnapshot,
+): PublicAutonomySnapshot {
   return {
     asOf: snapshot.asOf,
     initiatives: snapshot.initiatives.map(presentInitiative),
@@ -378,7 +402,12 @@ export function presentSnapshot(snapshot: InternalAutonomySnapshot): PublicAuton
   };
 }
 
-function presentCreateTriggerResult(result: CreateTriggerResult): PublicCreateTriggerResult {
+function presentCreateTriggerResult(
+  result: CreateTriggerResult,
+): PublicCreateTriggerResult {
+  // SAFETY: CreateTriggerResult.trigger y InternalTrigger son el mismo objeto de
+  // dominio Trigger; los campos internos de idempotencia se descartan en
+  // `presentTrigger` (allowlist), nunca se exponen.
   const trigger: InternalTrigger = result.trigger as unknown as InternalTrigger;
   return {
     trigger: presentTrigger(trigger),
@@ -389,6 +418,8 @@ function presentCreateTriggerResult(result: CreateTriggerResult): PublicCreateTr
 function presentCancelInitiativeResult(
   result: CancelInitiativeResult,
 ): PublicCancelInitiativeResult {
+  // SAFETY: CancelInitiativeResult.initiative es el mismo objeto de dominio
+  // Initiative; los campos internos se filtran en `presentInitiative`.
   const initiative = result.initiative as unknown as InternalInitiative;
   return {
     status: result.status,
@@ -399,6 +430,8 @@ function presentCancelInitiativeResult(
 function presentRespondInitiativeResult(
   result: RespondInitiativeResult,
 ): PublicRespondInitiativeResult {
+  // SAFETY: RespondInitiativeResult.initiative es el mismo objeto de dominio
+  // Initiative; los campos internos se filtran en `presentInitiative`.
   const initiative = result.initiative as unknown as InternalInitiative;
   return {
     initiative: presentInitiative(initiative),
@@ -417,7 +450,9 @@ function presentRespondInitiativeResult(
 export const SERVICE_AUTONOMY_PRESENTER = {
   presentSnapshot,
   presentCreateTriggerResult,
-  presentRevokeTriggerResult(trigger: InternalTrigger): PublicRevokeTriggerResult {
+  presentRevokeTriggerResult(
+    trigger: InternalTrigger,
+  ): PublicRevokeTriggerResult {
     return { trigger: presentTrigger(trigger) };
   },
   presentCancelInitiativeResult,
@@ -432,7 +467,9 @@ export const SERVICE_AUTONOMY_PRESENTER = {
 export const PANEL_AUTONOMY_PRESENTER = {
   presentSnapshot,
   presentCreateTriggerResult,
-  presentRevokeTriggerResult(trigger: InternalTrigger): PublicRevokeTriggerResult {
+  presentRevokeTriggerResult(
+    trigger: InternalTrigger,
+  ): PublicRevokeTriggerResult {
     return { trigger: presentTrigger(trigger) };
   },
   presentCancelInitiativeResult,
@@ -444,7 +481,9 @@ export const PANEL_AUTONOMY_PRESENTER = {
 // Presenter de admisión
 // ---------------------------------------------------------------------------
 
-function presentAdmissionState(state: AdmissionStateInternal): PublicAdmissionState {
+function presentAdmissionState(
+  state: AdmissionStateInternal,
+): PublicAdmissionState {
   return {
     [__publicBrand]: true as const,
     state: state.state,
@@ -483,6 +522,14 @@ export function autonomyErrorMessage(code: ApiErrorCode): string {
       return "Initiative state conflict";
     case "IDEMPOTENCY_CONFLICT":
       return "Idempotency key conflict";
+    case "FORBIDDEN":
+      return "Operation not permitted";
+    case "AUTONOMY_DISABLED":
+      return "Autonomous trigger creation is disabled";
+    case "TRIGGER_LIMIT_REACHED":
+      return "Active agent trigger limit reached";
+    case "TRIGGER_AUTHORITY_CONFLICT":
+      return "Trigger authority conflict";
     case "BAD_REQUEST":
       return "Bad request";
     case "RESOURCE_UNAVAILABLE":
@@ -517,7 +564,46 @@ function fail(c: Context<AuthEnv>, code: ApiErrorCode, message: string) {
 /** Recupera el presenter según el principal autenticado. */
 function presenterFor(c: Context<AuthEnv>) {
   const principal = c.get("principal");
-  return principal.kind === "panel" ? PANEL_AUTONOMY_PRESENTER : SERVICE_AUTONOMY_PRESENTER;
+  return principal.kind === "panel"
+    ? PANEL_AUTONOMY_PRESENTER
+    : SERVICE_AUTONOMY_PRESENTER;
+}
+
+/**
+ * Autoridad efectiva del Trigger derivada del principal autenticado (pihub step
+ * 2a): sesión de panel (cookie) → `owner`; Bearer de servicio sin header de
+ * principal → `control_plane`; Bearer de servicio con `PIHUB_PRINCIPAL_HEADER:
+ * PIHUB_RUNNER_PRINCIPAL` (runner) → `agent`. Nunca se deduce del body: la capa
+ * `api-v1/auth.ts` ya garantizó que la petición trae una credencial válida.
+ * El valor del header se compara EXACTAMENTE con `PIHUB_RUNNER_PRINCIPAL`
+ * ("runner"): "Runner", "agent" o vacío → `control_plane` (R3-005).
+ */
+function effectiveAuthorityFor(c: Context<AuthEnv>): EffectiveTriggerAuthority {
+  const principal = c.get("principal");
+  if (principal.kind === "panel") return "owner";
+  return c.req.header(PIHUB_PRINCIPAL_HEADER) === PIHUB_RUNNER_PRINCIPAL
+    ? "agent"
+    : "control_plane";
+}
+
+/**
+ * Liga el principal Runner al Agent sobre el que opera (R1-008): cuando la
+ * petición declara `PIHUB_PRINCIPAL_HEADER: runner`, el header
+ * `PIHUB_AGENT_HEADER` debe coincidir con el `:name` de la ruta; si falta o no
+ * coincide (un Runner intentando operar sobre otro Agent) → `FORBIDDEN`.
+ * `runtime-agent tools` solo pasan por aquí; nunca se deduce el principal del
+ * body. Suplantar la identidad exige la credencial de servicio, ya borrada del
+ * env alcanzable por el agente (R1-001).
+ */
+function assertRunnerBinding(c: Context<AuthEnv>, agentName: string): void {
+  if (c.req.header(PIHUB_PRINCIPAL_HEADER) !== PIHUB_RUNNER_PRINCIPAL) return;
+  const declared = c.req.header(PIHUB_AGENT_HEADER);
+  if (declared !== agentName) {
+    throw new DomainError(
+      "FORBIDDEN",
+      `runner declarado ${String(declared ?? "(sin X-Pihub-Agent)")} no puede operar sobre el agente ${agentName}`,
+    );
+  }
 }
 
 /** Parámetro de ruta obligatorio; missing = 400. */
@@ -540,6 +626,17 @@ export interface AutonomyRouteDeps {
   readonly agentExists: (name: string) => Promise<boolean>;
   readonly now: () => number;
   /**
+   * Lee la política de Triggers de un Agent (`AgentConfig.autonomy.triggers`,
+   * aditiva) para el gate de la autoridad `agent`. Ausente si el Agent no la
+   * declara (el repositorio aplica los defaults del Manager). Solo se consulta
+   * cuando la autoridad efectiva es `agent`. Si la lectura falla con un error
+   * distinto de `ENOENT` debe lanzar `AUTONOMY_DISABLED` (fail-closed, R4-004),
+   * no devolver defaults silenciosos.
+   */
+  readonly readAgentTriggerPolicy?: (
+    name: string,
+  ) => Promise<TriggerCreationPolicy | undefined>;
+  /**
    * Port opcional de admisión. En producción P2 no está presente → las rutas
    * devuelven 503 RESOURCE_UNAVAILABLE. P4 aporta el adapter real.
    */
@@ -550,7 +647,10 @@ export interface AutonomyRouteDeps {
 // Handlers
 // ---------------------------------------------------------------------------
 
-function handleGetAutonomy(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Response | Promise<Response> {
+function handleGetAutonomy(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Response | Promise<Response> {
   const agentName = requiredParam(c, "name");
   return handleAgentNotFound(c, deps, agentName, async () => {
     const now = deps.now();
@@ -561,7 +661,10 @@ function handleGetAutonomy(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Respon
   });
 }
 
-async function handleCreateTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+async function handleCreateTrigger(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Promise<Response> {
   const agentName = requiredParam(c, "name");
   return handleAgentNotFound(c, deps, agentName, async () => {
     const idempotencyKey = c.req.header("Idempotency-Key");
@@ -579,15 +682,27 @@ async function handleCreateTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps)
     const { definition, intent, mode, suggestedSkill } = parsed.data;
     const now = deps.now();
     try {
-      const result = deps.control.createTrigger({
-        agentName,
-        definition: definition as never,
-        intent,
-        mode,
-        suggestedSkill: suggestedSkill ?? null,
-        idempotencyKey: idempotencyKey.trim(),
-        now,
-      });
+      // P2.4a: la autoridad efectiva se resuelve por request desde el principal
+      // autenticado (panel→owner, service→control_plane, service+header→agent).
+      // Solo para `agent` se consulta la política (config del agente) para el gate.
+      assertRunnerBinding(c, agentName);
+      const authority = effectiveAuthorityFor(c);
+      const policy =
+        authority === "agent"
+          ? await deps.readAgentTriggerPolicy?.(agentName)
+          : undefined;
+      const result = deps.control.createTrigger(
+        {
+          agentName,
+          definition: definition as never,
+          intent,
+          mode,
+          suggestedSkill: suggestedSkill ?? null,
+          idempotencyKey: idempotencyKey.trim(),
+          now,
+        },
+        { authority, policy },
+      );
       const presenter = presenterFor(c);
       const publicResult = presenter.presentCreateTriggerResult(result);
       return c.json(publicResult, result.replayed ? 200 : 201);
@@ -597,15 +712,27 @@ async function handleCreateTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps)
   });
 }
 
-async function handleRevokeTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+async function handleRevokeTrigger(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Promise<Response> {
   const agentName = requiredParam(c, "name");
   const triggerId = requiredParam(c, "id");
   return handleAgentNotFound(c, deps, agentName, async () => {
     const now = deps.now();
     try {
-      const trigger = deps.control.revokeTrigger({ agentName, triggerId, now });
+      // P2.4a: igual que create — la autoridad efectiva se resuelve por request.
+      assertRunnerBinding(c, agentName);
+      const trigger = deps.control.revokeTrigger(
+        { agentName, triggerId, now },
+        { authority: effectiveAuthorityFor(c) },
+      );
       const presenter = presenterFor(c);
-      const publicResult = presenter.presentRevokeTriggerResult(trigger as unknown as InternalTrigger);
+      // SAFETY: Trigger devuelto por revokeTrigger es el mismo objeto de dominio;
+      // los campos internos se filtran en `presentTrigger` (allowlist).
+      const publicResult = presenter.presentRevokeTriggerResult(
+        trigger as unknown as InternalTrigger,
+      );
       return c.json(publicResult, 200);
     } catch (error) {
       return handleDomainError(c, error);
@@ -617,13 +744,20 @@ async function handleRevokeTrigger(c: Context<AuthEnv>, deps: AutonomyRouteDeps)
 // Handlers P2.4 — cancel/respond y admisión
 // ---------------------------------------------------------------------------
 
-async function handleCancelInitiative(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+async function handleCancelInitiative(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Promise<Response> {
   const agentName = requiredParam(c, "name");
   const initiativeId = requiredParam(c, "id");
   return handleAgentNotFound(c, deps, agentName, async () => {
     const now = deps.now();
     try {
-      const result = deps.control.cancelInitiative({ agentName, initiativeId, now });
+      const result = deps.control.cancelInitiative({
+        agentName,
+        initiativeId,
+        now,
+      });
       const presenter = presenterFor(c);
       const publicResult = presenter.presentCancelInitiativeResult(result);
       // running → 202 cancellation_requested; resto → 200 cancelled
@@ -635,7 +769,10 @@ async function handleCancelInitiative(c: Context<AuthEnv>, deps: AutonomyRouteDe
   });
 }
 
-async function handleRespondInitiative(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+async function handleRespondInitiative(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Promise<Response> {
   const agentName = requiredParam(c, "name");
   const initiativeId = requiredParam(c, "id");
   return handleAgentNotFound(c, deps, agentName, async () => {
@@ -675,7 +812,10 @@ async function handleRespondInitiative(c: Context<AuthEnv>, deps: AutonomyRouteD
 // Handlers de admisión (P2.4 shell contractual)
 // ---------------------------------------------------------------------------
 
-function handleGetAdmission(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Response {
+function handleGetAdmission(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Response {
   if (!deps.admission) {
     return fail(c, "RESOURCE_UNAVAILABLE", "Admission not yet available (P4)");
   }
@@ -684,7 +824,10 @@ function handleGetAdmission(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Respo
   return c.json(presenter.presentAdmission(state));
 }
 
-async function handlePutAdmission(c: Context<AuthEnv>, deps: AutonomyRouteDeps): Promise<Response> {
+async function handlePutAdmission(
+  c: Context<AuthEnv>,
+  deps: AutonomyRouteDeps,
+): Promise<Response> {
   if (!deps.admission) {
     return fail(c, "RESOURCE_UNAVAILABLE", "Admission not yet available (P4)");
   }
@@ -749,7 +892,20 @@ function handleDomainError(c: Context<AuthEnv>, error: unknown): Response {
  * P2), responden 503 RESOURCE_UNAVAILABLE. P4 aporta el adapter real.
  */
 export function registerAutonomyRoutes(
-  app: { get: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; post: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void; put: (path: string, handler: (c: Context<AuthEnv>) => Response | Promise<Response>) => void },
+  app: {
+    get: (
+      path: string,
+      handler: (c: Context<AuthEnv>) => Response | Promise<Response>,
+    ) => void;
+    post: (
+      path: string,
+      handler: (c: Context<AuthEnv>) => Response | Promise<Response>,
+    ) => void;
+    put: (
+      path: string,
+      handler: (c: Context<AuthEnv>) => Response | Promise<Response>,
+    ) => void;
+  },
   deps: AutonomyRouteDeps,
 ): void {
   // GET /agents/:name/autonomy — snapshot público
@@ -759,13 +915,19 @@ export function registerAutonomyRoutes(
   app.post("/agents/:name/triggers", (c) => handleCreateTrigger(c, deps));
 
   // POST /agents/:name/triggers/:id/revoke — revoke trigger
-  app.post("/agents/:name/triggers/:id/revoke", (c) => handleRevokeTrigger(c, deps));
+  app.post("/agents/:name/triggers/:id/revoke", (c) =>
+    handleRevokeTrigger(c, deps),
+  );
 
   // POST /agents/:name/initiatives/:id/cancel — cancel initiative
-  app.post("/agents/:name/initiatives/:id/cancel", (c) => handleCancelInitiative(c, deps));
+  app.post("/agents/:name/initiatives/:id/cancel", (c) =>
+    handleCancelInitiative(c, deps),
+  );
 
   // POST /agents/:name/initiatives/:id/respond — respond to initiative
-  app.post("/agents/:name/initiatives/:id/respond", (c) => handleRespondInitiative(c, deps));
+  app.post("/agents/:name/initiatives/:id/respond", (c) =>
+    handleRespondInitiative(c, deps),
+  );
 
   // GET /runtime/admission — shell contractual (P2: 503 sin port; P4: real)
   app.get("/runtime/admission", (c) => handleGetAdmission(c, deps));

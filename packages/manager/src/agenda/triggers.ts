@@ -46,13 +46,27 @@ import { DomainError } from "./errors.ts";
 import { sqliteErrcode } from "./turns.ts";
 
 /** Catálogo de días de la semana (`mon`…`sun`), §3.3. */
-const WEEKDAY_NAMES: ReadonlySet<string> = new Set(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
+const WEEKDAY_NAMES: ReadonlySet<string> = new Set([
+  "mon",
+  "tue",
+  "wed",
+  "thu",
+  "fri",
+  "sat",
+  "sun",
+]);
 
 type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
 /** `PlainDate.dayOfWeek` ISO (mon=1 … sun=7) → nombre del día. */
 const WEEKDAY_BY_ISO: Readonly<Record<number, Weekday>> = {
-  1: "mon", 2: "tue", 3: "wed", 4: "thu", 5: "fri", 6: "sat", 7: "sun",
+  1: "mon",
+  2: "tue",
+  3: "wed",
+  4: "thu",
+  5: "fri",
+  6: "sat",
+  7: "sun",
 };
 
 /** `HH:mm` estricto (`00:00`–`23:59`): se rechazan `9:00` y formas con segundos. */
@@ -67,14 +81,40 @@ const AT_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 export type ParsedSchedule =
   | { version: 1; kind: "interval"; intervalMs: number }
   | { version: 2; kind: "daily"; timeZone: string; at: string }
-  | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
+  | {
+      version: 2;
+      kind: "weekly";
+      timeZone: string;
+      at: string;
+      days: readonly Weekday[];
+    };
 
 /**
- * Autoridad efectiva de un Trigger (plan P1 §4/§5). Se **inyecta** desde el
- * modo del proceso (`env.panelEnabled`), nunca se infiere de bearer/cookie:
- * un Bearer usado por el operador en Gobernador sigue actuando bajo `owner`.
+ * Autoridad efectiva de un Trigger (plan P1 §4/§5; pihub step 2a). La autoridad
+ * se deriva del PRINCIPAL autenticado **por request**: sesión de panel (cookie)
+ * → `owner`; Bearer de servicio solo → `control_plane`; Bearer de servicio
+ * acompañado de `X-Pihub-Principal: runner` → `agent`. Para callers que no
+ * derivan el principal por request se conserva el modelo inyectado del proceso
+ * como DEFAULT (`env.panelEnabled` → `owner`|`control_plane`).
  */
-export type EffectiveTriggerAuthority = "owner" | "control_plane";
+export type EffectiveTriggerAuthority = "owner" | "control_plane" | "agent";
+
+/**
+ * Política de la autoridad `agent` (pihub step 2a) — gate de creación de
+ * Triggers por un agente. Se lee del `AgentConfig.autonomy.triggers` (aditivo,
+ * JSON); los defaults se resuelven en el Manager con `DEFAULT_ENABLE_AGENT_TRIGGERS`
+ * y `DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS`.
+ */
+export interface TriggerCreationPolicy {
+  readonly enabled?: boolean;
+  readonly maxActiveAgentTriggers?: number;
+}
+
+/** Default de `autonomy.triggers.enabled` (a menos que se declare `false`). */
+export const DEFAULT_ENABLE_AGENT_TRIGGERS = true;
+
+/** Default de `autonomy.triggers.maxActiveAgentTriggers` (pihub step 2a). */
+export const DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS = 5;
 
 /**
  * Forma de schedule v2 que `createTrigger` admite (plan P1 §4.1): solo
@@ -83,7 +123,13 @@ export type EffectiveTriggerAuthority = "owner" | "control_plane";
  */
 export type ScheduleV2 =
   | { version: 2; kind: "daily"; timeZone: string; at: string }
-  | { version: 2; kind: "weekly"; timeZone: string; at: string; days: readonly Weekday[] };
+  | {
+      version: 2;
+      kind: "weekly";
+      timeZone: string;
+      at: string;
+      days: readonly Weekday[];
+    };
 
 /** Modelo completo de Trigger tal y como lo expone el repositorio (P1.3). */
 export interface Trigger {
@@ -97,7 +143,10 @@ export interface Trigger {
   readonly suggestedSkill: string | null;
   readonly createdBy: "owner" | "control_plane" | "agent";
   readonly authority: EffectiveTriggerAuthority;
-  readonly proposalState: "proposed" | "approved" | null;
+  readonly proposalState:
+    | "proposed"
+    | "approved"
+    | null /* agent v2a puede ser NULL (activo, ADR 0035) */;
   readonly enabled: boolean;
   readonly nextFireAt: number | null;
   readonly lastFiredAt: number | null;
@@ -144,7 +193,9 @@ export interface RevokeTriggerCommand {
 }
 
 /** Todo rechazo de schedule es `TRIGGER_NOT_DISPARABLE` (§3); el motivo es interno. */
-function notDisposableSchedule(reason: "json" | "shape" | "timeZone" | "calendar"): DomainError {
+function notDisposableSchedule(
+  reason: "json" | "shape" | "timeZone" | "calendar",
+): DomainError {
   return new DomainError(
     "TRIGGER_NOT_DISPARABLE",
     `definition_json no es un schedule planificable (${reason})`,
@@ -152,7 +203,10 @@ function notDisposableSchedule(reason: "json" | "shape" | "timeZone" | "calendar
 }
 
 /** Fail-closed: el conjunto de claves debe ser exactamente `expected`, sin extra. */
-function hasExactlyKeys(obj: Record<string, unknown>, expected: readonly string[]): boolean {
+function hasExactlyKeys(
+  obj: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
   const keys = Object.keys(obj);
   if (keys.length !== expected.length) return false;
   const sortedKeys = [...keys].sort();
@@ -168,7 +222,11 @@ function parseWeekdays(value: unknown): readonly Weekday[] {
   const seen = new Set<string>();
   const days: Weekday[] = [];
   for (const entry of value) {
-    if (typeof entry !== "string" || !WEEKDAY_NAMES.has(entry) || seen.has(entry)) {
+    if (
+      typeof entry !== "string" ||
+      !WEEKDAY_NAMES.has(entry) ||
+      seen.has(entry)
+    ) {
       throw notDisposableSchedule("shape");
     }
     seen.add(entry);
@@ -227,10 +285,17 @@ class ScheduleCalculator {
       if (!hasExactlyKeys(obj, ["version", "kind", "intervalMs"])) {
         throw notDisposableSchedule("shape");
       }
-      if (!Number.isSafeInteger(obj.intervalMs) || (obj.intervalMs as number) <= 0) {
+      if (
+        !Number.isSafeInteger(obj.intervalMs) ||
+        (obj.intervalMs as number) <= 0
+      ) {
         throw notDisposableSchedule("shape");
       }
-      return { version: 1, kind: "interval", intervalMs: obj.intervalMs as number };
+      return {
+        version: 1,
+        kind: "interval",
+        intervalMs: obj.intervalMs as number,
+      };
     }
     if (obj.version === 2 && (obj.kind === "daily" || obj.kind === "weekly")) {
       if (typeof obj.at !== "string" || !AT_PATTERN.test(obj.at)) {
@@ -246,7 +311,13 @@ class ScheduleCalculator {
       if (!hasExactlyKeys(obj, ["version", "kind", "timeZone", "at", "days"])) {
         throw notDisposableSchedule("shape");
       }
-      return { version: 2, kind: "weekly", timeZone, at: obj.at, days: parseWeekdays(obj.days) };
+      return {
+        version: 2,
+        kind: "weekly",
+        timeZone,
+        at: obj.at,
+        days: parseWeekdays(obj.days),
+      };
     }
     throw notDisposableSchedule("shape");
   }
@@ -270,7 +341,10 @@ class ScheduleCalculator {
     const maxOffset = parsed.kind === "weekly" ? 7 : 1;
     for (let offset = 0; offset <= maxOffset; offset++) {
       const day = offset === 0 ? civilToday : civilToday.add({ days: offset });
-      if (parsed.kind === "weekly" && !parsed.days.includes(WEEKDAY_BY_ISO[day.dayOfWeek])) {
+      if (
+        parsed.kind === "weekly" &&
+        !parsed.days.includes(WEEKDAY_BY_ISO[day.dayOfWeek])
+      ) {
         continue;
       }
       const candidate = this.materialize(parsed.timeZone, day, hour, minute);
@@ -295,7 +369,13 @@ class ScheduleCalculator {
       throw notDisposableSchedule("timeZone");
     }
     try {
-      Temporal.ZonedDateTime.from({ timeZone: value, year: 2024, month: 1, day: 1, hour: 12 });
+      Temporal.ZonedDateTime.from({
+        timeZone: value,
+        year: 2024,
+        month: 1,
+        day: 1,
+        hour: 12,
+      });
     } catch {
       throw notDisposableSchedule("timeZone");
     }
@@ -315,7 +395,14 @@ class ScheduleCalculator {
   ): Temporal.ZonedDateTime {
     try {
       return Temporal.ZonedDateTime.from(
-        { timeZone, year: day.year, month: day.month, day: day.day, hour, minute },
+        {
+          timeZone,
+          year: day.year,
+          month: day.month,
+          day: day.day,
+          hour,
+          minute,
+        },
         { disambiguation: "compatible", overflow: "reject" },
       );
     } catch {
@@ -413,10 +500,18 @@ function canonicalDefinition(parsed: ParsedSchedule): Record<string, unknown> {
     return { version: 1, kind: "interval", intervalMs: parsed.intervalMs };
   }
   if (parsed.kind === "daily") {
-    return { version: 2, kind: "daily", timeZone: parsed.timeZone, at: parsed.at };
+    return {
+      version: 2,
+      kind: "daily",
+      timeZone: parsed.timeZone,
+      at: parsed.at,
+    };
   }
   return {
-    version: 2, kind: "weekly", timeZone: parsed.timeZone, at: parsed.at,
+    version: 2,
+    kind: "weekly",
+    timeZone: parsed.timeZone,
+    at: parsed.at,
     days: [...parsed.days].sort(),
   };
 }
@@ -502,7 +597,10 @@ export class TriggerRepository {
         )
         .get(triggerId) as TriggerRow | undefined;
       if (!row) {
-        throw new DomainError("TRIGGER_NOT_FOUND", `trigger ${triggerId} no existe`);
+        throw new DomainError(
+          "TRIGGER_NOT_FOUND",
+          `trigger ${triggerId} no existe`,
+        );
       }
       // Paso 3-4: disparabilidad (§9.1 — TRIGGER_NOT_DISPARABLE para
       // `proposed`/`disabled` o `next_fire_at IS NULL`; v1 solo dispara
@@ -532,9 +630,28 @@ export class TriggerRepository {
             result, created_at, state_changed_at, started_at, finished_at)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
-        initiativeId, row.agent_name, "queued", "trigger", triggerId, row.intent,
-        row.mode, sessionKey, now, null, null, 0, null, 0, null, null, null,
-        null, now, now, null, null,
+        initiativeId,
+        row.agent_name,
+        "queued",
+        "trigger",
+        triggerId,
+        row.intent,
+        row.mode,
+        sessionKey,
+        now,
+        null,
+        null,
+        0,
+        null,
+        0,
+        null,
+        null,
+        null,
+        null,
+        now,
+        now,
+        null,
+        null,
       );
       const update = db
         .prepare(
@@ -598,7 +715,10 @@ export class TriggerRepository {
    *   7. si el INSERT pierde esa carrera → releer dentro de la tx y aplicar 4/5;
    *   8. `COMMIT`, `replayed:false`.
    */
-  createTrigger(command: CreateTriggerCommand): CreateTriggerResult {
+  createTrigger(
+    command: CreateTriggerCommand,
+    agentPolicy?: TriggerCreationPolicy,
+  ): CreateTriggerResult {
     const db = this.sqlite;
     // Paso 1: validar y canonicalizar antes de abrir la tx. Se reutiliza el
     // `ScheduleCalculator` cerrado (misma validación de keys, IANA, HH:mm,
@@ -617,14 +737,26 @@ export class TriggerRepository {
         .prepare(
           `${SELECT_TRIGGER_FULL} WHERE agent_name = ? AND create_idempotency_key = ?`,
         )
-        .get(command.agentName, command.idempotencyKey) as TriggerRowFull | undefined;
+        .get(command.agentName, command.idempotencyKey) as
+        | TriggerRowFull
+        | undefined;
 
     db.exec("BEGIN IMMEDIATE"); // paso 2
     try {
       // Paso 3: la fila ya existente dentro de la tx decide entre 4/5.
       const existing = lookup();
       if (existing) {
+        // Idempotency replay / conflict se resuelve ANTES del gate de política
+        // (R3-003): una retry con la misma key al límite devuelve replayed:true
+        // en vez de TRIGGER_LIMIT_REACHED.
         return this.finishCreate(existing, commandHash, command.agentName);
+      }
+
+      // Gate de la autoridad `agent` (pihub step 2a). Se aplica DENTRO de la
+      // `BEGIN IMMEDIATE` (defense in depth: el conteo comparte transacción con
+      // el INSERT, R3-002/R4-001) y despues del CAS de idempotencia (R3-003).
+      if (command.authority === "agent") {
+        this.assertAgentTriggerPolicy(command.agentName, agentPolicy);
       }
 
       // Paso 6: INSERT completo; el índice único es el CAS contra otro escritor.
@@ -638,10 +770,23 @@ export class TriggerRepository {
               create_command_hash)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
-          triggerId, command.agentName, "schedule", definitionJson, command.intent,
-          command.mode, command.suggestedSkill, command.authority,
-          command.authority, null, 1, nextFireAt, null, command.now, command.now,
-          command.idempotencyKey, commandHash,
+          triggerId,
+          command.agentName,
+          "schedule",
+          definitionJson,
+          command.intent,
+          command.mode,
+          command.suggestedSkill,
+          command.authority,
+          command.authority,
+          null,
+          1,
+          nextFireAt,
+          null,
+          command.now,
+          command.now,
+          command.idempotencyKey,
+          commandHash,
         );
       } catch (error) {
         // Paso 7: el INSERT perdió la carrera contra otro escritor; releer
@@ -654,7 +799,10 @@ export class TriggerRepository {
       }
 
       db.exec("COMMIT"); // paso 8
-      return { trigger: this.getForAgent(command.agentName, triggerId), replayed: false };
+      return {
+        trigger: this.getForAgent(command.agentName, triggerId),
+        replayed: false,
+      };
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
@@ -683,13 +831,81 @@ export class TriggerRepository {
   }
 
   /**
+   * Número de Triggers ACTIVOS de un Agent con `created_by='agent'` (enabled=1).
+   * Es el denominador del gate de política de la autoridad `agent` (pihub step
+   * 2a): un agente no puede superar `autonomy.triggers.maxActiveAgentTriggers`.
+   */
+  countActiveAgentTriggers(agentName: string): number {
+    const row = this.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS n FROM triggers WHERE agent_name = ? AND created_by = 'agent' AND enabled = 1",
+      )
+      .get(agentName) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Gate de política de la autoridad `agent` (pihub step 2a). Defaults resueltos
+   * aquí (el Manager): `DEFAULT_ENABLE_AGENT_TRIGGERS=true`,
+   * `DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS=5`. Fail-closed:
+   *   (a) forma inválida (`enabled` presente y no booleano, o
+   *       `maxActiveAgentTriggers` presente y no entero positivo) →
+   *       `AUTONOMY_DISABLED` (R3-006).
+   *   (b) `enabled === false` → `AUTONOMY_DISABLED`.
+   *   (c) count de Triggers activos del agente con `created_by='agent'` ≥
+   *       `maxActiveAgentTriggers` → `TRIGGER_LIMIT_REACHED`.
+   */
+  private assertAgentTriggerPolicy(
+    agentName: string,
+    policy?: TriggerCreationPolicy,
+  ): void {
+    if (policy?.enabled !== undefined && typeof policy.enabled !== "boolean") {
+      throw new DomainError(
+        "AUTONOMY_DISABLED",
+        `agent ${agentName}: autonomy.triggers.enabled debe ser un booleano (fallo cerrado)`,
+      );
+    }
+    if (
+      policy?.maxActiveAgentTriggers !== undefined &&
+      (!Number.isInteger(policy.maxActiveAgentTriggers) ||
+        policy.maxActiveAgentTriggers < 1)
+    ) {
+      throw new DomainError(
+        "AUTONOMY_DISABLED",
+        `agent ${agentName}: autonomy.triggers.maxActiveAgentTriggers debe ser un entero positivo (fallo cerrado)`,
+      );
+    }
+    const enabled = policy?.enabled ?? DEFAULT_ENABLE_AGENT_TRIGGERS;
+    const maxActiveAgentTriggers =
+      policy?.maxActiveAgentTriggers ?? DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS;
+    if (enabled === false) {
+      throw new DomainError(
+        "AUTONOMY_DISABLED",
+        `agent ${agentName}: creación de Triggers deshabilitada por política (autonomy.triggers.enabled=false)`,
+      );
+    }
+    const active = this.countActiveAgentTriggers(agentName);
+    if (active >= maxActiveAgentTriggers) {
+      throw new DomainError(
+        "TRIGGER_LIMIT_REACHED",
+        `agent ${agentName}: límite de Triggers activos alcanzado (${active} ≥ ${maxActiveAgentTriggers})`,
+      );
+    }
+  }
+
+  /**
    * Revoke Trigger idempotente (plan P1 §4.2). CAS exacto dentro de una sola
-   * `BEGIN IMMEDIATE`:
+   * `BEGIN IMMEDIATE`. Para `authority` 'owner'/'control_plane' el CAS es por
+   * `authority`; para `authority='agent'` (pihub step 2a) el CAS es por
+   * `created_by='agent'` — un agente solo revoca Triggers que él creó:
    *
    * ```sql
-   * UPDATE triggers
-   * SET enabled=0, next_fire_at=NULL, updated_at=?
-   * WHERE id=? AND agent_name=? AND authority=? AND enabled=1;
+   * -- owner/control_plane
+   * UPDATE triggers SET enabled=0, next_fire_at=NULL, updated_at=?
+   *   WHERE id=? AND agent_name=? AND authority=? AND enabled=1;
+   * -- agent
+   * UPDATE triggers SET enabled=0, next_fire_at=NULL, updated_at=?
+   *   WHERE id=? AND agent_name=? AND created_by='agent' AND enabled=1;
    * ```
    *
    * Si cambia una fila, devuelve el Trigger revocado. Si cambia cero, relee
@@ -698,8 +914,9 @@ export class TriggerRepository {
    * | Relectura | Resultado |
    * |---|---|
    * | no existe (incluye ID de otro Agent) | `TRIGGER_NOT_FOUND`. |
-   * | existe, `authority` distinta | `TRIGGER_AUTHORITY_CONFLICT`. |
-   * | existe, autoridad coincide y `enabled=0` | éxito idempotente, sin cambiar otra vez `updated_at`. |
+   * | autoridad `agent`, pero la fila no es de agente | `FORBIDDEN` (no puede revocar lo que no creó). |
+   * | existe, guard (authority o created_by) distinto | `TRIGGER_AUTHORITY_CONFLICT`. |
+   * | existe, guard coincide y `enabled=0` | éxito idempotente, sin cambiar otra vez `updated_at`. |
    * | cualquier otro caso | `TRIGGER_AUTHORITY_CONFLICT` fail-closed; no se inventa éxito. |
    *
    * Revocar no borra Trigger, Initiatives ni `last_fired_at` y no reescribe
@@ -709,13 +926,29 @@ export class TriggerRepository {
     const db = this.sqlite;
     db.exec("BEGIN IMMEDIATE");
     try {
+      const isAgent = command.authority === "agent";
+      // ADR 0035 / R3-001: owner/control_plane pueden revocar Triggers creados
+      // por un agente (created_by='agent'), aunque su `authority` durable sea
+      // 'agent' y no coincida con la efectiva; el guard de `authority` se
+      // contempla junto con la procedencia de agente.
+      const guard = isAgent
+        ? "created_by = 'agent'"
+        : "(authority = ? OR created_by = 'agent')";
+      const params = isAgent
+        ? [command.now, command.triggerId, command.agentName]
+        : [
+            command.now,
+            command.triggerId,
+            command.agentName,
+            command.authority,
+          ];
       const result = db
         .prepare(
           `UPDATE triggers
              SET enabled = 0, next_fire_at = NULL, updated_at = ?
-           WHERE id = ? AND agent_name = ? AND authority = ? AND enabled = 1`,
+           WHERE id = ? AND agent_name = ? AND ${guard} AND enabled = 1`,
         )
-        .run(command.now, command.triggerId, command.agentName, command.authority);
+        .run(...params);
       if (Number(result.changes) === 1) {
         db.exec("COMMIT");
         return this.getForAgent(command.agentName, command.triggerId);
@@ -724,14 +957,30 @@ export class TriggerRepository {
       // otro Agent es indistinguible de inexistente (§4.2, §6.1).
       const row = db
         .prepare(`${SELECT_TRIGGER_FULL} WHERE id = ? AND agent_name = ?`)
-        .get(command.triggerId, command.agentName) as TriggerRowFull | undefined;
+        .get(command.triggerId, command.agentName) as
+        | TriggerRowFull
+        | undefined;
       if (!row) {
         throw new DomainError(
           "TRIGGER_NOT_FOUND",
           `trigger ${command.triggerId} no existe para el agent ${command.agentName}`,
         );
       }
-      if (row.authority !== command.authority) {
+      if (isAgent && row.created_by !== "agent") {
+        throw new DomainError(
+          "FORBIDDEN",
+          `trigger ${command.triggerId} (agent ${command.agentName}): un agente solo puede ` +
+            `revocar Triggers creados por él (created_by=${row.created_by})`,
+        );
+      }
+      // R2-006: para `agent` el guard siempre coincide tras el FORBIDDEN, así
+      // que solo se comprueba el desajuste de autoridad para owner/control_plane
+      // (donde la fila de agente también es revocable, R3-001).
+      const guardMatches =
+        isAgent ||
+        row.authority === command.authority ||
+        row.created_by === "agent";
+      if (!guardMatches) {
         throw new DomainError(
           "TRIGGER_AUTHORITY_CONFLICT",
           `trigger ${command.triggerId} (agent ${command.agentName}): authority durable ` +
@@ -769,12 +1018,18 @@ export class TriggerRepository {
    * procedencia histórica) y la reconciliación no toca `proposal_state`,
    * `enabled`, schedules, Agents ni Initiatives.
    */
-  reconcileAuthority(authority: EffectiveTriggerAuthority, now: number): number {
+  reconcileAuthority(
+    authority: EffectiveTriggerAuthority,
+    now: number,
+  ): number {
     const db = this.sqlite;
     db.exec("BEGIN IMMEDIATE");
     try {
       const result = db
-        .prepare("UPDATE triggers SET authority = ?, updated_at = ? WHERE authority <> ?")
+        .prepare(
+          "UPDATE triggers SET authority = ?, updated_at = ? " +
+            "WHERE authority <> ? AND NOT (created_by = 'agent' AND authority = 'agent')",
+        )
         .run(authority, now, authority);
       db.exec("COMMIT");
       return Number(result.changes);

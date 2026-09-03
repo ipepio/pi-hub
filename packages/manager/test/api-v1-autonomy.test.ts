@@ -57,24 +57,28 @@ function registerAgent(name: string): void {
 }
 
 /** Crea un trigger de prueba y devuelve su id. */
-function seedTrigger(db: SqliteDb, agentName: string, overrides?: Partial<{
-  id: string;
-  kind: string;
-  definitionJson: string;
-  intent: string;
-  mode: string;
-  suggestedSkill: string | null;
-  createdBy: string;
-  authority: string;
-  proposalState: string | null;
-  enabled: number;
-  nextFireAt: number | null;
-  lastFiredAt: number | null;
-  createdAt: number;
-  updatedAt: number;
-  createIdempotencyKey: string | null;
-  createCommandHash: string | null;
-}>): string {
+function seedTrigger(
+  db: SqliteDb,
+  agentName: string,
+  overrides?: Partial<{
+    id: string;
+    kind: string;
+    definitionJson: string;
+    intent: string;
+    mode: string;
+    suggestedSkill: string | null;
+    createdBy: string;
+    authority: string;
+    proposalState: string | null;
+    enabled: number;
+    nextFireAt: number | null;
+    lastFiredAt: number | null;
+    createdAt: number;
+    updatedAt: number;
+    createIdempotencyKey: string | null;
+    createCommandHash: string | null;
+  }>,
+): string {
   const id = overrides?.id ?? `trg-${Math.random().toString(36).slice(2, 10)}`;
   const now = Date.now();
   db.prepare(`
@@ -88,7 +92,8 @@ function seedTrigger(db: SqliteDb, agentName: string, overrides?: Partial<{
     id,
     agentName,
     overrides?.kind ?? "schedule",
-    overrides?.definitionJson ?? '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
+    overrides?.definitionJson ??
+      '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
     overrides?.intent ?? "test intent",
     overrides?.mode ?? "solo",
     overrides?.suggestedSkill ?? null,
@@ -145,32 +150,43 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
     };
 
     const app = makeApp({
-      projection: countingProjection as unknown as AutonomyRouteDeps["projection"],
+      projection:
+        countingProjection as unknown as AutonomyRouteDeps["projection"],
       control,
       agentExists: makeAgentExists(),
       now: () => 1_700_000_000_000,
     });
 
     snapshotCalls = 0;
-    const resService = await app.request(
-      "/agents/test-agent/autonomy",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const resService = await app.request("/agents/test-agent/autonomy", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(resService.status, 200, "service debe obtener 200");
-    assert.equal(snapshotCalls, 1, "GET service debe llamar a snapshotForAgent exactamente una vez");
-    const bodyService = await resService.json() as Record<string, unknown>;
+    assert.equal(
+      snapshotCalls,
+      1,
+      "GET service debe llamar a snapshotForAgent exactamente una vez",
+    );
+    const bodyService = (await resService.json()) as Record<string, unknown>;
 
     snapshotCalls = 0;
-    const resPanel = await app.request(
-      "/agents/test-agent/autonomy",
-      { headers: { authorization: "Bearer panel-token" } },
-    );
+    const resPanel = await app.request("/agents/test-agent/autonomy", {
+      headers: { authorization: "Bearer panel-token" },
+    });
     assert.equal(resPanel.status, 200, "panel debe obtener 200");
-    assert.equal(snapshotCalls, 1, "GET panel debe llamar a snapshotForAgent exactamente una vez");
-    const bodyPanel = await resPanel.json() as Record<string, unknown>;
+    assert.equal(
+      snapshotCalls,
+      1,
+      "GET panel debe llamar a snapshotForAgent exactamente una vez",
+    );
+    const bodyPanel = (await resPanel.json()) as Record<string, unknown>;
 
     // Ambas ven la misma proyección
-    assert.deepEqual(bodyService, bodyPanel, "service y panel deben ver el mismo snapshot");
+    assert.deepEqual(
+      bodyService,
+      bodyPanel,
+      "service y panel deben ver el mismo snapshot",
+    );
   });
 
   it("Agent inexistente da 404 AGENT_NOT_FOUND", async () => {
@@ -186,12 +202,11 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
       now: () => Date.now(),
     });
 
-    const res = await app.request(
-      "/agents/nonexistent/autonomy",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/agents/nonexistent/autonomy", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(res.status, 404);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "AGENT_NOT_FOUND");
   });
 
@@ -201,13 +216,15 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
     const trgDailyId = seedTrigger(db, "multi", {
       id: "trg-daily",
       intent: "daily check",
-      definitionJson: '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
+      definitionJson:
+        '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
     });
     // Trigger semanal
     const trgWeeklyId = seedTrigger(db, "multi", {
       id: "trg-weekly",
       intent: "weekly sync",
-      definitionJson: '{"version":2,"kind":"weekly","timeZone":"America/New_York","at":"18:30","days":["mon","wed","fri"]}',
+      definitionJson:
+        '{"version":2,"kind":"weekly","timeZone":"America/New_York","at":"18:30","days":["mon","wed","fri"]}',
     });
     // Initiative queued
     db.prepare(`
@@ -220,11 +237,34 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
          human_response_idempotency_key, human_response_command_hash)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      "ini-queued", "multi", "queued", "trigger", "trg-daily", "daily check", "solo",
-      "session-key-1", 1_700_000_000_000, null, null, 0, null,
-      0, null, null, null, null,
-      1_700_000_000_000, 1_700_000_000_000, null, null,
-      null, null, null, null, null, null,
+      "ini-queued",
+      "multi",
+      "queued",
+      "trigger",
+      "trg-daily",
+      "daily check",
+      "solo",
+      "session-key-1",
+      1_700_000_000_000,
+      null,
+      null,
+      0,
+      null,
+      0,
+      null,
+      null,
+      null,
+      null,
+      1_700_000_000_000,
+      1_700_000_000_000,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
     );
     // Initiative running
     db.prepare(`
@@ -237,11 +277,34 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
          human_response_idempotency_key, human_response_command_hash)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      "ini-running", "multi", "waiting_human", "trigger", "trg-weekly", "weekly sync", "ask",
-      "session-key-2", 1_700_000_000_000, "gpt-4", "turn-1", 0, null,
-      0, "running summary", null, null, null,
-      1_699_000_000_000, 1_700_000_000_000, 1_699_500_000_000, null,
-      "do you confirm?", 1_700_086_400_000, "req-1", null, null, null,
+      "ini-running",
+      "multi",
+      "waiting_human",
+      "trigger",
+      "trg-weekly",
+      "weekly sync",
+      "ask",
+      "session-key-2",
+      1_700_000_000_000,
+      "gpt-4",
+      "turn-1",
+      0,
+      null,
+      0,
+      "running summary",
+      null,
+      null,
+      null,
+      1_699_000_000_000,
+      1_700_000_000_000,
+      1_699_500_000_000,
+      null,
+      "do you confirm?",
+      1_700_086_400_000,
+      "req-1",
+      null,
+      null,
+      null,
     );
 
     const agenda = new AgendaRepository(db);
@@ -254,12 +317,11 @@ describe("P2.3 — GET /agents/:name/autonomy", () => {
       now: () => 1_700_000_050_000,
     });
 
-    const res = await app.request(
-      "/agents/multi/autonomy",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/agents/multi/autonomy", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.ok(Array.isArray(body.initiatives), "initiatives debe ser array");
     assert.ok(Array.isArray(body.agenda), "agenda debe ser array");
     assert.ok(Array.isArray(body.inbox), "inbox debe ser array");
@@ -286,24 +348,26 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
       now: () => 1_700_000_000_000,
     });
 
-    const res = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-create-1",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          intent: "daily check",
-          mode: "solo",
-        }),
+    const res = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-create-1",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        intent: "daily check",
+        mode: "solo",
+      }),
+    });
     assert.equal(res.status, 201, "create debe devolver 201");
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.replayed, false);
     assert.ok(body.trigger);
     assert.equal(typeof (body.trigger as Record<string, unknown>).id, "string");
@@ -322,22 +386,25 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
       now: () => 1_700_000_000_000,
     });
 
-    const res = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-create-weekly",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "weekly", timeZone: "America/New_York", at: "18:30", days: ["mon", "wed", "fri"] },
-          intent: "weekly sync",
-          mode: "ask",
-        }),
+    const res = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-create-weekly",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "weekly",
+          timeZone: "America/New_York",
+          at: "18:30",
+          days: ["mon", "wed", "fri"],
+        },
+        intent: "weekly sync",
+        mode: "ask",
+      }),
+    });
     assert.equal(res.status, 201);
   });
 
@@ -362,7 +429,12 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
         "Idempotency-Key": "idem-replay",
       },
       body: JSON.stringify({
-        definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
         intent: "daily check",
         mode: "solo",
       }),
@@ -373,7 +445,7 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
 
     const res2 = await app.request("/agents/test-agent/triggers", opts);
     assert.equal(res2.status, 200, "replay debe devolver 200");
-    const body2 = await res2.json() as Record<string, unknown>;
+    const body2 = (await res2.json()) as Record<string, unknown>;
     assert.equal(body2.replayed, true, "replay debe marcar replayed:true");
   });
 
@@ -389,20 +461,17 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
       now: () => Date.now(),
     });
 
-    const res = await app.request(
-      "/agents/nonexistent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-any",
-        },
-        body: JSON.stringify({ this_is: "garbage" }),
+    const res = await app.request("/agents/nonexistent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-any",
       },
-    );
+      body: JSON.stringify({ this_is: "garbage" }),
+    });
     assert.equal(res.status, 404);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "AGENT_NOT_FOUND");
   });
 
@@ -419,22 +488,19 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
       now: () => Date.now(),
     });
 
-    const res = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-v1",
-        },
-        body: JSON.stringify({
-          definition: { version: 1, kind: "interval", intervalMs: 3_600_000 },
-          intent: "test",
-          mode: "solo",
-        }),
+    const res = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-v1",
       },
-    );
+      body: JSON.stringify({
+        definition: { version: 1, kind: "interval", intervalMs: 3_600_000 },
+        intent: "test",
+        mode: "solo",
+      }),
+    });
     assert.equal(res.status, 400);
   });
 
@@ -451,21 +517,23 @@ describe("P2.3 — POST /agents/:name/triggers", () => {
       now: () => Date.now(),
     });
 
-    const res = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          intent: "test",
-          mode: "solo",
-        }),
+    const res = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        intent: "test",
+        mode: "solo",
+      }),
+    });
     assert.equal(res.status, 400);
   });
 });
@@ -474,7 +542,12 @@ describe("P2.3 — POST /agents/:name/triggers/:id/revoke", () => {
   it("revoca trigger y devuelve 200", async () => {
     const db = openMemoryDb();
     registerAgent("test-agent");
-    const triggerId = seedTrigger(db, "test-agent");
+    // Un caller service se resuelve a autoridad control_plane (por principal);
+    // el Trigger sembrado debe ser de control_plane para que el revoke aplique.
+    const triggerId = seedTrigger(db, "test-agent", {
+      createdBy: "control_plane",
+      authority: "control_plane",
+    });
     const agenda = new AgendaRepository(db);
     const turns = new TurnExecution({ apiToken: "test" });
     const control = new AutonomyControl({ agenda, turns, authority: "owner" });
@@ -493,7 +566,7 @@ describe("P2.3 — POST /agents/:name/triggers/:id/revoke", () => {
       },
     );
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.ok(body.trigger);
     assert.equal((body.trigger as Record<string, unknown>).id, triggerId);
   });
@@ -501,7 +574,10 @@ describe("P2.3 — POST /agents/:name/triggers/:id/revoke", () => {
   it("revoke repetido mantiene 200 y no borra historia", async () => {
     const db = openMemoryDb();
     registerAgent("test-agent");
-    const triggerId = seedTrigger(db, "test-agent");
+    const triggerId = seedTrigger(db, "test-agent", {
+      createdBy: "control_plane",
+      authority: "control_plane",
+    });
     const agenda = new AgendaRepository(db);
     const turns = new TurnExecution({ apiToken: "test" });
     const control = new AutonomyControl({ agenda, turns, authority: "owner" });
@@ -517,14 +593,22 @@ describe("P2.3 — POST /agents/:name/triggers/:id/revoke", () => {
       headers: { authorization: "Bearer service-token" },
     };
 
-    const res1 = await app.request(`/agents/test-agent/triggers/${triggerId}/revoke`, opts);
+    const res1 = await app.request(
+      `/agents/test-agent/triggers/${triggerId}/revoke`,
+      opts,
+    );
     assert.equal(res1.status, 200);
 
-    const res2 = await app.request(`/agents/test-agent/triggers/${triggerId}/revoke`, opts);
+    const res2 = await app.request(
+      `/agents/test-agent/triggers/${triggerId}/revoke`,
+      opts,
+    );
     assert.equal(res2.status, 200, "revoke repetido debe dar 200");
 
     // Trigger debe seguir existiendo en disco
-    const row = db.prepare("SELECT id FROM triggers WHERE id = ?").get(triggerId) as { id: string } | undefined;
+    const row = db
+      .prepare("SELECT id FROM triggers WHERE id = ?")
+      .get(triggerId) as { id: string } | undefined;
     assert.ok(row, "trigger debe seguir existiendo en BD tras revoke repetido");
   });
 
@@ -549,7 +633,7 @@ describe("P2.3 — POST /agents/:name/triggers/:id/revoke", () => {
       },
     );
     assert.equal(res.status, 404);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "TRIGGER_NOT_FOUND");
   });
 
@@ -594,34 +678,40 @@ describe("P2.3 — mutación con cookie visible en GET Bearer y viceversa", () =
     });
 
     // Crear trigger como panel
-    const createRes = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer panel-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-cross-1",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          intent: "cross check",
-          mode: "solo",
-        }),
+    const createRes = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer panel-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-cross-1",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        intent: "cross check",
+        mode: "solo",
+      }),
+    });
     assert.equal(createRes.status, 201);
 
     // Leer como Bearer service
-    const getRes = await app.request(
-      "/agents/test-agent/autonomy",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const getRes = await app.request("/agents/test-agent/autonomy", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(getRes.status, 200);
-    const body = await getRes.json() as Record<string, unknown>;
+    const body = (await getRes.json()) as Record<string, unknown>;
     const triggers = body.triggers as Array<Record<string, unknown>>;
-    const created = triggers.find((t: Record<string, unknown>) => t.intent === "cross check");
-    assert.ok(created, "el trigger creado por panel debe ser visible por Bearer");
+    const created = triggers.find(
+      (t: Record<string, unknown>) => t.intent === "cross check",
+    );
+    assert.ok(
+      created,
+      "el trigger creado por panel debe ser visible por Bearer",
+    );
   });
 
   it("trigger creado por Bearer se ve en GET con panel", async () => {
@@ -638,39 +728,48 @@ describe("P2.3 — mutación con cookie visible en GET Bearer y viceversa", () =
     });
 
     // Crear trigger como Bearer service
-    const createRes = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "idem-cross-2",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          intent: "bearer created",
-          mode: "solo",
-        }),
+    const createRes = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "idem-cross-2",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        intent: "bearer created",
+        mode: "solo",
+      }),
+    });
     assert.equal(createRes.status, 201);
 
     // Leer como panel
-    const getRes = await app.request(
-      "/agents/test-agent/autonomy",
-      { headers: { authorization: "Bearer panel-token" } },
-    );
+    const getRes = await app.request("/agents/test-agent/autonomy", {
+      headers: { authorization: "Bearer panel-token" },
+    });
     assert.equal(getRes.status, 200);
-    const body = await getRes.json() as Record<string, unknown>;
+    const body = (await getRes.json()) as Record<string, unknown>;
     const triggers = body.triggers as Array<Record<string, unknown>>;
-    const created = triggers.find((t: Record<string, unknown>) => t.intent === "bearer created");
-    assert.ok(created, "el trigger creado por Bearer debe ser visible por panel");
+    const created = triggers.find(
+      (t: Record<string, unknown>) => t.intent === "bearer created",
+    );
+    assert.ok(
+      created,
+      "el trigger creado por Bearer debe ser visible por panel",
+    );
   });
 });
 
 describe("P2.3 — raw responses no contienen sentinels internos (§3.2)", () => {
-  async function makeAppWithFakeControl(): Promise<{ app: Hono; db: SqliteDb }> {
+  async function makeAppWithFakeControl(): Promise<{
+    app: Hono;
+    db: SqliteDb;
+  }> {
     const db = openMemoryDb();
     registerAgent("test-agent");
 
@@ -681,8 +780,14 @@ describe("P2.3 — raw responses no contienen sentinels internos (§3.2)", () =>
           id: "trg-tainted",
           agentName: "test-agent",
           kind: "schedule",
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          definitionJson: '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
+          definition: {
+            version: 2,
+            kind: "daily",
+            timeZone: "Europe/Madrid",
+            at: "09:00",
+          },
+          definitionJson:
+            '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
           intent: "tainted test",
           mode: "solo",
           suggestedSkill: null,
@@ -705,8 +810,14 @@ describe("P2.3 — raw responses no contienen sentinels internos (§3.2)", () =>
         id: "trg-tainted-revoke",
         agentName: "test-agent",
         kind: "schedule",
-        definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-        definitionJson: '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        definitionJson:
+          '{"version":2,"kind":"daily","timeZone":"Europe/Madrid","at":"09:00"}',
         intent: "tainted revoke",
         mode: "solo",
         suggestedSkill: null,
@@ -737,34 +848,43 @@ describe("P2.3 — raw responses no contienen sentinels internos (§3.2)", () =>
 
   it("GET autonomy no contiene sentinels internos", async () => {
     const { app } = await makeAppWithFakeControl();
-    const res = await app.request(
-      "/agents/test-agent/autonomy",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/agents/test-agent/autonomy", {
+      headers: { authorization: "Bearer service-token" },
+    });
     const body = await res.text();
-    assert.equal(body.includes("LEAK::"), false, "GET autonomy no debe contener LEAK::");
+    assert.equal(
+      body.includes("LEAK::"),
+      false,
+      "GET autonomy no debe contener LEAK::",
+    );
   });
 
   it("POST create trigger no contiene sentinels internos", async () => {
     const { app } = await makeAppWithFakeControl();
-    const res = await app.request(
-      "/agents/test-agent/triggers",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-          "Idempotency-Key": "taint-test",
-        },
-        body: JSON.stringify({
-          definition: { version: 2, kind: "daily", timeZone: "Europe/Madrid", at: "09:00" },
-          intent: "taint test",
-          mode: "solo",
-        }),
+    const res = await app.request("/agents/test-agent/triggers", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
+        "Idempotency-Key": "taint-test",
       },
-    );
+      body: JSON.stringify({
+        definition: {
+          version: 2,
+          kind: "daily",
+          timeZone: "Europe/Madrid",
+          at: "09:00",
+        },
+        intent: "taint test",
+        mode: "solo",
+      }),
+    });
     const body = await res.text();
-    assert.equal(body.includes("LEAK::"), false, "POST create trigger no debe contener LEAK::");
+    assert.equal(
+      body.includes("LEAK::"),
+      false,
+      "POST create trigger no debe contener LEAK::",
+    );
   });
 
   it("POST revoke trigger no contiene sentinels internos", async () => {
@@ -777,7 +897,11 @@ describe("P2.3 — raw responses no contienen sentinels internos (§3.2)", () =>
       },
     );
     const body = await res.text();
-    assert.equal(body.includes("LEAK::"), false, "POST revoke trigger no debe contener LEAK::");
+    assert.equal(
+      body.includes("LEAK::"),
+      false,
+      "POST revoke trigger no debe contener LEAK::",
+    );
   });
 });
 
@@ -797,14 +921,36 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
          result, created_at, state_changed_at, started_at, finished_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, "test-agent", "queued", "trigger", "trg-1", "test", "solo",
-      "sk", 1_700_000_000_000, null, null, 0, null,
-      0, null, null, null, null,
-      1_700_000_000_000, 1_700_000_000_000, null, null,
+      id,
+      "test-agent",
+      "queued",
+      "trigger",
+      "trg-1",
+      "test",
+      "solo",
+      "sk",
+      1_700_000_000_000,
+      null,
+      null,
+      0,
+      null,
+      0,
+      null,
+      null,
+      null,
+      null,
+      1_700_000_000_000,
+      1_700_000_000_000,
+      null,
+      null,
     );
   }
 
-  function seedRunning(db: SqliteDb, id: string, turnId: string = "turn-running"): void {
+  function seedRunning(
+    db: SqliteDb,
+    id: string,
+    turnId: string = "turn-running",
+  ): void {
     seedTrigger(db, "test-agent", { id: "trg-1", intent: "test" });
     db.prepare(`
       INSERT INTO initiatives
@@ -814,10 +960,28 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
          result, created_at, state_changed_at, started_at, finished_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, "test-agent", "running", "trigger", "trg-1", "test", "solo",
-      "sk", 1_700_000_000_000, "gpt-4", turnId, 0, null,
-      0, null, null, null, null,
-      1_699_000_000_000, 1_700_000_000_000, 1_699_500_000_000, null,
+      id,
+      "test-agent",
+      "running",
+      "trigger",
+      "trg-1",
+      "test",
+      "solo",
+      "sk",
+      1_700_000_000_000,
+      "gpt-4",
+      turnId,
+      0,
+      null,
+      0,
+      null,
+      null,
+      null,
+      null,
+      1_699_000_000_000,
+      1_700_000_000_000,
+      1_699_500_000_000,
+      null,
     );
   }
 
@@ -831,10 +995,28 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
          result, created_at, state_changed_at, started_at, finished_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, "test-agent", state, "trigger", "trg-1", "test", "solo",
-      "sk", 1_700_000_000_000, null, null, 0, null,
-      0, null, null, null, null,
-      1_699_000_000_000, 1_700_000_000_000, 1_699_500_000_000, 1_700_000_000_000,
+      id,
+      "test-agent",
+      state,
+      "trigger",
+      "trg-1",
+      "test",
+      "solo",
+      "sk",
+      1_700_000_000_000,
+      null,
+      null,
+      0,
+      null,
+      0,
+      null,
+      null,
+      null,
+      null,
+      1_699_000_000_000,
+      1_700_000_000_000,
+      1_699_500_000_000,
+      1_700_000_000_000,
     );
   }
 
@@ -857,7 +1039,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.status, "cancelled");
     assert.ok(body.initiative);
   });
@@ -881,7 +1063,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.status, "cancelled");
   });
 
@@ -894,7 +1076,11 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
     const fakeTurns = {
       abort: () => true,
     } as unknown as TurnExecution;
-    const control = new AutonomyControl({ agenda, turns: fakeTurns, authority: "owner" });
+    const control = new AutonomyControl({
+      agenda,
+      turns: fakeTurns,
+      authority: "owner",
+    });
     const app = makeApp({
       projection: agenda.projection,
       control,
@@ -907,7 +1093,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     assert.equal(res.status, 202, "running debe dar 202");
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.status, "cancellation_requested");
   });
 
@@ -930,7 +1116,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     assert.equal(res.status, 409);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "INITIATIVE_STATE_CONFLICT");
   });
 
@@ -944,7 +1130,9 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
     const turns = new TurnExecution({ apiToken: "test" });
     const control = new AutonomyControl({ agenda, turns, authority: "owner" });
     // Actualizar agent_name en la fila a agent-a
-    db.prepare("UPDATE initiatives SET agent_name = 'agent-a' WHERE id = 'ini-other-agent'").run();
+    db.prepare(
+      "UPDATE initiatives SET agent_name = 'agent-a' WHERE id = 'ini-other-agent'",
+    ).run();
     const app = makeApp({
       projection: agenda.projection,
       control,
@@ -957,7 +1145,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/cancel", () => {
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     assert.equal(res.status, 404);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "INITIATIVE_NOT_FOUND");
   });
 });
@@ -979,11 +1167,34 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
          human_response_idempotency_key, human_response_command_hash)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, "test-agent", "waiting_human", "trigger", "trg-1", "test respond", "ask",
-      "sk-respond", 1_700_000_000_000, "gpt-4", "turn-respond", 0, null,
-      0, "summary respond", null, null, null,
-      1_699_000_000_000, 1_700_000_000_000, 1_699_500_000_000, null,
-      "do you confirm?", 1_700_086_400_000, "req-1", null, null, null,
+      id,
+      "test-agent",
+      "waiting_human",
+      "trigger",
+      "trg-1",
+      "test respond",
+      "ask",
+      "sk-respond",
+      1_700_000_000_000,
+      "gpt-4",
+      "turn-respond",
+      0,
+      null,
+      0,
+      "summary respond",
+      null,
+      null,
+      null,
+      1_699_000_000_000,
+      1_700_000_000_000,
+      1_699_500_000_000,
+      null,
+      "do you confirm?",
+      1_700_086_400_000,
+      "req-1",
+      null,
+      null,
+      null,
     );
   }
 
@@ -1014,7 +1225,7 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
       },
     );
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.ok(body.initiative);
     assert.equal(body.replayed, false);
     // Verificar que la initiative pasó a queued
@@ -1045,14 +1256,20 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
       body: JSON.stringify({ answer: "confirmado" }),
     };
 
-    const res1 = await app.request("/agents/test-agent/initiatives/ini-respond-replay/respond", opts);
+    const res1 = await app.request(
+      "/agents/test-agent/initiatives/ini-respond-replay/respond",
+      opts,
+    );
     assert.equal(res1.status, 200);
-    const body1 = await res1.json() as Record<string, unknown>;
+    const body1 = (await res1.json()) as Record<string, unknown>;
     assert.equal(body1.replayed, false);
 
-    const res2 = await app.request("/agents/test-agent/initiatives/ini-respond-replay/respond", opts);
+    const res2 = await app.request(
+      "/agents/test-agent/initiatives/ini-respond-replay/respond",
+      opts,
+    );
     assert.equal(res2.status, 200, "replay debe dar 200");
-    const body2 = await res2.json() as Record<string, unknown>;
+    const body2 = (await res2.json()) as Record<string, unknown>;
     assert.equal(body2.replayed, true, "replay debe marcar replayed:true");
   });
 
@@ -1097,10 +1314,28 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
          result, created_at, state_changed_at, started_at, finished_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      "ini-respond-queued", "test-agent", "queued", "trigger", "trg-1", "test", "solo",
-      "sk", 1_700_000_000_000, null, null, 0, null,
-      0, null, null, null, null,
-      1_700_000_000_000, 1_700_000_000_000, null, null,
+      "ini-respond-queued",
+      "test-agent",
+      "queued",
+      "trigger",
+      "trg-1",
+      "test",
+      "solo",
+      "sk",
+      1_700_000_000_000,
+      null,
+      null,
+      0,
+      null,
+      0,
+      null,
+      null,
+      null,
+      null,
+      1_700_000_000_000,
+      1_700_000_000_000,
+      null,
+      null,
     );
     const agenda = new AgendaRepository(db);
     const turns = new TurnExecution({ apiToken: "test" });
@@ -1132,7 +1367,9 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
     registerAgent("agent-a");
     registerAgent("agent-b");
     seedWaitingHuman(db, "ini-respond-other");
-    db.prepare("UPDATE initiatives SET agent_name = 'agent-a' WHERE id = 'ini-respond-other'").run();
+    db.prepare(
+      "UPDATE initiatives SET agent_name = 'agent-a' WHERE id = 'ini-respond-other'",
+    ).run();
     const agenda = new AgendaRepository(db);
     const turns = new TurnExecution({ apiToken: "test" });
     const control = new AutonomyControl({ agenda, turns, authority: "owner" });
@@ -1193,7 +1430,13 @@ describe("P2.4 — POST /agents/:name/initiatives/:id/respond", () => {
 // ---------------------------------------------------------------------------
 
 describe("P2.4 — GET/PUT /runtime/admission", () => {
-  function makeAdmissionApp(fakeAdmission?: { state: "open" | "draining"; idle: boolean; activeTurns: number; runningInitiatives: number; changedAt: number }) {
+  function makeAdmissionApp(fakeAdmission?: {
+    state: "open" | "draining";
+    idle: boolean;
+    activeTurns: number;
+    runningInitiatives: number;
+    changedAt: number;
+  }) {
     const db = openMemoryDb();
     registerAgent("test-agent");
     const agenda = new AgendaRepository(db);
@@ -1227,30 +1470,26 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
 
   it("sin port (producción P2) GET da 503 RESOURCE_UNAVAILABLE", async () => {
     const { app } = makeAdmissionApp(); // no fake admission
-    const res = await app.request(
-      "/runtime/admission",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/runtime/admission", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(res.status, 503);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "RESOURCE_UNAVAILABLE");
   });
 
   it("sin port PUT da 503 RESOURCE_UNAVAILABLE", async () => {
     const { app } = makeAdmissionApp();
-    const res = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "open" }),
+    const res = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "open" }),
+    });
     assert.equal(res.status, 503);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.code, "RESOURCE_UNAVAILABLE");
   });
 
@@ -1263,13 +1502,21 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       changedAt: 1_700_000_000_000,
     };
     const { app } = makeAdmissionApp(fakeAdmission);
-    const res = await app.request(
-      "/runtime/admission",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/runtime/admission", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
-    assert.deepEqual(Object.keys(body).sort(), ["activeTurns", "changedAt", "idle", "runningInitiatives", "state"].sort());
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.deepEqual(
+      Object.keys(body).sort(),
+      [
+        "activeTurns",
+        "changedAt",
+        "idle",
+        "runningInitiatives",
+        "state",
+      ].sort(),
+    );
     assert.equal(body.state, "open");
     assert.equal(body.idle, false);
     assert.equal(body.activeTurns, 2);
@@ -1286,20 +1533,26 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       changedAt: 1_700_000_000_000,
     };
     const { app } = makeAdmissionApp(fakeAdmission);
-    const res = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "draining" }),
+    const res = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "draining" }),
+    });
     assert.equal(res.status, 200, "PUT admission debe dar 200");
-    const body = await res.json() as Record<string, unknown>;
-    assert.deepEqual(Object.keys(body).sort(), ["activeTurns", "changedAt", "idle", "runningInitiatives", "state"].sort());
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.deepEqual(
+      Object.keys(body).sort(),
+      [
+        "activeTurns",
+        "changedAt",
+        "idle",
+        "runningInitiatives",
+        "state",
+      ].sort(),
+    );
     assert.equal(body.state, "draining");
   });
 
@@ -1314,31 +1567,25 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
     const { app } = makeAdmissionApp(fakeAdmission);
 
     // service
-    const resService = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "open" }),
+    const resService = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "open" }),
+    });
     assert.equal(resService.status, 200);
 
     // panel
-    const resPanel = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer panel-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "open" }),
+    const resPanel = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer panel-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "open" }),
+    });
     assert.equal(resPanel.status, 200);
   });
 
@@ -1351,17 +1598,14 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       changedAt: 1_700_000_000_000,
     };
     const { app } = makeAdmissionApp(fakeAdmission);
-    const res = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "invalid" }),
+    const res = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "invalid" }),
+    });
     assert.equal(res.status, 400);
   });
 
@@ -1374,17 +1618,14 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       changedAt: 1_700_000_000_000,
     };
     const { app } = makeAdmissionApp(fakeAdmission);
-    const res = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "open", extra: "nope" }),
+    const res = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "open", extra: "nope" }),
+    });
     assert.equal(res.status, 400);
   });
 
@@ -1428,18 +1669,27 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       admission: taintedPort,
     });
 
-    const res = await app.request(
-      "/runtime/admission",
-      { headers: { authorization: "Bearer service-token" } },
-    );
+    const res = await app.request("/runtime/admission", {
+      headers: { authorization: "Bearer service-token" },
+    });
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
+    const body = (await res.json()) as Record<string, unknown>;
     // Solo las 5 claves públicas
-    assert.deepEqual(Object.keys(body).sort(), ["activeTurns", "changedAt", "idle", "runningInitiatives", "state"]);
+    assert.deepEqual(Object.keys(body).sort(), [
+      "activeTurns",
+      "changedAt",
+      "idle",
+      "runningInitiatives",
+      "state",
+    ]);
     const json = JSON.stringify(body);
     assert.equal(json.includes("LEAK::"), false, "GET no debe filtrar LEAK::");
     assert.equal(json.includes("token"), false, "GET no debe filtrar token");
-    assert.equal(json.includes("internalCounters"), false, "GET no debe filtrar internalCounters");
+    assert.equal(
+      json.includes("internalCounters"),
+      false,
+      "GET no debe filtrar internalCounters",
+    );
   });
 
   it("PUT con port sucio no filtra LEAK:: ni claves extra (taint HTTP)", async () => {
@@ -1481,25 +1731,32 @@ describe("P2.4 — GET/PUT /runtime/admission", () => {
       admission: taintedPort,
     });
 
-    const res = await app.request(
-      "/runtime/admission",
-      {
-        method: "PUT",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ state: "draining" }),
+    const res = await app.request("/runtime/admission", {
+      method: "PUT",
+      headers: {
+        authorization: "Bearer service-token",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ state: "draining" }),
+    });
     assert.equal(res.status, 200);
-    const body = await res.json() as Record<string, unknown>;
-    assert.deepEqual(Object.keys(body).sort(), ["activeTurns", "changedAt", "idle", "runningInitiatives", "state"]);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(body).sort(), [
+      "activeTurns",
+      "changedAt",
+      "idle",
+      "runningInitiatives",
+      "state",
+    ]);
     assert.equal(body.state, "draining");
     const json = JSON.stringify(body);
     assert.equal(json.includes("LEAK::"), false, "PUT no debe filtrar LEAK::");
     assert.equal(json.includes("token"), false, "PUT no debe filtrar token");
-    assert.equal(json.includes("internalCounters"), false, "PUT no debe filtrar internalCounters");
+    assert.equal(
+      json.includes("internalCounters"),
+      false,
+      "PUT no debe filtrar internalCounters",
+    );
   });
 });
 
@@ -1602,7 +1859,11 @@ describe("P2.4 — raw responses de cancel/respond no contienen sentinels intern
       { method: "POST", headers: { authorization: "Bearer service-token" } },
     );
     const body = await res.text();
-    assert.equal(body.includes("LEAK::"), false, "POST cancel no debe contener LEAK::");
+    assert.equal(
+      body.includes("LEAK::"),
+      false,
+      "POST cancel no debe contener LEAK::",
+    );
   });
 
   it("POST respond no contiene LEAK::", async () => {
@@ -1620,6 +1881,10 @@ describe("P2.4 — raw responses de cancel/respond no contienen sentinels intern
       },
     );
     const body = await res.text();
-    assert.equal(body.includes("LEAK::"), false, "POST respond no debe contener LEAK::");
+    assert.equal(
+      body.includes("LEAK::"),
+      false,
+      "POST respond no debe contener LEAK::",
+    );
   });
 });

@@ -13,8 +13,10 @@ import {
 } from "@pihub/shared";
 import { runnerEnvFor, Supervisor } from "../dist/supervisor.js";
 
-test("runner callback auth is narrow and API_TOKEN remains absent", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-supervisor-env-"));
+test("runnerEnvFor inyecta API_TOKEN cuando env.apiToken está seteado y lo omite cuando vacío", async () => {
+  const dataDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "pihub-supervisor-env-"),
+  );
   try {
     await setEnv(dataDir, "GLOBAL_ONLY", "global-value");
     await setEnv(dataDir, "SHARED_VALUE", "global-value");
@@ -45,11 +47,20 @@ test("runner callback auth is narrow and API_TOKEN remains absent", async () => 
         sharedMemoryDefault: "none",
         telegramAllowedUsers: [],
       },
-      { name: "agent", port: 4100, enabled: true, createdAt: "2026-08-01T00:00:00.000Z" },
+      {
+        name: "agent",
+        port: 4100,
+        enabled: true,
+        createdAt: "2026-08-01T00:00:00.000Z",
+      },
       callbackToken,
     );
 
-    assert.equal(runnerEnv.API_TOKEN, undefined);
+    // The service credential is the Runner's inbound-auth secret AND the one
+    // the governed tools forward to the Manager; it must be present so
+    // `loadEnv()` in the runner captures it into `env.apiToken` (the boot
+    // scrub removes it from process.env afterwards, R1-001).
+    assert.equal(runnerEnv.API_TOKEN, "cd".repeat(32));
     assert.equal(runnerEnv.PIHUB_RUNNER_CALLBACK_TOKEN, callbackToken);
     assert.equal(runnerEnv.PIHUB_MANAGER_PORT, "4567");
     assert.equal(runnerEnv.CONTAINER_SECRET, undefined);
@@ -90,9 +101,16 @@ test("runnerEnvFor propaga la allowlist de Telegram al env del Runner", () => {
       sharedMemoryDefault: "none",
       telegramAllowedUsers: [111, 222],
     },
-    { name: "agent", port: 4100, enabled: true, createdAt: "2026-08-01T00:00:00.000Z" },
+    {
+      name: "agent",
+      port: 4100,
+      enabled: true,
+      createdAt: "2026-08-01T00:00:00.000Z",
+    },
     callbackToken,
   );
+  // apiToken ausente (vacío) → API_TOKEN no se compone al env del Runner.
+  assert.equal(runnerEnv.API_TOKEN, undefined);
   assert.equal(runnerEnv.PIHUB_TELEGRAM_ALLOWED_USERS, "111,222");
   assert.equal(runnerEnv.PIHUB_RUNNER_CALLBACK_TOKEN, callbackToken);
   assert.equal(runnerEnv.PIHUB_MANAGER_PORT, "4789");
@@ -109,7 +127,9 @@ async function writeRunnableAgent(dataDir, name) {
 }
 
 test("runner callback token is agent-scoped, rotates, and is revoked on stop or exit", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-supervisor-callback-"));
+  const dataDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "pihub-supervisor-callback-"),
+  );
   const alphaFirst = "11".repeat(32);
   const betaFirst = "22".repeat(32);
   const alphaSecond = "33".repeat(32);

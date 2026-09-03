@@ -19,11 +19,12 @@
  *     terminal T6: no existe un write optimista `running→cancelled`. La
  *     ventana connecting (abort no encuentra el handle) queda expuesta como
  *     `INITIATIVE_STATE_CONFLICT` hasta P4.
- *   - El modo y la autoridad se **inyectan**, NO se infieren del bearer ni de
- *     la cookie: un Bearer usado por el operador en Gobernador sigue actuando
- *     bajo autoridad `owner`. `AutonomyControl` no autentica, no conoce Hono y
- *     no redacta — es política de dominio configurada, no inferencia de
- *     credenciales (P2 aplicará el principal).
+ *   - La autoridad se **inyecta** como DEFAULT del proceso (`env.panelEnabled`
+ *     → `owner`|`control_plane`). `AutonomyControl` no autentica, no conoce
+ *     Hono y no redacta. Desde P2.4a (pihub step 2a) la capa de ruta puede
+ *     pasar la autoridad efectiva derivada del PRINCIPAL autenticado por
+ *     request (`panel`→`owner`, `service`→`control_plane`, `runner`→`agent`)
+ *     en `options`; sin `options`, se conserva el DEFAULT del constructor.
  */
 
 import type { AgendaRepository } from "./index.ts";
@@ -31,26 +32,60 @@ import type { Initiative } from "./initiatives.ts";
 import type { TurnExecution } from "./turn-execution.ts";
 import { DomainError } from "./errors.ts";
 import type {
-  CreateTriggerCommand as RepositoryCreateTriggerCommand,
-  CreateTriggerResult,
-  EffectiveTriggerAuthority,
-  RevokeTriggerCommand as RepositoryRevokeTriggerCommand,
-  Trigger,
+ CreateTriggerCommand as RepositoryCreateTriggerCommand,
+ CreateTriggerResult,
+ EffectiveTriggerAuthority,
+ RevokeTriggerCommand as RepositoryRevokeTriggerCommand,
+ Trigger,
 } from "./triggers.ts";
+import type { TriggerCreationPolicy } from "./triggers.ts";
 
 /**
  * Comando público de `createTrigger` (plan P1 §4.1): recibe `agentName`,
  * `definition` v2, `intent`, `mode`, `suggestedSkill`, `idempotencyKey` y
  * `now`. No recibe principal, token, cookie, Hono ni un `SqliteDb`; y no
- * aporta `authority`/`created_by` — se inyectan en el constructor.
+ * aporta `authority`/`created_by` — se inyectan en el constructor o se
+ * declaran por request en `CreateTriggerOptions`.
  */
-export type CreateTriggerCommand = Omit<RepositoryCreateTriggerCommand, "authority">;
+export type CreateTriggerCommand = Omit<
+ RepositoryCreateTriggerCommand,
+ "authority"
+>;
 
 /**
  * Comando público de `revokeTrigger` (plan P1 §4.2): recibe `agentName`,
- * `triggerId` y `now`; la `authority` se inyecta en el constructor.
+ * `triggerId` y `now`; la `authority` se inyecta en el constructor o se
+ * declara por request en `RevokeTriggerOptions`.
  */
-export type RevokeTriggerCommand = Omit<RepositoryRevokeTriggerCommand, "authority">;
+export type RevokeTriggerCommand = Omit<
+ RepositoryRevokeTriggerCommand,
+ "authority"
+>;
+
+/**
+ * Política de la autoridad `agent` (pihub step 2a) — gate de creación de
+ * Triggers por un agente. Se lee del `AgentConfig.autonomy.triggers` (aditivo,
+ * JSON); los defaults se resuelven en el repositorio con
+ * `DEFAULT_ENABLE_AGENT_TRIGGERS` (true) y `DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS`
+ * (5). Re-exportada desde `triggers.ts`, que es quien la define y la aplica.
+ */
+export type { TriggerCreationPolicy } from "./triggers.ts";
+export { DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS } from "./triggers.ts";
+
+/**
+ * Opciones por request de `createTrigger`. `authority` sobreescribe la
+ * autoridad efectiva del proceso (DEFAULT del constructor); `policy` es la
+ * política `agent` resuelta de la config del agente y la aplica el gate.
+ */
+export interface CreateTriggerOptions {
+ readonly authority?: EffectiveTriggerAuthority;
+ readonly policy?: TriggerCreationPolicy;
+}
+
+/** Opciones por request de `revokeTrigger` (`authority` sobreescribe el DEFAULT). */
+export interface RevokeTriggerOptions {
+ readonly authority?: EffectiveTriggerAuthority;
+}
 
 /** Resultado de `createTrigger`: el Trigger creado o reencontrado y si fue replay. */
 export type { CreateTriggerResult } from "./triggers.ts";
@@ -61,9 +96,9 @@ export type { CreateTriggerResult } from "./triggers.ts";
  * del turno se inyecta en el constructor.
  */
 export interface CancelInitiativeCommand {
-  readonly agentName: string;
-  readonly initiativeId: string;
-  readonly now: number;
+ readonly agentName: string;
+ readonly initiativeId: string;
+ readonly now: number;
 }
 
 /**
@@ -76,8 +111,11 @@ export interface CancelInitiativeCommand {
  *   `running→cancelled` lo escribirá TurnExecution/terminal T6, nunca Control.
  */
 export type CancelInitiativeResult =
-  | { readonly status: "cancelled"; readonly initiative: Initiative }
-  | { readonly status: "cancellation_requested"; readonly initiative: Initiative };
+ | { readonly status: "cancelled"; readonly initiative: Initiative }
+ | {
+    readonly status: "cancellation_requested";
+    readonly initiative: Initiative;
+   };
 
 /**
  * Comando de `respondToInitiative` (plan P1 §6.3): `agentName`, `initiativeId`,
@@ -86,13 +124,13 @@ export type CancelInitiativeResult =
  * canónica `{initiativeId, answer}`.
  */
 export interface RespondInitiativeCommand {
-  readonly agentName: string;
-  readonly initiativeId: string;
-  readonly answer: string;
-  readonly idempotencyKey: string;
-  readonly now: number;
-  /** P3.2/B1: request humano que el respondedor declara contestar (opcional). */
-  readonly expectedHumanRequestId?: string | null;
+ readonly agentName: string;
+ readonly initiativeId: string;
+ readonly answer: string;
+ readonly idempotencyKey: string;
+ readonly now: number;
+ /** P3.2/B1: request humano que el respondedor declara contestar (opcional). */
+ readonly expectedHumanRequestId?: string | null;
 }
 
 /**
@@ -101,144 +139,168 @@ export interface RespondInitiativeCommand {
  * después de un claim, gracias a que la key/hash persisten).
  */
 export type RespondInitiativeResult = {
-  readonly initiative: Initiative;
-  readonly replayed: boolean;
+ readonly initiative: Initiative;
+ readonly replayed: boolean;
 };
 
 export class AutonomyControl {
-  private readonly agenda: AgendaRepository;
-  private readonly turns: Pick<TurnExecution, "abort">;
-  private readonly authority: EffectiveTriggerAuthority;
+ private readonly agenda: AgendaRepository;
+ private readonly turns: Pick<TurnExecution, "abort">;
+ private readonly authority: EffectiveTriggerAuthority;
 
-  /**
-   * `authority` es la autoridad efectiva del proceso, derivada **una vez** del
-   * modo (`env.panelEnabled`) en el arranque; nunca se infiere por request.
-   * `turns` es solo el `abort` que la cancelación de una Initiative `running`
-   * necesita (plan P1 §4): es el único camino de cancelación de un turno vivo.
-   */
-  constructor(options: {
-    agenda: AgendaRepository;
-    turns: Pick<TurnExecution, "abort">;
-    authority: EffectiveTriggerAuthority;
-  }) {
-    this.agenda = options.agenda;
-    this.turns = options.turns;
-    this.authority = options.authority;
-  }
+ /**
+  * `authority` es la autoridad efectiva del proceso, derivada **una vez** del
+  * modo (`env.panelEnabled`) en el arranque; nunca se infiere por request.
+  * `turns` es solo el `abort` que la cancelación de una Initiative `running`
+  * necesita (plan P1 §4): es el único camino de cancelación de un turno vivo.
+  */
+ constructor(options: {
+  agenda: AgendaRepository;
+  turns: Pick<TurnExecution, "abort">;
+  authority: EffectiveTriggerAuthority;
+ }) {
+  this.agenda = options.agenda;
+  this.turns = options.turns;
+  this.authority = options.authority;
+ }
 
-  /**
-   * Crea un Trigger schedule v2 idempotente. Delega el CAS de idempotencia al
-   * repositorio y materializa aquí la autoridad efectiva inyectada. Devuelve
-   * `{ trigger, replayed }`: `replayed=true` cuando la misma key y el mismo
-   * comando canónico ya existían (mismo ID, sin segunda fila).
-   */
-  createTrigger(command: CreateTriggerCommand): CreateTriggerResult {
-    return this.agenda.triggers.createTrigger({
-      ...command,
-      authority: this.authority,
-    });
-  }
+ /**
+  * Crea un Trigger schedule v2 idempotente. Delega el CAS de idempotencia al
+  * repositorio y materializa aquí la autoridad efectiva: la `options.authority`
+  * por request si viene (pihub step 2a), si no la inyectada en el constructor
+  * (DEFAULT del proceso). Cuando la autoridad efectiva es `agent`, el gate de
+  * política lo aplica el repositorio DENTRO de la transacción y después del CAS
+  * de idempotencia: una retry con la misma key al límite devuelve
+  * `replayed:true` (R3-003), nunca `TRIGGER_LIMIT_REACHED`. Devuelve
+  * `{ trigger, replayed }`.
+  */
+ createTrigger(
+  command: CreateTriggerCommand,
+  options?: CreateTriggerOptions,
+ ): CreateTriggerResult {
+  const authority = options?.authority ?? this.authority;
+  return this.agenda.triggers.createTrigger(
+   {
+    ...command,
+    authority,
+   },
+   authority === "agent" ? options?.policy : undefined,
+  );
+ }
 
-  /**
-   * Revoca un Trigger (plan P1 §4.2). Deshabilita el Trigger y anula
-   * `next_fire_at`; repetirlo es éxito idempotente y nunca reescribe
-   * `created_by`. Un ID de otro Agent es indistinguible de inexistente
-   * (`TRIGGER_NOT_FOUND`); un Trigger cuya `authority` no coincide con la
-   * efectiva es `TRIGGER_AUTHORITY_CONFLICT` (fail-closed). Delega el CAS al
-   * repositorio y materializa aquí la autoridad efectiva inyectada.
-   */
-  revokeTrigger(command: RevokeTriggerCommand): Trigger {
-    return this.agenda.triggers.revokeTrigger({
-      ...command,
-      authority: this.authority,
-    });
-  }
+ /**
+  * Revoca un Trigger (plan P1 §4.2). Deshabilita el Trigger y anula
+  * `next_fire_at`; repetirlo es éxito idempotente y nunca reescribe
+  * `created_by`. `options.authority` por request prima sobre la del proceso.
+  * Un ID de otro Agent es indistinguible de inexistente
+  * (`TRIGGER_NOT_FOUND`); con autoridad `agent` solo se revoca lo creado por
+  * el agente (`FORBIDDEN` en otro caso); `owner`/`control_plane` conservan su
+  * semántica de `TRIGGER_AUTHORITY_CONFLICT`. Delega el CAS al repositorio.
+  */
+ revokeTrigger(
+  command: RevokeTriggerCommand,
+  options?: RevokeTriggerOptions,
+ ): Trigger {
+  return this.agenda.triggers.revokeTrigger({
+   ...command,
+   authority: options?.authority ?? this.authority,
+  });
+ }
 
-  /**
-   * Cancela una Initiative (plan P1 §6.2, matriz completa). Toda lectura y
-   * UPDATE va scoped por `(id, agent_name)`: un ID de otra Agenda es
-   * `INITIATIVE_NOT_FOUND`, indistinguible de uno inexistente.
-   *
-   * Estados en reposo (`queued`, `waiting_human`, `waiting_agent`) → CAS
-   * directo a `cancelled` por el repositorio. `cancelled` repetido es éxito
-   * idempotente sin escritura; `succeeded|failed|expired` es
-   * `INITIATIVE_STATE_CONFLICT`.
-   *
-   * `running` → **solo** por `TurnExecution.abort` + terminal T6; nunca se
-   * escribe `cancelled` en la fila mientras el turno sigue generando. Si el
-   * abort encuentra el handle devuelve `{status:"cancellation_requested"}`
-   * (T6 escribirá el terminal). Si no lo encuentra (ventana connecting, P4),
-   * se relee: `cancelled` es éxito idempotente; cualquier otro estado durable
-   * es `INITIATIVE_STATE_CONFLICT` — nunca se falsea una cancelación.
-   */
-  cancelInitiative(command: CancelInitiativeCommand): CancelInitiativeResult {
-    const { agentName, initiativeId, now } = command;
-    // Lectura inicial agent-scoped: decide el camino (reposo → CAS; running → abort).
-    const observed = this.agenda.initiatives.getForAgent(initiativeId, agentName);
-    if (observed.state === "running") {
-      return this.cancelRunning(observed);
-    }
-    const initiative = this.agenda.initiatives.cancelForAgent(initiativeId, agentName, now);
-    return { status: "cancelled", initiative };
+ /**
+  * Cancela una Initiative (plan P1 §6.2, matriz completa). Toda lectura y
+  * UPDATE va scoped por `(id, agent_name)`: un ID de otra Agenda es
+  * `INITIATIVE_NOT_FOUND`, indistinguible de uno inexistente.
+  *
+  * Estados en reposo (`queued`, `waiting_human`, `waiting_agent`) → CAS
+  * directo a `cancelled` por el repositorio. `cancelled` repetido es éxito
+  * idempotente sin escritura; `succeeded|failed|expired` es
+  * `INITIATIVE_STATE_CONFLICT`.
+  *
+  * `running` → **solo** por `TurnExecution.abort` + terminal T6; nunca se
+  * escribe `cancelled` en la fila mientras el turno sigue generando. Si el
+  * abort encuentra el handle devuelve `{status:"cancellation_requested"}`
+  * (T6 escribirá el terminal). Si no lo encuentra (ventana connecting, P4),
+  * se relee: `cancelled` es éxito idempotente; cualquier otro estado durable
+  * es `INITIATIVE_STATE_CONFLICT` — nunca se falsea una cancelación.
+  */
+ cancelInitiative(command: CancelInitiativeCommand): CancelInitiativeResult {
+  const { agentName, initiativeId, now } = command;
+  // Lectura inicial agent-scoped: decide el camino (reposo → CAS; running → abort).
+  const observed = this.agenda.initiatives.getForAgent(initiativeId, agentName);
+  if (observed.state === "running") {
+   return this.cancelRunning(observed);
   }
+  const initiative = this.agenda.initiatives.cancelForAgent(
+   initiativeId,
+   agentName,
+   now,
+  );
+  return { status: "cancelled", initiative };
+ }
 
-  /**
-   * Camino de una Initiative durablemente `running` (§6.2): abort + relectura.
-   * Ninguna rama escribe la fila: el terminal `running→cancelled` lo escribe
-   * TurnExecution (T6), no Control.
-   */
-  private cancelRunning(initiative: Initiative): CancelInitiativeResult {
-    if (initiative.turnId === null) {
-      throw new DomainError(
-        "INITIATIVE_INVARIANT_VIOLATION",
-        `initiative ${initiative.id}: running sin turn_id no tiene turno que abortar`,
-      );
-    }
-    const aborted = this.turns.abort(initiative.agentName, initiative.turnId);
-    if (aborted) {
-      return { status: "cancellation_requested", initiative };
-    }
-    // Abort no encontró el handle: releer para no falsear una cancelación.
-    const current = this.agenda.initiatives.getForAgent(initiative.id, initiative.agentName);
-    if (current.state === "cancelled") {
-      // T6 (u otro camino) ya la canceló mientras tanto: éxito idempotente.
-      return { status: "cancelled", initiative: current };
-    }
-    throw new DomainError(
-      "INITIATIVE_STATE_CONFLICT",
-      `initiative ${initiative.id}: abort no encontró el turno y durable sigue ${current.state}`,
-    );
+ /**
+  * Camino de una Initiative durablemente `running` (§6.2): abort + relectura.
+  * Ninguna rama escribe la fila: el terminal `running→cancelled` lo escribe
+  * TurnExecution (T6), no Control.
+  */
+ private cancelRunning(initiative: Initiative): CancelInitiativeResult {
+  if (initiative.turnId === null) {
+   throw new DomainError(
+    "INITIATIVE_INVARIANT_VIOLATION",
+    `initiative ${initiative.id}: running sin turn_id no tiene turno que abortar`,
+   );
   }
+  const aborted = this.turns.abort(initiative.agentName, initiative.turnId);
+  if (aborted) {
+   return { status: "cancellation_requested", initiative };
+  }
+  // Abort no encontró el handle: releer para no falsear una cancelación.
+  const current = this.agenda.initiatives.getForAgent(
+   initiative.id,
+   initiative.agentName,
+  );
+  if (current.state === "cancelled") {
+   // T6 (u otro camino) ya la canceló mientras tanto: éxito idempotente.
+   return { status: "cancelled", initiative: current };
+  }
+  throw new DomainError(
+   "INITIATIVE_STATE_CONFLICT",
+   `initiative ${initiative.id}: abort no encontró el turno y durable sigue ${current.state}`,
+  );
+ }
 
-  /**
-   * Lectura agent-scoped para bordes internos que deben explicar un conflicto
-   * de CAS sin abrir el almacén ni inferir la causa desde el texto del error.
-   * Un ID de otro Agent conserva la semántica indistinguible de no encontrado.
-   */
-  initiativeForAgent(agentName: string, initiativeId: string): Initiative {
-    return this.agenda.initiatives.getForAgent(initiativeId, agentName);
-  }
+ /**
+  * Lectura agent-scoped para bordes internos que deben explicar un conflicto
+  * de CAS sin abrir el almacén ni inferir la causa desde el texto del error.
+  * Un ID de otro Agent conserva la semántica indistinguible de no encontrado.
+  */
+ initiativeForAgent(agentName: string, initiativeId: string): Initiative {
+  return this.agenda.initiatives.getForAgent(initiativeId, agentName);
+ }
 
-  /**
-   * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
-   * `queued` con la `answer` depositada como pending, para que el Loop la
-   * retome con su dispatch normal. Control no despacha ni llama al Runner: el
-   * Loop sigue siendo el dispatcher único y la Initiative conserva su
-   * `session_key` — la respuesta llega al hilo que preguntó, no a uno nuevo.
-   *
-   * La idempotencia es de respuesta (primera key gana): el replay de la misma
-   * key se absorbe sea cual sea el estado actual; una key nueva cuando ya salió
-   * de `waiting_human` es `INITIATIVE_STATE_CONFLICT`. Delega el CAS al
-   * repositorio (`initiatives.respondForAgent`).
-   */
-  respondToInitiative(command: RespondInitiativeCommand): RespondInitiativeResult {
-    return this.agenda.initiatives.respondForAgent({
-      id: command.initiativeId,
-      agentName: command.agentName,
-      answer: command.answer,
-      idempotencyKey: command.idempotencyKey,
-      now: command.now,
-      expectedHumanRequestId: command.expectedHumanRequestId,
-    });
-  }
+ /**
+  * Responde a una Initiative en `waiting_human` (plan P1 §6.3): la vuelve a
+  * `queued` con la `answer` depositada como pending, para que el Loop la
+  * retome con su dispatch normal. Control no despacha ni llama al Runner: el
+  * Loop sigue siendo el dispatcher único y la Initiative conserva su
+  * `session_key` — la respuesta llega al hilo que preguntó, no a uno nuevo.
+  *
+  * La idempotencia es de respuesta (primera key gana): el replay de la misma
+  * key se absorbe sea cual sea el estado actual; una key nueva cuando ya salió
+  * de `waiting_human` es `INITIATIVE_STATE_CONFLICT`. Delega el CAS al
+  * repositorio (`initiatives.respondForAgent`).
+  */
+ respondToInitiative(
+  command: RespondInitiativeCommand,
+ ): RespondInitiativeResult {
+  return this.agenda.initiatives.respondForAgent({
+   id: command.initiativeId,
+   agentName: command.agentName,
+   answer: command.answer,
+   idempotencyKey: command.idempotencyKey,
+   now: command.now,
+   expectedHumanRequestId: command.expectedHumanRequestId,
+  });
+ }
 }

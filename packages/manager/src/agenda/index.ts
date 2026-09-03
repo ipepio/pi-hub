@@ -6,9 +6,18 @@ import {
   type RespondForAgentCommand,
   type RespondForAgentResult,
 } from "./initiatives.ts";
-import { TriggerRepository, type DueScheduleTrigger, type Trigger } from "./triggers.ts";
+import {
+  TriggerRepository,
+  type DueScheduleTrigger,
+  type Trigger,
+} from "./triggers.ts";
 import { CallbackRepository } from "./callbacks.ts";
-import { TurnRepository, type ReserveResult, type TurnFinalState, type FailureCause } from "./turns.ts";
+import {
+  TurnRepository,
+  type ReserveResult,
+  type TurnFinalState,
+  type FailureCause,
+} from "./turns.ts";
 import {
   HumanRequestDeliveriesRepository,
   HumanRequestRepository,
@@ -16,11 +25,28 @@ import {
   type PauseRunningForHumanCommand,
 } from "./human-requests.ts";
 import { sqliteErrcode } from "./turns.ts";
-import { recoverRunningOnStartup, type StartupRecoveryResult } from "./recovery.ts";
+import {
+  recoverRunningOnStartup,
+  type StartupRecoveryResult,
+} from "./recovery.ts";
 import { canTransition, type InitiativeState } from "./state.ts";
 import { DomainError } from "./errors.ts";
-import { AutonomyControl, type CreateTriggerCommand, type CreateTriggerResult, type RevokeTriggerCommand, type CancelInitiativeCommand, type CancelInitiativeResult, type RespondInitiativeCommand, type RespondInitiativeResult } from "./autonomy-control.ts";
+import {
+  AutonomyControl,
+  type CreateTriggerCommand,
+  type CreateTriggerResult,
+  type RevokeTriggerCommand,
+  type CancelInitiativeCommand,
+  type CancelInitiativeResult,
+  type RespondInitiativeCommand,
+  type RespondInitiativeResult,
+} from "./autonomy-control.ts";
 import type { EffectiveTriggerAuthority } from "./triggers.ts";
+import {
+  DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS,
+  DEFAULT_ENABLE_AGENT_TRIGGERS,
+} from "./triggers.ts";
+import type { TriggerCreationPolicy } from "./triggers.ts";
 import {
   AutonomyProjection,
   DEFAULT_HISTORY_LIMIT,
@@ -182,7 +208,10 @@ export class AgendaRepository {
           }
         | undefined;
       if (!row) {
-        throw new DomainError("INITIATIVE_NOT_FOUND", `initiative ${initiativeId} no existe`);
+        throw new DomainError(
+          "INITIATIVE_NOT_FOUND",
+          `initiative ${initiativeId} no existe`,
+        );
       }
       if (row.state !== "queued") {
         // El estado durable ya no es el que el claim exige: otro escritor ganó
@@ -206,7 +235,12 @@ export class AgendaRepository {
           "INSERT INTO turns (agent_name, turn_id, idempotency_key, claimed_at) VALUES (?,?,?,?)",
         ).run(row.agent_name, turnId, idempotencyKey, now);
       } catch (error) {
-        throw this.turnConflictOf(error, row.agent_name, turnId, idempotencyKey);
+        throw this.turnConflictOf(
+          error,
+          row.agent_name,
+          turnId,
+          idempotencyKey,
+        );
       }
 
       // T2 (§6): `queued→running` con `turnId`, por CAS `WHERE state='queued'`
@@ -228,7 +262,9 @@ export class AgendaRepository {
       const sets = columns.map((c) => `${c} = ?`).join(", ");
       const values = columns.map((c) => patch[c]);
       const result = db
-        .prepare(`UPDATE initiatives SET ${sets} WHERE id = ? AND state = 'queued'`)
+        .prepare(
+          `UPDATE initiatives SET ${sets} WHERE id = ? AND state = 'queued'`,
+        )
         .run(...values, initiativeId);
       if (Number(result.changes) !== 1) {
         // Guard defensivo: dentro de `BEGIN IMMEDIATE` nadie más pudo cambiar
@@ -310,9 +346,11 @@ export type {
   RespondInitiativeCommand,
   RespondInitiativeResult,
   EffectiveTriggerAuthority,
+  TriggerCreationPolicy,
   InternalAutonomySnapshot,
   InternalInitiative,
   InternalTrigger,
   HumanRequest,
   PauseRunningForHumanCommand,
 };
+export { DEFAULT_MAX_ACTIVE_AGENT_TRIGGERS, DEFAULT_ENABLE_AGENT_TRIGGERS };

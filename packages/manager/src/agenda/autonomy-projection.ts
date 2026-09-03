@@ -63,7 +63,7 @@ export interface InternalTrigger {
   readonly mode: InitiativeMode;
   readonly suggestedSkill: string | null;
   readonly createdBy: "owner" | "control_plane" | "agent";
-  readonly authority: "owner" | "control_plane";
+  readonly authority: "owner" | "control_plane" | "agent";
   readonly proposalState: "proposed" | "approved" | null;
   readonly enabled: boolean;
   readonly nextFireAt: number | null;
@@ -107,7 +107,7 @@ interface TriggerRow {
   mode: InitiativeMode;
   suggested_skill: string | null;
   created_by: "owner" | "control_plane" | "agent";
-  authority: "owner" | "control_plane";
+  authority: "owner" | "control_plane" | "agent";
   proposal_state: "proposed" | "approved" | null;
   enabled: number;
   next_fire_at: number | null;
@@ -190,13 +190,20 @@ const LIVE_STATES = "('queued','running','waiting_human','waiting_agent')";
 /** Los cuatro estados terminales de la historia retenida. */
 const HISTORY_STATES = "('succeeded','failed','expired','cancelled')";
 
-function byAvailableAtThenId(a: InternalInitiative, b: InternalInitiative): number {
+function byAvailableAtThenId(
+  a: InternalInitiative,
+  b: InternalInitiative,
+): number {
   if (a.availableAt !== b.availableAt) return a.availableAt - b.availableAt;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
-function byStateChangedAtThenId(a: InternalInitiative, b: InternalInitiative): number {
-  if (a.stateChangedAt !== b.stateChangedAt) return a.stateChangedAt - b.stateChangedAt;
+function byStateChangedAtThenId(
+  a: InternalInitiative,
+  b: InternalInitiative,
+): number {
+  if (a.stateChangedAt !== b.stateChangedAt)
+    return a.stateChangedAt - b.stateChangedAt;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
@@ -260,7 +267,9 @@ export class AutonomyProjection {
     try {
       // Paso 2: Triggers del Agent, habilitados y revocados, `(created_at, id)`.
       const triggerRows = db
-        .prepare(`${SELECT_TRIGGERS} WHERE agent_name = ? ORDER BY created_at, id`)
+        .prepare(
+          `${SELECT_TRIGGERS} WHERE agent_name = ? ORDER BY created_at, id`,
+        )
         .all(agentName) as TriggerRow[];
       const triggers = triggerRows.map((row) => this.mapTrigger(row));
 
@@ -304,7 +313,14 @@ export class AutonomyProjection {
         .sort(byStateChangedAtThenId);
 
       db.exec("COMMIT"); // paso 5
-      return { asOf: now, initiatives, agenda, inbox, triggers, historyTruncated };
+      return {
+        asOf: now,
+        initiatives,
+        agenda,
+        inbox,
+        triggers,
+        historyTruncated,
+      };
     } catch (error) {
       db.exec("ROLLBACK"); // ante cualquier error, no hay fotografía parcial
       throw error;
