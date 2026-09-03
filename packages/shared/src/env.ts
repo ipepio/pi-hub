@@ -1,4 +1,7 @@
-import { SHARED_MEMORY_ACCESS_VALUES, type SharedMemoryAccess } from "./types.js";
+import {
+  SHARED_MEMORY_ACCESS_VALUES,
+  type SharedMemoryAccess,
+} from "./types.js";
 
 export interface PihubEnv {
   dataDir: string;
@@ -24,6 +27,12 @@ export interface PihubEnv {
   telegramPrimaryChatId?: number;
   /** Ruta a un manifiesto JSON de agentes a provisionar al arrancar (PIHUB_AGENTS_FILE) */
   agentsFile?: string;
+  /**
+   * Token efímero de callback Runner→Manager (PIHUB_RUNNER_CALLBACK_TOKEN). Se
+   * captura en `loadEnv` en memoria y luego `scrubProtectedProcessEnv` lo borra
+   * del `process.env`: es la única credencial de `POST /internal/runner/…`.
+   */
+  runnerCallbackToken?: string;
   /** URL base de un servidor de audio OpenAI-compatible (speaches, LocalAI...). Vacío = voz desactivada */
   speechUrl?: string;
   speechApiKey?: string;
@@ -70,17 +79,27 @@ function list(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function positiveInt(value: string | undefined, fallback: number, name: string): number {
+function positiveInt(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+): number {
   if (value === undefined || value === "") return fallback;
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 1) throw new Error(`${name} inválido: ${value} (entero positivo)`);
+  if (!Number.isInteger(n) || n < 1)
+    throw new Error(`${name} inválido: ${value} (entero positivo)`);
   return n;
 }
 
-function nonNegativeInt(value: string | undefined, fallback: number, name: string): number {
+function nonNegativeInt(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+): number {
   if (value === undefined || value === "") return fallback;
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) throw new Error(`${name} inválido: ${value} (entero ≥ 0)`);
+  if (!Number.isInteger(n) || n < 0)
+    throw new Error(`${name} inválido: ${value} (entero ≥ 0)`);
   return n;
 }
 
@@ -125,10 +144,15 @@ export function parsePortRange(value: string | undefined): [number, number] {
   return [lo, hi];
 }
 
-export function parseSharedMemoryAccess(value: string | undefined): SharedMemoryAccess {
+export function parseSharedMemoryAccess(
+  value: string | undefined,
+): SharedMemoryAccess {
   if (value === undefined || value === "") return "none";
-  if ((SHARED_MEMORY_ACCESS_VALUES as readonly string[]).includes(value)) return value as SharedMemoryAccess;
-  throw new Error(`PIHUB_SHARED_MEMORY_DEFAULT inválido: ${value} (valores: none | read | read-write)`);
+  if ((SHARED_MEMORY_ACCESS_VALUES as readonly string[]).includes(value))
+    return value as SharedMemoryAccess;
+  throw new Error(
+    `PIHUB_SHARED_MEMORY_DEFAULT inválido: ${value} (valores: none | read | read-write)`,
+  );
 }
 
 export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
@@ -145,23 +169,50 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     defaultModel: env.PIHUB_DEFAULT_MODEL || undefined,
     overwriteModels: bool(env.PIHUB_OVERWRITE_MODELS, false),
     memoryEnabled: bool(env.PIHUB_MEMORY_ENABLED, true),
-    sharedMemoryDefault: parseSharedMemoryAccess(env.PIHUB_SHARED_MEMORY_DEFAULT),
+    sharedMemoryDefault: parseSharedMemoryAccess(
+      env.PIHUB_SHARED_MEMORY_DEFAULT,
+    ),
     platformPromptEnabled: bool(env.PIHUB_PLATFORM_PROMPT_ENABLED, true),
     oauthProviders: list(env.PIHUB_OAUTH_PROVIDERS),
     telegramAllowedUsers,
-    telegramPrimaryChatId: parseTelegramPrimaryChatId(env.PIHUB_TELEGRAM_PRIMARY_CHAT_ID, telegramAllowedUsers),
+    telegramPrimaryChatId: parseTelegramPrimaryChatId(
+      env.PIHUB_TELEGRAM_PRIMARY_CHAT_ID,
+      telegramAllowedUsers,
+    ),
     agentsFile: env.PIHUB_AGENTS_FILE || undefined,
     speechUrl: (env.PIHUB_SPEECH_URL || "").replace(/\/+$/, "") || undefined,
     speechApiKey: env.PIHUB_SPEECH_API_KEY || undefined,
+    runnerCallbackToken: env.PIHUB_RUNNER_CALLBACK_TOKEN || undefined,
     sttModel: env.PIHUB_STT_MODEL || undefined,
     ttsModel: env.PIHUB_TTS_MODEL || undefined,
     ttsVoice: env.PIHUB_TTS_VOICE || undefined,
-    uploadsRetentionHours: Number(env.PIHUB_UPLOADS_RETENTION_HOURS ?? 24) || 24,
-    loopConcurrency: positiveInt(env.PIHUB_LOOP_CONCURRENCY, 1, "PIHUB_LOOP_CONCURRENCY"),
+    uploadsRetentionHours:
+      Number(env.PIHUB_UPLOADS_RETENTION_HOURS ?? 24) || 24,
+    loopConcurrency: positiveInt(
+      env.PIHUB_LOOP_CONCURRENCY,
+      1,
+      "PIHUB_LOOP_CONCURRENCY",
+    ),
     loopPollMs: positiveInt(env.PIHUB_LOOP_POLL_MS, 1000, "PIHUB_LOOP_POLL_MS"),
-    loopGraceMs: nonNegativeInt(env.PIHUB_LOOP_GRACE_MS, 5000, "PIHUB_LOOP_GRACE_MS"),
-    loopPostAbortMarginMs: nonNegativeInt(env.PIHUB_LOOP_POST_ABORT_MARGIN_MS, 1000, "PIHUB_LOOP_POST_ABORT_MARGIN_MS"),
-    turnDispatchTimeoutMs: nonNegativeInt(env.PIHUB_TURN_DISPATCH_TIMEOUT_MS, 30_000, "PIHUB_TURN_DISPATCH_TIMEOUT_MS"),
-    waitingHumanExpiryMs: positiveInt(env.PIHUB_WAITING_HUMAN_EXPIRY_MS, 604_800_000, "PIHUB_WAITING_HUMAN_EXPIRY_MS"),
+    loopGraceMs: nonNegativeInt(
+      env.PIHUB_LOOP_GRACE_MS,
+      5000,
+      "PIHUB_LOOP_GRACE_MS",
+    ),
+    loopPostAbortMarginMs: nonNegativeInt(
+      env.PIHUB_LOOP_POST_ABORT_MARGIN_MS,
+      1000,
+      "PIHUB_LOOP_POST_ABORT_MARGIN_MS",
+    ),
+    turnDispatchTimeoutMs: nonNegativeInt(
+      env.PIHUB_TURN_DISPATCH_TIMEOUT_MS,
+      30_000,
+      "PIHUB_TURN_DISPATCH_TIMEOUT_MS",
+    ),
+    waitingHumanExpiryMs: positiveInt(
+      env.PIHUB_WAITING_HUMAN_EXPIRY_MS,
+      604_800_000,
+      "PIHUB_WAITING_HUMAN_EXPIRY_MS",
+    ),
   };
 }

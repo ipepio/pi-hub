@@ -7,7 +7,10 @@ import {
   type AgentSession,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { createRuntimeProviders, type ResolvedRuntimeModel } from "@pihub/providers";
+import {
+  createRuntimeProviders,
+  type ResolvedRuntimeModel,
+} from "@pihub/providers";
 import {
   agentPaths,
   dataPaths,
@@ -23,7 +26,7 @@ import {
   type SessionType,
 } from "@pihub/shared";
 
-import { askHumanTool } from "./ask-human.ts";
+import { createAgentTools } from "./agent-tools.ts";
 
 export type ResolvedModel = ResolvedRuntimeModel;
 
@@ -39,7 +42,10 @@ export type SessionCreationMode = "resumeLatest" | "fresh";
  * Convierte una identidad de Channel Session en un directorio estable que
  * no puede escapar del workspace ni filtrar la clave original en el path.
  */
-export function sessionStorageDirectory(sessionsDir: string, sessionKey: string): string {
+export function sessionStorageDirectory(
+  sessionsDir: string,
+  sessionKey: string,
+): string {
   const digest = createHash("sha256").update(sessionKey).digest("hex");
   return path.join(sessionsDir, digest);
 }
@@ -70,7 +76,10 @@ export class SessionFactory {
     this.config = config;
     const agent = agentPaths(env.dataDir, config.name);
     this.paths = sessionKey
-      ? { ...agent, sessionsDir: sessionStorageDirectory(agent.sessionsDir, sessionKey) }
+      ? {
+          ...agent,
+          sessionsDir: sessionStorageDirectory(agent.sessionsDir, sessionKey),
+        }
       : agent;
     this.globalDir = dataPaths(env.dataDir).globalDir;
     this.creationMode = creationMode;
@@ -87,7 +96,13 @@ export class SessionFactory {
    * nueva; si no hay ninguna sesión, el SDK crea una nueva.
    */
   forSession(sessionKey: string): SessionFactory {
-    return new SessionFactory(this.env, this.config, sessionKey, this.sessionType, "resumeLatest");
+    return new SessionFactory(
+      this.env,
+      this.config,
+      sessionKey,
+      this.sessionType,
+      "resumeLatest",
+    );
   }
 
   /**
@@ -122,7 +137,11 @@ export class SessionFactory {
    */
   async listCommands(): Promise<{
     skills: Array<{ name: string; description: string }>;
-    prompts: Array<{ name: string; description: string; argumentHint?: string }>;
+    prompts: Array<{
+      name: string;
+      description: string;
+      argumentHint?: string;
+    }>;
   }> {
     const loader = new DefaultResourceLoader({
       cwd: this.paths.workspaceDir,
@@ -130,7 +149,9 @@ export class SessionFactory {
     });
     await loader.reload();
     return {
-      skills: loader.getSkills().skills.map((s) => ({ name: s.name, description: s.description })),
+      skills: loader
+        .getSkills()
+        .skills.map((s) => ({ name: s.name, description: s.description })),
       prompts: loader.getPrompts().prompts.map((p) => ({
         name: p.name,
         description: p.description,
@@ -151,8 +172,15 @@ export class SessionFactory {
     const agentIndex = (await readIndex(this.paths.memoryDir)).trim();
     // Con "none" ni siquiera se lee el índice compartido: el agente no debe saber que existe.
     const sharedIndex =
-      sharedAccess === "none" ? "" : (await readIndex(dataPaths(this.env.dataDir).globalMemoryDir)).trim();
-    return buildMemorySection({ memoryEnabled: true, sharedAccess, agentIndex, sharedIndex });
+      sharedAccess === "none"
+        ? ""
+        : (await readIndex(dataPaths(this.env.dataDir).globalMemoryDir)).trim();
+    return buildMemorySection({
+      memoryEnabled: true,
+      sharedAccess,
+      agentIndex,
+      sharedIndex,
+    });
   }
 
   private platformSection(): string {
@@ -161,11 +189,14 @@ export class SessionFactory {
       agentName: this.config.name,
       memoryEnabled: this.env.memoryEnabled,
       telegram: Boolean(this.config.telegramToken),
+      sessionType: this.sessionType,
     });
   }
 
   async create(overrideModel?: ResolvedModel): Promise<AgentSession> {
-    const custom = await fs.readFile(this.paths.systemPromptFile, "utf8").catch(() => "");
+    const custom = await fs
+      .readFile(this.paths.systemPromptFile, "utf8")
+      .catch(() => "");
     const platform = this.platformSection();
     const memory = await this.memorySection();
 
@@ -185,10 +216,15 @@ export class SessionFactory {
     const model = overrideModel ?? (await this.resolveModel());
 
     // P3.1: sesión human → excluye ask_human (incluso si una extensión la registra);
-    //        sesión initiative → inyecta la tool SDK reservada.
-    const sessionOptions: { excludeTools?: string[]; customTools?: ToolDefinition[] } =
+    //        sesión initiative → inyecta las tools del agente (ask_human + schedule_trigger
+    //        + revoke_trigger). Las tools de scheduling son `customTools`, así que una sesión
+    //        human simplemente no las registra (no puede invocarlas).
+    const sessionOptions: {
+      excludeTools?: string[];
+      customTools?: ToolDefinition[];
+    } =
       this.sessionType === "initiative"
-        ? { customTools: [askHumanTool] }
+        ? { customTools: createAgentTools(this.env, this.config.name) }
         : { excludeTools: [ASK_HUMAN_TOOL_NAME] };
 
     return this.runtimeProviders.createSession({
@@ -196,14 +232,22 @@ export class SessionFactory {
       agentDir: this.globalDir,
       ...sessionOptions,
       ...(model ? { model } : {}),
-      ...(this.config.thinkingLevel ? { thinkingLevel: this.config.thinkingLevel } : {}),
+      ...(this.config.thinkingLevel
+        ? { thinkingLevel: this.config.thinkingLevel }
+        : {}),
       resourceLoader: loader,
       // P3.6: keyed → reanuda la última sesión del directorio (o crea si no existe);
       //       fresh (new_session / standalone) → siempre una sesión nueva.
       sessionManager:
         this.creationMode === "resumeLatest"
-          ? SessionManager.continueRecent(this.paths.workspaceDir, this.paths.sessionsDir)
-          : SessionManager.create(this.paths.workspaceDir, this.paths.sessionsDir),
+          ? SessionManager.continueRecent(
+              this.paths.workspaceDir,
+              this.paths.sessionsDir,
+            )
+          : SessionManager.create(
+              this.paths.workspaceDir,
+              this.paths.sessionsDir,
+            ),
     });
   }
 }

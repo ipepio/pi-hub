@@ -8,13 +8,20 @@ import {
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, PihubEnv } from "@pihub/shared";
 import type { SessionFactory } from "./session.js";
-import { speakable, sttEnabled, synthesize, transcribe, ttsEnabled } from "./speech.js";
+import {
+  speakable,
+  sttEnabled,
+  synthesize,
+  transcribe,
+  ttsEnabled,
+} from "./speech.js";
 
 const EDIT_INTERVAL_MS = 2500;
 const TG_LIMIT = 4096;
 export const CALLBACK_TIMEOUT_MS = 5_000;
 
-const CALLBACK_ERROR_MESSAGE = "No pude entregar la respuesta. Reinténtalo o usa el panel.";
+const CALLBACK_ERROR_MESSAGE =
+  "No pude entregar la respuesta. Reinténtalo o usa el panel.";
 const CALLBACK_RESPONSE_MESSAGES = {
   accepted: "Respuesta recibida.",
   replayed: "Respuesta ya recibida.",
@@ -31,7 +38,9 @@ export interface TelegramHumanReplyDependencies {
   respondTo: (ctx: TelegramTextContext, text: string) => Promise<unknown>;
 }
 
-function parseTelegramReplyStatus(body: unknown): TelegramReplyStatus | undefined {
+function parseTelegramReplyStatus(
+  body: unknown,
+): TelegramReplyStatus | undefined {
   if (typeof body !== "object" || body === null) return undefined;
   const status = (body as { status?: unknown }).status;
   if (status === "unknown") return status;
@@ -45,15 +54,23 @@ function parseTelegramReplyStatus(body: unknown): TelegramReplyStatus | undefine
 }
 
 /** Decide si un usuario está permitido según la allowlist. Vacía = permitir a todos. */
-export function isAllowedUser(allowlist: number[], fromId: number | undefined): boolean {
+export function isAllowedUser(
+  allowlist: number[],
+  fromId: number | undefined,
+): boolean {
   if (allowlist.length === 0) return true;
   return fromId !== undefined && allowlist.includes(fromId);
 }
 
 /** Avisa por consola si el bot de Telegram arranca sin allowlist. */
-export function warnIfNoAllowlist(agentName: string, allowlist: number[]): void {
+export function warnIfNoAllowlist(
+  agentName: string,
+  allowlist: number[],
+): void {
   if (allowlist.length === 0) {
-    console.warn(`[telegram:${agentName}] sin allowlist: el bot acepta a cualquier usuario`);
+    console.warn(
+      `[telegram:${agentName}] sin allowlist: el bot acepta a cualquier usuario`,
+    );
   }
 }
 
@@ -63,7 +80,7 @@ export function warnIfNoAllowlist(agentName: string, allowlist: number[]): void 
  * update para que una respuesta nunca abra una sesión humana por accidente.
  */
 export function createTelegramHumanReplyMiddleware(
-  env: Pick<PihubEnv, "managerPort">,
+  env: Pick<PihubEnv, "managerPort" | "runnerCallbackToken">,
   dependencies: TelegramHumanReplyDependencies,
 ): MiddlewareFn<TelegramTextContext> {
   return async (ctx, next) => {
@@ -75,7 +92,11 @@ export function createTelegramHumanReplyMiddleware(
 
     let status: TelegramReplyStatus;
     try {
-      const callbackToken = process.env.PIHUB_RUNNER_CALLBACK_TOKEN;
+      // Pihub step 2a (R1-001): el token de callback se captura en `loadEnv`
+      // (`env.runnerCallbackToken`) y `scrubProtectedProcessEnv` lo borra del
+      // `process.env` tras arrancar; aquí se usa la copia en memoria, nunca el
+      // env al que el bash del pi-agent puede acceder.
+      const callbackToken = env.runnerCallbackToken;
       if (!callbackToken) throw new Error("runner callback token ausente");
 
       const chatId = ctx.chat.id;
@@ -90,14 +111,21 @@ export function createTelegramHumanReplyMiddleware(
             "content-type": "application/json",
             "x-pihub-runner-callback-token": callbackToken,
           },
-          body: JSON.stringify({ chatId, replyToMessageId, text, idempotencyKey }),
+          body: JSON.stringify({
+            chatId,
+            replyToMessageId,
+            text,
+            idempotencyKey,
+          }),
           signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
         },
       );
-      if (response.status !== 200) throw new Error(`callback HTTP ${response.status}`);
+      if (response.status !== 200)
+        throw new Error(`callback HTTP ${response.status}`);
 
       const parsedStatus = parseTelegramReplyStatus(await response.json());
-      if (parsedStatus === undefined) throw new Error("callback response inválida");
+      if (parsedStatus === undefined)
+        throw new Error("callback response inválida");
       status = parsedStatus;
     } catch {
       await dependencies.respondTo(ctx, CALLBACK_ERROR_MESSAGE);
@@ -126,7 +154,8 @@ export function startTelegram(
   const sessions = new Map<number, AgentSession>();
   const startedAt = Date.now();
 
-  const allowed = (ctx: Context): boolean => isAllowedUser(env.telegramAllowedUsers, ctx.from?.id);
+  const allowed = (ctx: Context): boolean =>
+    isAllowedUser(env.telegramAllowedUsers, ctx.from?.id);
 
   async function getSession(chatId: number): Promise<AgentSession> {
     let session = sessions.get(chatId);
@@ -170,8 +199,12 @@ export function startTelegram(
 
   bot.command("status", async (ctx) => {
     const session = sessions.get(ctx.chat.id);
-    const model = session?.model as { provider?: string; id?: string } | undefined;
-    const modelId = model?.provider ? `${model.provider}/${model.id}` : config.model ?? "(por defecto)";
+    const model = session?.model as
+      | { provider?: string; id?: string }
+      | undefined;
+    const modelId = model?.provider
+      ? `${model.provider}/${model.id}`
+      : (config.model ?? "(por defecto)");
     const uptimeMin = Math.round((Date.now() - startedAt) / 60000);
     await ctx.reply(
       `Agente: ${config.name}\nModelo: ${modelId}\nSesión: ${session ? session.sessionId : "(ninguna)"}\n` +
@@ -182,7 +215,9 @@ export function startTelegram(
   bot.command("model", async (ctx) => {
     const spec = (ctx.match ?? "").trim();
     if (!spec) {
-      await ctx.reply("Uso: /model proveedor/id — p.ej. /model anthropic/claude-sonnet-5");
+      await ctx.reply(
+        "Uso: /model proveedor/id — p.ej. /model anthropic/claude-sonnet-5",
+      );
       return;
     }
     const model = await factory.resolveModel(spec);
@@ -235,17 +270,16 @@ export function startTelegram(
 
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "message_update") {
-        const e = (event as { assistantMessageEvent?: { type?: string; delta?: string } })
-          .assistantMessageEvent;
+        const e = (
+          event as { assistantMessageEvent?: { type?: string; delta?: string } }
+        ).assistantMessageEvent;
         if (e?.type === "text_delta" && e.delta) {
           buffer += e.delta;
           void maybeEdit(false);
         }
       } else if (event.type === "tool_execution_start") {
         const toolName = (event as { toolName?: string }).toolName ?? "tool";
-        void ctx.api
-          .sendChatAction(chatId, "typing")
-          .catch(() => {});
+        void ctx.api.sendChatAction(chatId, "typing").catch(() => {});
         if (!buffer) {
           buffer = "";
           void ctx.api
@@ -256,7 +290,9 @@ export function startTelegram(
     });
 
     try {
-      const options = session.isStreaming ? ({ streamingBehavior: "followUp" } as const) : undefined;
+      const options = session.isStreaming
+        ? ({ streamingBehavior: "followUp" } as const)
+        : undefined;
       await session.prompt(promptText, options);
     } catch (error) {
       buffer = `⚠️ Error: ${error instanceof Error ? error.message : String(error)}`;
@@ -268,10 +304,15 @@ export function startTelegram(
     // Entrega final: primer trozo edita el placeholder, el resto en mensajes nuevos
     const full = buffer.trim() || "(sin respuesta)";
     const chunks: string[] = [];
-    for (let i = 0; i < full.length; i += TG_LIMIT) chunks.push(full.slice(i, i + TG_LIMIT));
+    for (let i = 0; i < full.length; i += TG_LIMIT)
+      chunks.push(full.slice(i, i + TG_LIMIT));
     try {
       if (chunks[0] !== lastSent) {
-        await ctx.api.editMessageText(chatId, placeholder.message_id, chunks[0]);
+        await ctx.api.editMessageText(
+          chatId,
+          placeholder.message_id,
+          chunks[0],
+        );
       }
       for (const chunk of chunks.slice(1)) await ctx.reply(chunk);
     } catch {
@@ -288,20 +329,29 @@ export function startTelegram(
   // devolver la respuesta también como nota de voz. El audio nunca se guarda.
   bot.on(["message:voice", "message:audio"], async (ctx) => {
     if (!sttEnabled(env)) {
-      await ctx.reply("Este agente no tiene voz configurada (falta STT en la plataforma).");
+      await ctx.reply(
+        "Este agente no tiene voz configurada (falta STT en la plataforma).",
+      );
       return;
     }
     const media = ctx.message.voice ?? ctx.message.audio;
     if (!media) return;
     try {
       const file = await ctx.api.getFile(media.file_id);
-      if (!file.file_path) throw new Error("Telegram no devolvió la ruta del audio");
+      if (!file.file_path)
+        throw new Error("Telegram no devolvió la ruta del audio");
       const download = await fetch(
         `https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`,
       );
-      if (!download.ok) throw new Error(`descarga fallida (${download.status})`);
+      if (!download.ok)
+        throw new Error(`descarga fallida (${download.status})`);
       const audio = Buffer.from(await download.arrayBuffer());
-      const text = await transcribe(env, audio, file.file_path.split("/").pop() ?? "voice.oga", media.mime_type ?? "audio/ogg");
+      const text = await transcribe(
+        env,
+        audio,
+        file.file_path.split("/").pop() ?? "voice.oga",
+        media.mime_type ?? "audio/ogg",
+      );
       if (!text) {
         await ctx.reply("No he entendido nada en el audio.");
         return;
@@ -312,13 +362,19 @@ export function startTelegram(
       if (ttsEnabled(env) && answer && !answer.startsWith("⚠️")) {
         const speech = speakable(answer);
         if (speech) {
-          const voice = await synthesize(env, speech, config.ttsVoice ?? env.ttsVoice);
+          const voice = await synthesize(
+            env,
+            speech,
+            config.ttsVoice ?? env.ttsVoice,
+          );
           await ctx.replyWithVoice(new InputFile(voice, "respuesta.ogg"));
         }
       }
     } catch (error) {
       console.error(`[telegram:${config.name}] audio:`, error);
-      await ctx.reply(`⚠️ No pude procesar el audio: ${(error as Error).message}`);
+      await ctx.reply(
+        `⚠️ No pude procesar el audio: ${(error as Error).message}`,
+      );
     }
   });
 
@@ -331,7 +387,9 @@ export function startTelegram(
     ])
     .catch(() => {});
 
-  bot.catch((error) => console.error(`[telegram:${config.name}]`, error.message));
+  bot.catch((error) =>
+    console.error(`[telegram:${config.name}]`, error.message),
+  );
   void bot.start();
   console.log(`[telegram:${config.name}] bot iniciado`);
 

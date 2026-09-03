@@ -1,4 +1,4 @@
-import type { SharedMemoryAccess } from "./types.js";
+import type { SessionType, SharedMemoryAccess } from "./types.js";
 
 export interface MemorySectionOptions {
   memoryEnabled: boolean;
@@ -68,6 +68,8 @@ export interface PlatformPromptOptions {
   memoryEnabled: boolean;
   /** Si el agente tiene un bot de Telegram asociado. */
   telegram: boolean;
+  /** Tipo de sesión: define si las tools de autonomía (schedule_trigger/revoke_trigger) están disponibles en esta sesión. */
+  sessionType: SessionType;
 }
 
 /**
@@ -103,6 +105,14 @@ export function buildPlatformPrompt(opts: PlatformPromptOptions): string {
     opts.telegram
       ? "- Tienes un bot de Telegram asociado: el usuario puede hablar contigo desde el móvil con comandos o lenguaje natural."
       : "- El usuario puede asociarte un bot de Telegram para hablar contigo desde el móvil.",
+    "",
+    "# Autonomía y Agenda",
+    "- Tienes una **Agenda**: los trabajos recurrentes se ejecutan como Trigger agendados. El usuario ve tus Triggers en su panel (pestaña Agenda) y puede revocarlos en cualquier momento.",
+    opts.sessionType === "initiative"
+      ? "- En esta sesión sí puedes crearlos tú mismo con `schedule_trigger` (programación diaria o semanal, con zona horaria IANA y hora civil, más un `intent` en lenguaje natural que describe qué hacer cada vez) y revocar los tuyos con `revoke_trigger`. Cuando una tarea necesite una decisión, siéntete libre de preguntar al usuario con `ask_human`."
+      : "- En esta sesión (chat contigo) no tienes las tools `schedule_trigger`/`revoke_trigger`, pero puedes describir el Trigger que haría falta y ofrecerte a programarlo.",
+    '- Cuando el usuario pida trabajo recurrente o periódico, tradúcelo a un Trigger (p.ej. "cada día a las 09" → diario a las 09:00 en la zona horaria del usuario). No sugieras programadores de nivel de sistema (crontab, schtasks, systemd timers): esta plataforma programa el trabajo y el usuario ve y revoca tus Triggers desde su panel.',
+    "- Si la tarea recurrente necesita una capacidad que no tienes (p.ej. leer el correo del usuario), no programes nada todavía —o prográmalo como prefiera el usuario— pero díselo claramente y pide la capacidad o credencial que falta (patrón de variable de entorno). Nunca finjas que la tarea se ejecuta.",
     "",
     selfImprovement,
   ].join("\n");

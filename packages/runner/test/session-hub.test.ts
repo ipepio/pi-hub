@@ -5,7 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { ChatHub, SessionHubRegistry } from "../src/hub.ts";
 import { SessionFactory } from "../src/session.ts";
-import { ASK_HUMAN_TOOL_NAME } from "@pihub/shared";
+import {
+  ASK_HUMAN_TOOL_NAME,
+  SCHEDULE_TRIGGER_TOOL_NAME,
+  REVOKE_TRIGGER_TOOL_NAME,
+} from "@pihub/shared";
 import { askHumanTool } from "../src/ask-human.ts";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 
@@ -58,9 +62,15 @@ test("cada sessionKey obtiene un ChatHub aislado y conserva el mismo hub al reab
 /** Crea un SessionFactory real con runtimeProviders falsificado que captura
  *  las sessionOptions y evita las dependencias de E/S. */
 function fakeSessionFactory(sessionType: "human" | "initiative") {
-  const captured: { options: Record<string, unknown> | null } = { options: null };
+  const captured: { options: Record<string, unknown> | null } = {
+    options: null,
+  };
   const factory = new SessionFactory(
-    { dataDir: "/tmp", memoryEnabled: false, platformPromptEnabled: false } as never,
+    {
+      dataDir: "/tmp",
+      memoryEnabled: false,
+      platformPromptEnabled: false,
+    } as never,
     { name: "test", port: 0, enabled: true, createdAt: "2025-01-01" } as never,
     undefined,
     sessionType,
@@ -90,18 +100,37 @@ test("human prompts cannot see reserved ask_human even when an extension registe
     [ASK_HUMAN_TOOL_NAME],
     "human excluye ask_human aunque una extensión la registre",
   );
-  assert.ok(!captured.options!.customTools, "human no inyecta la tool reservada");
+  assert.ok(
+    !captured.options!.customTools,
+    "human no inyecta la tool reservada",
+  );
 });
 
-test("initiative sessions own the reserved ask_human and an extension cannot override it", async () => {
+test("initiative sessions own the reserved ask_human, schedule_trigger and revoke_trigger tools", async () => {
   const { factory, captured } = fakeSessionFactory("initiative");
   await factory.create();
+  const names = (captured.options!.customTools as Array<{ name: string }>).map(
+    (t) => t.name,
+  );
   assert.deepEqual(
-    captured.options!.customTools,
-    [askHumanTool],
-    "initiative instala la tool SDK reservada",
+    names,
+    [ASK_HUMAN_TOOL_NAME, SCHEDULE_TRIGGER_TOOL_NAME, REVOKE_TRIGGER_TOOL_NAME],
+    "initiative instala ask_human + schedule_trigger + revoke_trigger",
+  );
+  assert.ok(
+    captured.options!.customTools.some(
+      (t: { name: string }) => t.name === ASK_HUMAN_TOOL_NAME,
+    ),
+    "mantiene ask_human",
   );
   assert.ok(!captured.options!.excludeTools, "initiative no excluye ask_human");
+  // askHumanTool (la instancia SDK) sigue siendo una de las tools inyectadas.
+  assert.ok(
+    (captured.options!.customTools as Array<{ name: string }>).some(
+      (t) => t === askHumanTool,
+    ),
+    "la instancia reservada de ask_human está presente",
+  );
 });
 
 test("isStreaming detecta un turno vivo en cualquier Channel Session", async () => {
@@ -145,7 +174,10 @@ test("isStreaming detecta un turno vivo en cualquier Channel Session", async () 
 /** Crea un SessionFactory real con runtimeProviders falsificado que captura el
  *  SessionManager de cada creación y devuelve una sesión fake con el sessionId
  *  real del manager (el manager persiste en ficheros reales en un dir temporal). */
-async function keyedFactoryWithRealManager(dataDir: string, sessionType: "human" | "initiative") {
+async function keyedFactoryWithRealManager(
+  dataDir: string,
+  sessionType: "human" | "initiative",
+) {
   const managers: SessionManager[] = [];
   const stub = {
     createSession: async (opts: any) => {
@@ -185,7 +217,10 @@ async function keyedFactoryWithRealManager(dataDir: string, sessionType: "human"
 function persistConversation(manager: SessionManager): void {
   manager.appendMessage({ role: "user", content: "hola" } as never);
   manager.appendMessage({ role: "assistant", content: "mundo" } as never);
-  assert.ok(manager.getSessionFile(), "la conversación queda persistida en un fichero real");
+  assert.ok(
+    manager.getSessionFile(),
+    "la conversación queda persistida en un fichero real",
+  );
 }
 
 test("a recreated Initiative hub resumes the latest session for the same sessionKey", async () => {
@@ -220,7 +255,10 @@ test("a recreated Initiative hub resumes the latest session for the same session
 
 test("explicit new_session never resumes the discarded conversation", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "pihub-a16-fresh-"));
-  const { keyed, managers } = await keyedFactoryWithRealManager(dataDir, "initiative");
+  const { keyed, managers } = await keyedFactoryWithRealManager(
+    dataDir,
+    "initiative",
+  );
   const hub = new ChatHub(keyed("channel-2"));
 
   await hub.ensureSession();
@@ -229,7 +267,11 @@ test("explicit new_session never resumes the discarded conversation", async () =
   assert.ok(originalSessionId);
 
   const newSessionId = await hub.newSession();
-  assert.strictEqual(managers.length, 2, "new_session crea un segundo SessionManager");
+  assert.strictEqual(
+    managers.length,
+    2,
+    "new_session crea un segundo SessionManager",
+  );
   assert.notStrictEqual(
     managers[1].getSessionId(),
     originalSessionId,

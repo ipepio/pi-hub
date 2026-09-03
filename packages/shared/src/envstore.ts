@@ -7,12 +7,35 @@ import { agentPaths, dataPaths } from "./registry.js";
  * (ni global ni por agente). Protegen la config de la plataforma y los secretos
  * de arranque del contenedor.
  */
-export const PROTECTED_ENV_KEYS = ["API_TOKEN"];
+export const PROTECTED_ENV_KEYS = [
+ "API_TOKEN",
+ // Pihub step 2a (R1-001): el token efímero de callback del Runner y la clave
+ // TTS también son secretos, ya leídos en `loadEnv` (env.runnerCallbackToken /
+ // env.speechApiKey): no deben permanecer en el env alcanzable por el agente.
+ "PIHUB_RUNNER_CALLBACK_TOKEN",
+ "PIHUB_SPEECH_API_KEY",
+];
 export const PROTECTED_ENV_PREFIXES = ["PIHUB_", "PI_CODING_AGENT_"];
 
+/**
+ * Borra del `env` dado las claves protegidas EXACTAS de `PROTECTED_ENV_KEYS`
+ * (pihub step 2a, R1-001): la credencial de servicio (`API_TOKEN`), el token
+ * efímero de callback del Runner y la clave TTS. Es el scrub que el Runner
+ * invoca tras `loadEnv()` para que el bash del pi-agent no herede estos
+ * secretos — la autenticación sigue usando los valores que `loadEnv` ya
+ * capturó en memoria. Solo las claves exactas: los prefijos `PIHUB_*` /
+ * `PI_CODING_AGENT_*` de configuración se conservan, pues el runtime pi puede
+ * necesitarlos legítimamente.
+ */
+export function scrubProtectedProcessEnv(env: NodeJS.ProcessEnv): void {
+ for (const key of PROTECTED_ENV_KEYS) {
+  delete env[key];
+ }
+}
+
 export function isProtectedEnvKey(key: string): boolean {
-  if (PROTECTED_ENV_KEYS.includes(key)) return true;
-  return PROTECTED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+ if (PROTECTED_ENV_KEYS.includes(key)) return true;
+ return PROTECTED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -22,83 +45,98 @@ const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * como un proceso normal. Todo lo demás debe entrar por un EnvStore explícito.
  */
 const RUNNER_SYSTEM_ENV_KEYS = [
-  "PATH",
-  "HOME",
-  "LANG",
-  "LANGUAGE",
-  "LC_ALL",
-  "LC_COLLATE",
-  "LC_CTYPE",
-  "LC_MESSAGES",
-  "LC_MONETARY",
-  "LC_NUMERIC",
-  "LC_TIME",
-  "TZ",
-  "TMPDIR",
-  "TMP",
-  "TEMP",
-  "TERM",
-  "SHELL",
-  "USER",
-  "LOGNAME",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_CACHE_HOME",
+ "PATH",
+ "HOME",
+ "LANG",
+ "LANGUAGE",
+ "LC_ALL",
+ "LC_COLLATE",
+ "LC_CTYPE",
+ "LC_MESSAGES",
+ "LC_MONETARY",
+ "LC_NUMERIC",
+ "LC_TIME",
+ "TZ",
+ "TMPDIR",
+ "TMP",
+ "TEMP",
+ "TERM",
+ "SHELL",
+ "USER",
+ "LOGNAME",
+ "XDG_CONFIG_HOME",
+ "XDG_DATA_HOME",
+ "XDG_CACHE_HOME",
 ] as const;
 
 export function isValidEnvKey(key: string): boolean {
-  return KEY_RE.test(key);
+ return KEY_RE.test(key);
 }
 
 export type EnvStore = Record<string, string>;
 
 function globalEnvFile(dataDir: string): string {
-  return path.join(dataPaths(dataDir).globalDir, "env.json");
+ return path.join(dataPaths(dataDir).globalDir, "env.json");
 }
 
 function agentEnvFile(dataDir: string, agentName: string): string {
-  return path.join(agentPaths(dataDir, agentName).root, "env.json");
+ return path.join(agentPaths(dataDir, agentName).root, "env.json");
 }
 
 function envFile(dataDir: string, agentName?: string): string {
-  return agentName ? agentEnvFile(dataDir, agentName) : globalEnvFile(dataDir);
+ return agentName ? agentEnvFile(dataDir, agentName) : globalEnvFile(dataDir);
 }
 
-export async function readEnvStore(dataDir: string, agentName?: string): Promise<EnvStore> {
-  try {
-    const raw = JSON.parse(await fs.readFile(envFile(dataDir, agentName), "utf8")) as EnvStore;
-    return raw && typeof raw === "object" ? raw : {};
-  } catch {
-    return {};
-  }
+export async function readEnvStore(
+ dataDir: string,
+ agentName?: string,
+): Promise<EnvStore> {
+ try {
+  const raw = JSON.parse(
+   await fs.readFile(envFile(dataDir, agentName), "utf8"),
+  ) as EnvStore;
+  return raw && typeof raw === "object" ? raw : {};
+ } catch {
+  return {};
+ }
 }
 
-async function writeEnvStore(dataDir: string, store: EnvStore, agentName?: string): Promise<void> {
-  const file = envFile(dataDir, agentName);
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(store, null, 2) + "\n", "utf8");
+async function writeEnvStore(
+ dataDir: string,
+ store: EnvStore,
+ agentName?: string,
+): Promise<void> {
+ const file = envFile(dataDir, agentName);
+ await fs.mkdir(path.dirname(file), { recursive: true });
+ await fs.writeFile(file, JSON.stringify(store, null, 2) + "\n", "utf8");
 }
 
 /** Fija una variable. Lanza si la clave es inválida o está protegida. */
 export async function setEnv(
-  dataDir: string,
-  key: string,
-  value: string,
-  agentName?: string,
+ dataDir: string,
+ key: string,
+ value: string,
+ agentName?: string,
 ): Promise<void> {
-  if (!isValidEnvKey(key)) throw new Error(`Nombre de variable inválido: ${key}`);
-  if (isProtectedEnvKey(key)) throw new Error(`La variable "${key}" está protegida y no se puede fijar`);
-  const store = await readEnvStore(dataDir, agentName);
-  store[key] = value;
-  await writeEnvStore(dataDir, store, agentName);
+ if (!isValidEnvKey(key))
+  throw new Error(`Nombre de variable inválido: ${key}`);
+ if (isProtectedEnvKey(key))
+  throw new Error(`La variable "${key}" está protegida y no se puede fijar`);
+ const store = await readEnvStore(dataDir, agentName);
+ store[key] = value;
+ await writeEnvStore(dataDir, store, agentName);
 }
 
-export async function unsetEnv(dataDir: string, key: string, agentName?: string): Promise<boolean> {
-  const store = await readEnvStore(dataDir, agentName);
-  if (!(key in store)) return false;
-  delete store[key];
-  await writeEnvStore(dataDir, store, agentName);
-  return true;
+export async function unsetEnv(
+ dataDir: string,
+ key: string,
+ agentName?: string,
+): Promise<boolean> {
+ const store = await readEnvStore(dataDir, agentName);
+ if (!(key in store)) return false;
+ delete store[key];
+ await writeEnvStore(dataDir, store, agentName);
+ return true;
 }
 
 /**
@@ -109,29 +147,32 @@ export async function unsetEnv(dataDir: string, key: string, agentName?: string)
  * Supervisor, cuando ya se conoce el Agent concreto.
  */
 export async function resolveRunnerEnv(
-  dataDir: string,
-  agentName: string,
-  base: NodeJS.ProcessEnv,
+ dataDir: string,
+ agentName: string,
+ base: NodeJS.ProcessEnv,
 ): Promise<NodeJS.ProcessEnv> {
-  const globalStore = await readEnvStore(dataDir);
-  const agentStore = await readEnvStore(dataDir, agentName);
-  const merged: NodeJS.ProcessEnv = {};
-  for (const key of RUNNER_SYSTEM_ENV_KEYS) {
-    const value = base[key];
-    if (value !== undefined) merged[key] = value;
+ const globalStore = await readEnvStore(dataDir);
+ const agentStore = await readEnvStore(dataDir, agentName);
+ const merged: NodeJS.ProcessEnv = {};
+ for (const key of RUNNER_SYSTEM_ENV_KEYS) {
+  const value = base[key];
+  if (value !== undefined) merged[key] = value;
+ }
+ for (const store of [globalStore, agentStore]) {
+  for (const [key, value] of Object.entries(store)) {
+   if (isProtectedEnvKey(key)) continue;
+   merged[key] = value;
   }
-  for (const store of [globalStore, agentStore]) {
-    for (const [key, value] of Object.entries(store)) {
-      if (isProtectedEnvKey(key)) continue;
-      merged[key] = value;
-    }
-  }
-  return merged;
+ }
+ return merged;
 }
 
 /** Solo las claves (para no exponer secretos por la API). */
-export async function listEnvKeys(dataDir: string, agentName?: string): Promise<string[]> {
-  return Object.keys(await readEnvStore(dataDir, agentName)).sort();
+export async function listEnvKeys(
+ dataDir: string,
+ agentName?: string,
+): Promise<string[]> {
+ return Object.keys(await readEnvStore(dataDir, agentName)).sort();
 }
 
 /**
@@ -140,15 +181,16 @@ export async function listEnvKeys(dataDir: string, agentName?: string): Promise<
  * protegida, no se persiste ninguna, para no dejar el store a medias.
  */
 export async function replaceEnvStore(
-  dataDir: string,
-  entries: EnvStore,
-  agentName?: string,
+ dataDir: string,
+ entries: EnvStore,
+ agentName?: string,
 ): Promise<void> {
-  for (const key of Object.keys(entries)) {
-    if (!isValidEnvKey(key)) throw new Error(`Nombre de variable inválido: ${key}`);
-    if (isProtectedEnvKey(key)) {
-      throw new Error(`La variable "${key}" está protegida y no se puede fijar`);
-    }
+ for (const key of Object.keys(entries)) {
+  if (!isValidEnvKey(key))
+   throw new Error(`Nombre de variable inválido: ${key}`);
+  if (isProtectedEnvKey(key)) {
+   throw new Error(`La variable "${key}" está protegida y no se puede fijar`);
   }
-  await writeEnvStore(dataDir, { ...entries }, agentName);
+ }
+ await writeEnvStore(dataDir, { ...entries }, agentName);
 }
