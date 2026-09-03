@@ -5,6 +5,34 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-04
+
+### Added
+
+- **Triggers de Agent con autoridad gobernada** (ADR 0035): autoridad efectiva
+  derivada del principal autenticado (cookie → owner, Bearer → control_plane,
+  headers de runner → agent); los triggers creados por Agent se activan de
+  inmediato dentro de la política `autonomy.triggers` (`enabled` +
+  `maxActiveAgentTriggers`, default 5, fail-closed); owner/control_plane revocan
+  triggers de agent y los conflictos de autoridad responden
+  `TRIGGER_AUTHORITY_CONFLICT`. Migración de esquema a v3 (rebuild de triggers,
+  CHECK relajado, FK pragmas en transacción).
+- **Tools de scheduling en el Runner**: `schedule_trigger` y `revoke_trigger`
+  solo en sesiones de iniciativa, con forwarding verbatim de errores de dominio
+  e idempotency key solo por header. El Supervisor inyecta `API_TOKEN` al
+  Runner para que las tools autentiquen.
+- **Prompt de plataforma con sección Autonomía**: variante por sessionType
+  (español), regla no-crontab y honestidad sobre capacidades faltantes.
+- **Eventos en vivo hacia el dashboard**: el session hub del Runner reenvía
+  thinking-delta/tool-start/tool-end para feedback en tiempo real.
+
+### Changed
+
+- Scrub de credenciales del proceso Runner tras el boot
+  (`scrubProtectedProcessEnv`): claves protegidas y token de callback ya no se
+  exponen en `/proc/1/environ`; telegram captura su token desde la config
+  resuelta.
+
 ## [0.9.1] — 2026-08-10
 
 ### Added
