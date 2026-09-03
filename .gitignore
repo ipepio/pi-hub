@@ -26,3 +26,12 @@ Thumbs.db
 
 # TypeScript incremental
 *.tsbuildinfo
+# Local Pi runtime state
+.atl/
+.local-data/
+
+# Documentación local de estación de dev (no va al repo)
+CLAUDE.md
+CONTEXT.md
+CONTRIBUTING.md
+ARCHITECTURE_MAP.md
