@@ -1,6 +1,6 @@
 {
   "name": "@pihub/cli",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "type": "module",
   "bin": {
     "pihub": "dist/index.js"
