@@ -230,6 +230,17 @@ primary chat no hay llamadas a Telegram (fail-closed): el panel es el inbox
 canónico. El contrato completo está en
 [`docs/manager-api-v1.md`](docs/manager-api-v1.md) §11.5.
 
+Además, un Agent puede **programar sus propios triggers** durante sesiones de
+iniciativa con las tools `schedule_trigger` y `revoke_trigger` (nunca desde
+sesiones humanas). Cada trigger queda marcado con `createdBy`/`authority:
+agent` y su vigencia está gobernada por la política del Agent
+(`autonomy.triggers`: `enabled` + `maxActiveAgentTriggers`, default 5,
+fail-closed). La autoridad es del **principal autenticado**, no del proceso:
+el propietario o el control plane pueden revocar triggers de agent, y un
+intento de escribir sobre triggers ajenos responde
+`TRIGGER_AUTHORITY_CONFLICT`. Los triggers creados por Agent se activan
+inmediatamente dentro de la política (ADR 0035).
+
 ## Recursos, memoria y canales
 
 ### Memoria
@@ -325,6 +336,7 @@ Ejecuta `pihub` sin argumentos para ver todos los métodos y flags.
 | `PIHUB_TELEGRAM_PRIMARY_CHAT_ID` | vacío | Chat privado de Telegram para las preguntas de `ask_human` (fail-closed) |
 | `PIHUB_SPEECH_URL` | vacío | Servidor OpenAI-compatible de STT/TTS |
 | `PIHUB_UPLOADS_RETENTION_HOURS` | `24` | Retención de uploads del workspace |
+| `PIHUB_RUNNER_CALLBACK_TOKEN` | vacío | Token con el que el Runner autentica sus callbacks al Manager (X-Pihub-Principal: runner); el Runner lo recibe por env y se limpia de su proceso tras el boot |
 
 ## Desarrollo y verificación
 
@@ -338,9 +350,9 @@ npm test
 npm run test:contract-red --workspace packages/manager
 ```
 
-Node debe ser 22 o posterior; pi está fijado a `0.80.3`. Consulta
-[`CONTRIBUTING.md`](CONTRIBUTING.md) para desarrollo local, pruebas y reglas de
-cambio.
+Node debe ser 22 o posterior; pi está fijado a `0.80.3`. Las reglas de cambio y
+el estado vivo del proyecto viven en [`docs/ESTADO.md`](docs/ESTADO.md) y
+[`docs/PENDIENTE.md`](docs/PENDIENTE.md).
 
 ## Documentación
 
