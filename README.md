@@ -44,7 +44,7 @@ WebSockets a un Runner ni conoce su puerto.
 El mismo Runtime soporta exactamente uno de estos modos:
 
 | Modo | `PIHUB_PANEL_ENABLED` | Quién configura el Runtime | Superficie recomendada |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | **Gobernador** | `true` | El operador desde el panel local | Panel + `/api/v1` |
 | **Gobernado** | `false` | Un control plane externo | `/api/v1` con Bearer |
 
@@ -127,7 +127,7 @@ sudo ./scripts/install.sh --user pihub
 ```
 
 | Propiedad | Docker gestionado | Servicio root | Servicio `--user` |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Arranca con la máquina | `restart: unless-stopped` | sí | sí |
 | Administra el sistema anfitrión | no | sí | no |
 | Puede abrir conexiones/usar SSH | según política del Runtime | sí | sí |
@@ -137,7 +137,7 @@ El instalador es idempotente: una reinstalación actualiza código y unidad, per
 conserva datos, `API_TOKEN` y modo ya elegidos. Sus rutas son:
 
 | Recurso | Ruta |
-|---|---|
+| --- | --- |
 | Código | `/opt/pihub` |
 | Datos persistentes | `/var/lib/pihub` |
 | Configuración y token | `/etc/pihub/pihub.env` |
@@ -249,7 +249,7 @@ inmediatamente dentro de la política (ADR 0035).
 opcional por Agent y tiene tres niveles:
 
 | `sharedAccess` | Puede leer Shared Memory | Puede escribir/borrar Shared Memory |
-|---|---:|---:|
+| --- | ---: | ---: |
 | `none` (default) | no | no |
 | `read` | sí | no |
 | `read-write` | sí | sí |
@@ -321,7 +321,7 @@ Ejecuta `pihub` sin argumentos para ver todos los métodos y flags.
 `.env.example` es la lista completa. Las variables principales son:
 
 | Variable | Default | Efecto |
-|---|---|---|
+| --- | --- | --- |
 | `API_TOKEN` | vacío | Autenticación de API y panel; nunca lo dejes vacío fuera de desarrollo |
 | `PIHUB_DATA_DIR` | `/data` | Volumen persistente del Runtime |
 | `PIHUB_MANAGER_PORT` | `4000` | Puerto HTTP del Manager |

@@ -1,8 +1,8 @@
 # Estado de pihub
 
-> Última verificación: **2026-08-10** · versión **v0.9.1** · release publicada
-> desde HEAD `2309dc94708429680d085d42801b3d2f4f8c6441` con digest
-> `ghcr.io/ipepio/pi-hub@sha256:892322db268ee54978fc824723650f2fb4d0aa73880b3b6ffcd9f00b15eb0151`.
+> Última verificación: **2026-09-04** · versión **v0.10.0** · release publicada
+> desde HEAD `05515f9` con digest
+> `ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4`.
 
 ## Verificado
 
@@ -20,8 +20,8 @@
 | Instalación Docker y servicio systemd | Funciona |
 
 ```text
-npm run verify     # typecheck + build limpios, 657 tests passed, 0 failed
-# imagen publicada v0.9.1: ghcr.io/ipepio/pi-hub@sha256:892322db268ee54978fc824723650f2fb4d0aa73880b3b6ffcd9f00b15eb0151
+npm run verify     # typecheck + build limpios, 717 tests passed, 0 failed
+# imagen publicada v0.10.0: ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4
 ```
 
 Antes de publicarse, la imagen candidata también se verificó contra Manager y
