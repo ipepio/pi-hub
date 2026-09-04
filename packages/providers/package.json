@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@pihub/shared": "0.9.1",
+    "@pihub/shared": "0.10.0",
     "@earendil-works/pi-coding-agent": "0.80.3"
   },
   "devDependencies": {
