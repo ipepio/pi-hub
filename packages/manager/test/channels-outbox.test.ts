@@ -378,4 +378,34 @@ describe("outbox worker — teardown (I2)", () => {
     assert.equal(await outbox.deadFor("agent", "telegram", "teardown"), 0);
     assert.equal((await outbox.byId(kept.id))?.state, "pending");
   });
+
+  // B2 (verify round, revocation 3c): deleting an AGENT is a teardown of every
+  // channel it had, and the queue is agent-scoped — `deadFor` takes a kind, so a
+  // purge would have to guess which kinds still have rows (by the time the route
+  // runs, `channels.json` is gone). `deadForAgent` is the drain that cannot miss.
+  it("deadForAgent terminals EVERY row of that agent, without sending a single one", async () => {
+    const db = await migratedDb();
+    const time = clock();
+    const sent: string[] = [];
+    const outbox = outboxWith(db, time, async (row) => {
+      sent.push(row.id);
+      return "msg";
+    });
+    const first = await outbox.enqueue(BASE);
+    const second = await outbox.enqueue({ ...BASE, target: "666" });
+    const survived = await outbox.enqueue({ ...BASE, agentName: "other", target: "999" });
+
+    const drained = await outbox.deadForAgent("agent", "agent deletion");
+    assert.equal(drained, 2, "both rows of the purged agent");
+    assert.deepEqual(sent, [], "a purge never delivers");
+    assert.equal((await outbox.byId(first.id))?.state, "dead");
+    assert.equal((await outbox.byId(second.id))?.state, "dead");
+    assert.equal((await outbox.byId(first.id))?.lastError, "agent deletion");
+    assert.equal(
+      (await outbox.byId(survived.id))?.state,
+      "pending",
+      "el otro Agent conserva su cola",
+    );
+    assert.equal(await outbox.deadForAgent("agent", "replay"), 0, "idempotente por estado");
+  });
 });

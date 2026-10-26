@@ -16,9 +16,12 @@ import {
   type ServerLike,
   type StartupStore,
 } from "../src/startup.ts";
-import { openManagerStore, type ManagerStore } from "../src/storage/sqlite.ts";
+import { openManagerStore, openTestDb, type ManagerStore } from "../src/storage/sqlite.ts";
 import { composeChannels, type ChannelComposition } from "../src/channels/composition.ts";
 import type { ChannelExchangeLog } from "../src/channels/exchange-log.ts";
+import { createLateBoundHitl } from "../src/channels/hitl-bridge.ts";
+import { HumanRequestDelivery } from "../src/primary-channel/human-request-delivery.ts";
+import type { HumanRequest } from "../src/agenda/human-requests.ts";
 import { ChannelRuntimeRegistry } from "../src/channels/registry.ts";
 import { PairingMachine } from "../src/channels/pairing.ts";
 import { writeChannelRecords, type ChannelRecord } from "../src/channels/store.ts";
@@ -309,6 +312,21 @@ function channelTurn(turnId = "turn-1"): CompletedTurn {
   };
 }
 
+/** La pregunta con la forma que `TurnExecution.onHumanRequest` entrega. */
+function requestOf(overrides: Partial<HumanRequest> = {}): HumanRequest {
+  return {
+    agentName: "agent",
+    initiativeId: "ini-hitl",
+    requestId: "req-hitl",
+    turnId: "turn-hitl",
+    toolCallId: "tool-hitl",
+    question: "¿Cuál es el plan?",
+    summary: "resumen del contexto",
+    expiresAt: 1_760_000_000_000,
+    ...overrides,
+  };
+}
+
 async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 1000): Promise<void> {
   const started = Date.now();
   while (!(await condition())) {
@@ -510,7 +528,188 @@ describe("arranque con canales compuestos — el composition root (fix round A, 
       false,
       "`shutdownRuntime` no paró el drene",
     );
-    assert.equal(registry.isRunning("agent", "telegram"), false);
-    assert.deepEqual(transport.stops, ["telegram"]);
-  });
-});
+        assert.equal(registry.isRunning("agent", "telegram"), false);
+        assert.deepEqual(transport.stops, ["telegram"]);
+      });
+
+      // ─── fix round B (verify): B1 + B2, las dos puertas que nacen tarde ─────────
+      //
+      // `composeChannels` no existe hasta el paso 13 de `runStartup`, y hasta este
+      // corte dos consumidoras nacían antes sin que nadie les pasara nada:
+      //
+      // * `HumanRequestDelivery` (paso 8) se construía con un cliente Bot API de
+      //   token — la costura `hitl` de la composición se quedaba sin llamador y la
+      //   tarjeta de `waiting_human` era un no-op silencioso en producción
+      //   (spec `agent-channels`, «Unified session delivery-by-origin», caso 3).
+      // * Las rutas `/api/v1` (paso 10) recibían `{ registry, pairing, exchanges }`:
+      //   `outbox` estaba `undefined`, así que el drenado de teardown (FIX H4) y el
+      //   de `DELETE /agents/:name` (revocation 3c) no dreñaban nada.
+      //
+      // El primer test lee el composition root (es lo único que puede probar que
+      // PRODUCCIÓN enchufa estas dos salidas); el segundo ejecuta la misma forma
+      // sobre las tablas v4 reales y comprueba que la tarjeta llega al bot.
+      it("el arranque enlaza TARDE las dos salidas que nacen en `createOutboxWorker`", async () => {
+        const source = await fs.readFile(new URL("../src/index.ts", import.meta.url), "utf8");
+
+        const checks: Array<[RegExp, string]> = [
+          [
+            /createLateBoundHitl\(/,
+            "no hay puerta HITL tardía: `HumanRequestDelivery` (paso 8) no puede recibir una costura que aún no existe",
+          ],
+          [
+            /new HumanRequestDelivery\(\{[\s\S]{0,500}?channel: hitlDoor/,
+            "`HumanRequestDelivery` se construye sin `channel`: la tarjeta cae en el camino legado del token que el cutover dejó de escribir",
+          ],
+          [
+            /hitlDoor\.bind\(composition\.hitl\)/,
+            "la costura `hitl` de `composeChannels` sigue sin llamador de producción",
+          ],
+          [
+            /\.outbox = composition\.outbox/,
+            "las rutas no reciben el outbox: el drenado de teardown (`PUT []`, `DELETE /channels/:kind`, `DELETE /agents/:name`) es un no-op",
+          ],
+        ];
+        for (const [pattern, why] of checks) assert.match(source, pattern, why);
+
+        assert.doesNotMatch(
+          source,
+          /api\.telegram\.org/,
+          "el arranque ya no compone un cliente Bot API con token: el único camino de salida es el outbox",
+        );
+        assert.doesNotMatch(
+          source,
+          /agentConfigFor:/,
+          "fuente del `telegramToken` legado fuera del arranque (fix H3: la puerta es el vínculo)",
+        );
+      });
+
+      it("con el cableado real, una tarjeta HITL sale por el outbox del canal", { timeout: 20000 }, async () => {
+        const dataDir = await setup();
+        // `human_request_deliveries.initiative_id` es FK: la reserva necesita la
+        // Initiative que el Dashboard proyecta. Sembrada sobre el MISMO fichero que
+        // luego abre `runStartup`, y con el driver crudo cerrado antes de abrirlo.
+        const seed = await openTestDb(dataDir);
+        seed
+          .prepare(
+            `INSERT INTO initiatives
+               (id, agent_name, state, origin, intent, mode, session_key, available_at,
+                bound_model, chain_depth, visible_effects_declared, summary, created_at,
+                state_changed_at, human_question, human_expires_at, human_request_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            "ini-hitl",
+            "agent",
+            "waiting_human",
+            "human",
+            "haz algo",
+            "solo",
+            "agent:agent:main",
+            1,
+            "gpt-5",
+            0,
+            0,
+            "resumen del contexto",
+            1000,
+            1000,
+            "¿Cuál es el plan?",
+            1_760_000_000_000,
+            "req-hitl",
+          );
+        seed.close();
+
+        const transport = fakeTransport();
+        const registry = new ChannelRuntimeRegistry({ adapterFactory: transport.adapterFactory });
+        const pairing = new PairingMachine({ dataDir });
+        const bridge = fakeTurns();
+        const recorder: Recorder = { calls: [] };
+        const logs: string[] = [];
+
+        let channelDelivery: ((turn: CompletedTurn) => void) | undefined;
+        let composed: ChannelComposition | undefined;
+        let delivery: HumanRequestDelivery | undefined;
+        // Lo mismo que `index.ts`: la puerta existe desde el paso 8, la costura
+        // detrás de ella aparece en el 13.
+        const hitlDoor = createLateBoundHitl({ log: (line) => logs.push(line) });
+
+        const runtime = await runStartup(
+          {
+            openStore: async () => {
+              const store = await openManagerStore(dataDir);
+              stores.push(store);
+              return store;
+            },
+            providers: { initialize: async () => {} },
+            provision: async () => {},
+            createSupervisor: () => ({ startAll: async () => {}, stopAll: async () => {} }),
+            createTurns: ({ store }) => {
+              delivery = new HumanRequestDelivery({
+                deliveries: store.agenda.humanRequestDeliveries,
+                channel: hitlDoor,
+                log: (line) => logs.push(line),
+              });
+              return {
+                startTurn: bridge.startTurn,
+                completeTurn: (turn: CompletedTurn) => channelDelivery?.(turn),
+              };
+            },
+            createOAuth: () => ({}),
+            createApp: () => ({}),
+            createLoop: () => fakeLoop(recorder),
+            serve: () => ({ close: () => {} } satisfies ServerLike),
+            createOutboxWorker: ({ store, turns }) => {
+              composed = composeChannels({
+                dataDir,
+                persistence: store.channels,
+                registry,
+                pairing,
+                turns,
+                resolveRunner: async () => ({ port: 4100 }),
+                drainIntervalMs: 5,
+                log: () => {},
+              });
+              compositions.push(composed);
+              hitlDoor.bind(composed.hitl);
+              channelDelivery = composed.onTurnCompleted;
+              return composed.worker;
+            },
+          },
+          "owner",
+        );
+
+        // Canal vivo con vínculo: el destino de la tarjeta es el chat emparejado.
+        await registry.replaceAll("agent", [
+          {
+            kind: "telegram",
+            token: "771234:AA-token",
+            pairingWindowEndsAt: "2099-01-01T00:00:00.000Z",
+          },
+        ]);
+        await pairing.requestPairing("agent", "telegram", "12345");
+        assert.equal(hitlDoor.bound, true, "fixture: la composición enlazó la puerta");
+
+        await delivery!.deliver(requestOf());
+
+        await until(() => transport.sends.length === 1);
+        assert.equal(transport.sends[0]!.chatId, "12345", "al VÍNCULO, no a un chat de env");
+        assert.match(transport.sends[0]!.text, /Pregunta para ti/);
+        assert.match(transport.sends[0]!.text, /¿Cuál es el plan\?/);
+        assert.equal(
+          runtime.store.agenda.humanRequestDeliveries.lookupDelivery(
+            "agent",
+            "telegram",
+            "12345",
+            "pending:req-hitl",
+          )?.humanRequestId,
+          "req-hitl",
+          "la reserva durable se escribe con el chat vinculado",
+        );
+        assert.deepEqual(
+          logs.filter((line) => line.startsWith("HUMAN_REQUEST_DELIVERY_")),
+          [],
+          "sin skips ni fallos: la tarjeta se entregó: " + logs.join(" | "),
+        );
+
+        await shutdownRuntime({ ...runtime, channels: registry });
+      });
+    });

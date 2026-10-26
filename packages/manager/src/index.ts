@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { serve } from "@hono/node-server";
-import { isValidAgentName, loadEnv, readAgent } from "@pihub/shared";
+import { loadEnv } from "@pihub/shared";
 import { bootstrap } from "./bootstrap.js";
 import { provisionAgents } from "./provision.js";
 import { createApi } from "./api.js";
+import type { ApiV1ChannelDeps } from "./api-v1/routes.js";
 import { Supervisor } from "./supervisor.js";
 import { OAuthService } from "./oauth.js";
 import { createRuntimeProviders } from "@pihub/providers";
@@ -14,37 +15,25 @@ import { AgendaLoop } from "./agenda/loop.js";
 import { TurnExecution, type CompletedTurn } from "./agenda/turn-execution.js";
 import type { EffectiveTriggerAuthority } from "./agenda/triggers.js";
 import { AutonomyControl } from "./agenda/autonomy-control.js";
-import {
-  HumanRequestDelivery,
-  type TelegramBotClient,
-} from "./primary-channel/human-request-delivery.js";
+import { HumanRequestDelivery } from "./primary-channel/human-request-delivery.js";
 import { ChannelRuntimeRegistry } from "./channels/registry.js";
 import { composeChannels } from "./channels/composition.js";
+import { createLateBoundHitl } from "./channels/hitl-bridge.js";
 import { resetObservedState } from "./channels/store.js";
 import { PairingMachine } from "./channels/pairing.js";
 import { assertNoDoubleTelegramBot } from "./channels/cutover.js";
 
 const env = loadEnv();
 
-/** Cliente HTTP real; `HumanRequestDelivery` conserva este efecto inyectable. */
-const telegramBotClient: TelegramBotClient = {
-  async sendMessage(token, params) {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(params),
-    });
-    if (!response.ok) throw response;
-
-    const payload = await response.json() as {
-      ok?: unknown;
-      result?: { message_id?: unknown };
-    };
-    if (payload.ok !== true || !Number.isSafeInteger(payload.result?.message_id)) {
-      throw new SyntaxError("Telegram Bot API devolvió una respuesta inválida");
-    }
-    return { message_id: payload.result!.message_id as number };
-  },
+/**
+ * Fix H3/B1 (verify round): el arranque YA NO compone ningún cliente Bot API.
+ * El único camino de salida de una tarjeta `waiting_human` es el de cualquier otro
+ * mensaje no-web: `composeChannels` → outbox → adapter vivo. Un cliente de token
+ * aquí volvería a pedir el `agent.json.telegramToken` que el cutover dejó de
+ * escribir — la puerta muerta que hacía el envío un no-op silencioso.
+ */
+const logLine = (line: string): void => {
+  console.error(`[pihub] ${line}`);
 };
 
 // P1.4 (§5): la autoridad efectiva se deriva **una vez** del modo
@@ -95,6 +84,29 @@ const channelRegistry = new ChannelRuntimeRegistry();
  */
 const channelPairing = new PairingMachine({ dataDir: env.dataDir });
 
+/**
+ * La puerta HITL de enlace tardío (fix B1, spec `agent-channels` → «Unified session
+ * delivery-by-origin», caso 3). `TurnExecution` — y con él `HumanRequestDelivery` —
+ * nace en el paso 8; la costura `hitl` de `composeChannels` no existe hasta el 13.
+ * Este objeto es la referencia estable que la entrega guarda de por vida; el arranque
+ * enlaza la costura real abajo, en `createOutboxWorker`. Mientras no está enlazada la
+ * puerta es FAIL-CLOSED: `boundChatOf` responde `null` (skip documentado, cero filas,
+ * cero envíos) y `enqueue` rechaza — nunca una tarjeta fantasma encolada.
+ */
+const hitlDoor = createLateBoundHitl({ log: logLine });
+
+/**
+ * El objeto de dependencias de canales que reciben las rutas `/api/v1`. ES UNA SOLA
+ * referencia mutable a propósito: `createApp` corre en el paso 10 y `composeChannels`
+ * en el 13, así que lo que nace tarde (`outbox`, la puerta del drenado de teardown,
+ * FIX H4 + revocation 3c) se enlaza SOBRE ESTE objeto y las rutas lo ven porque lo
+ * leen al servir (`channelOutbox()`), no porque lo copien al construirse.
+ */
+const channelRouteDeps: ApiV1ChannelDeps = {
+  registry: channelRegistry,
+  pairing: channelPairing,
+};
+
 // El Supervisor se construye aquí, y `createSupervisor` solo lo devuelve, porque el
 // inbound de un canal necesita el puerto del Runner vivo (`runnerPortOf`) y
 // `runStartup` no le pasa el Supervisor a `createOutboxWorker`. El constructor es
@@ -131,19 +143,18 @@ const runtime = await runStartup(
     // Fase 3.7 (§9.7): el watchdog de apertura/silencio se lee de env — en
     // producción el default es real y NO cero (`0` significaría desactivado).
     createTurns: ({ store }) => {
-      // [ÁRBITRO-1]: sin panel o chat privado primario no se compone ningún
-      // delivery. El panel sigue mostrando la espera y Telegram recibe cero
-      // llamadas (fail-closed).
-      const delivery = env.panelEnabled && env.telegramPrimaryChatId !== undefined
+      // [ÁRBITRO-1] reescrito por H3/B1: sin panel no se compone ningún delivery
+      // (el panel sigue mostrando la espera y Telegram recibe cero llamadas).
+      // Con panel, la puerta de salida es la de canales y el destino lo decide EL
+      // VÍNCULO — nunca un `agent.json.telegramToken` (campo que el cutover dejó de
+      // escribir) ni un chat de env. Sin vínculo la entrega registra su
+      // `HUMAN_REQUEST_DELIVERY_SKIPPED`, es decir: antes «tarjeta perdida en
+      // silencio», ahora decisión visible en el journal.
+      const delivery = env.panelEnabled
         ? new HumanRequestDelivery({
-            client: telegramBotClient,
+            channel: hitlDoor,
             deliveries: store.agenda.humanRequestDeliveries,
-            primaryChatId: env.telegramPrimaryChatId,
-            agentConfigFor: async (agentName) => {
-              if (!isValidAgentName(agentName)) return null;
-              const config = await readAgent(env.dataDir, agentName);
-              return config?.name === agentName ? config : null;
-            },
+            log: logLine,
           })
         : undefined;
 
@@ -179,6 +190,16 @@ const runtime = await runStartup(
         turns,
         authority: effectiveTriggerAuthority,
       });
+      // Fix B2 (drenado de teardown): las rutas reciben el objeto COMPARTIDO, no un
+      // literal nuevo. `createApp` es el paso 10 y `composeChannels` el 13, así que el
+      // `outbox` tiene que caer sobre la MISMA referencia que `channelOutbox()` lee al
+      // servir; un literal por copia lo dejaría `undefined` para siempre en producción.
+      // Aquí solo se rellena lo que ya existe: `exchanges` es el MISMO objeto que
+      // escribe el delivery-router (la puerta estrecha del store, una instancia por
+      // base abierta) — sin él la ruta projection-in no tendría filas que servir.
+      Object.assign(channelRouteDeps, {
+        exchanges: store.channels.exchanges,
+      });
       return createApi(
         env,
         supervisor,
@@ -190,17 +211,9 @@ const runtime = await runStartup(
           control: autonomyControl,
           deliveries: store.agenda.humanRequestDeliveries,
         },
-        // El registry del arranque es el que sirve las rutas de canales: si el
-        // router se fabricara el suyo, el `stopAll()` de abajo no vería nada.
-        // `exchanges` es el MISMO objeto que escribe el delivery-router (la puerta
-        // estrecha del store, una instancia por base abierta): sin él la ruta
-        // projection-in no tiene filas que servir aunque el Manager ya haya
-        // entregado mensajes por el canal.
-        {
-          registry: channelRegistry,
-          pairing: channelPairing,
-          exchanges: store.channels.exchanges,
-        },
+        // El registry del arranque es el que sirve las rutas de canales: si el router
+        // se fabricara el suyo, el `stopAll()` de abajo no vería nada.
+        channelRouteDeps,
       );
     },
     // Fase 3.5 (D2): el Loop se compone y arranca después de `serve`.
@@ -236,6 +249,12 @@ const runtime = await runStartup(
       });
       // Enlace tardío del hook (ver `channelDelivery` arriba).
       channelDelivery = composition.onTurnCompleted;
+      // Fix B1: la tarjeta de `waiting_human` sale por la costura REAL de la
+      // composición (router → outbox → adapter vivo), decidida por el vínculo.
+      hitlDoor.bind(composition.hitl);
+      // Fix B2 / H4: sin esto las rutas no tienen puerta de drenado y `PUT []`,
+      // `DELETE /channels/:kind` y `DELETE /agents/:name` no dreñan la cola.
+      channelRouteDeps.outbox = composition.outbox;
       return composition.worker;
     },
     serve: (app) =>

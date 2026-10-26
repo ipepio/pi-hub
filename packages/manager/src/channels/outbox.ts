@@ -234,6 +234,13 @@ const SQL_DEAD_FOR = `
       updated_at = ?
   WHERE agent_name = ? AND kind = ? AND state IN ('pending', 'in_flight')`;
 
+/** Agent purge (revocation 3c): every kind at once, kind-blind by necessity. */
+const SQL_DEAD_FOR_AGENT = `
+  UPDATE channel_outbox
+  SET state = 'dead', last_error = ?, next_attempt_at = NULL, in_flight_at = NULL,
+      updated_at = ?
+  WHERE agent_name = ? AND state IN ('pending', 'in_flight')`;
+
 const SQL_COUNTS = `SELECT state, COUNT(*) AS total FROM channel_outbox GROUP BY state`;
 
 interface RawRow {
@@ -506,12 +513,29 @@ export class ChannelOutbox {
    * rows for one agent + kind reach the terminal state WITHOUT a send. Returns
    * how many rows were moved, so a route can log the effect it had.
    */
-  async deadFor(agentName: string, kind: ChannelKind, reason: string): Promise<number> {
-    const result = this.db
-      .prepare(SQL_DEAD_FOR)
-      .run(describeError(reason), this.now(), agentName, kind);
-    return Number(result.changes);
-  }
+      async deadFor(agentName: string, kind: ChannelKind, reason: string): Promise<number> {
+        const result = this.db
+          .prepare(SQL_DEAD_FOR)
+          .run(describeError(reason), this.now(), agentName, kind);
+        return Number(result.changes);
+      }
+    
+      /**
+       * Agent teardown (spec `agent-channels` → Revocation semantics (c): «The purge
+       * path stops the channel adapter … Drains the channel outbox to terminal
+       * state»). Same semantics as `deadFor` — `pending`/`in_flight` become `dead`
+       * WITHOUT a send, delivered history stays readable — but scoped to the AGENT,
+       * which is what a purge needs: by the time the route runs the projection
+       * (`channels.json`) is on its way out, so there is no authoritative kind list
+       * left to iterate, and a row of a kind nobody projected anymore would survive
+       * the purge and be retried through whatever adapter later took that slot.
+       */
+      async deadForAgent(agentName: string, reason: string): Promise<number> {
+        const result = this.db
+          .prepare(SQL_DEAD_FOR_AGENT)
+          .run(describeError(reason), this.now(), agentName);
+        return Number(result.changes);
+      }
 
   /** Rows in the queue per state — the observable count a status surface can show. */
   async counts(): Promise<Record<OutboxState, number>> {

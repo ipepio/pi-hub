@@ -175,6 +175,10 @@ export function correlationIdOf(c: {
  * The only outbox face a channel-removal route needs. `deadFor` is idempotent
  * by state (it only touches `pending`/`in_flight` rows) and returns how many
  * rows it moved, which is what the route logs.
+ *
+ * `deadForAgent` is what an AGENT purge calls (fix B2, revocation 3c): a purge
+ * has no kind list to iterate — the projection is being deleted with the Agent
+ * — and a row of a kind nobody projected anymore would otherwise outlive it.
  */
 export interface ChannelOutboxTeardown {
   deadFor(
@@ -182,6 +186,7 @@ export interface ChannelOutboxTeardown {
     kind: ChannelKind,
     reason: string,
   ): Promise<number>;
+  deadForAgent(agentName: string, reason: string): Promise<number>;
 }
 
 /**
@@ -222,12 +227,17 @@ export function createApiV1Router(
   const pairing =
     channels?.pairing ?? new PairingMachine({ dataDir: env.dataDir });
   /**
-   * Outbox teardown door (FIX H4). Structural and OPTIONAL: the queue lives on
-   * the SQLite driver `ManagerStore` hides, so only the composition root can
-   * hand it over, and it does so LATE (the outbox is built after the app).
-   * Absent = nothing to drain, and a removal behaves as before this fix.
+   * Outbox teardown door (FIX H4 + fix B2). Structural and OPTIONAL: the queue
+   * lives on the SQLite driver `ManagerStore` hides, so only the composition
+   * root can hand it over — and it does so LATE, because `createApp` is step 10
+   * of `runStartup` while `composeChannels` is step 13.
+   *
+   * That is why this is a READER and not a snapshot: `const door =
+   * channels?.outbox`, taken while the router is built, is `undefined` forever in
+   * production — the very shape that kept the H4 drain inert outside tests. Every
+   * route below calls the reader at request time.
    */
-  const channelOutbox = channels?.outbox;
+  const channelOutbox = () => channels?.outbox;
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
   const turnosVistos = new Map<string, string>();
   //
@@ -673,14 +683,52 @@ export function createApiV1Router(
     }
   });
 
-  app.delete("/agents/:name", async (c) => {
-    const name = c.req.param("name");
-    const config = await readAgent(env.dataDir, name).catch(() => undefined);
-    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-    await supervisor.stop(name);
-    await deleteAgent(env, name);
-    return c.body(null, 204);
-  });
+      app.delete("/agents/:name", async (c) => {
+        const name = c.req.param("name");
+        const config = await readAgent(env.dataDir, name).catch(() => undefined);
+        if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+        await supervisor.stop(name);
+        // Revocation (c) — Agent deletion is a CHANNEL teardown too (spec
+        // `agent-channels`, and fix B2 of the verify round: until this call existed,
+        // the bot of a purged Agent kept long-polling until the Manager restarted,
+        // which is the highest-incident-risk gap of the change: duplicate-token
+        // conflicts plus a live bot answering a chat whose Agent no longer exists).
+        //
+        // Silent by construction — no adapter sends a farewell, and the queue rows
+        // go to the terminal `dead` state WITHOUT a delivery attempt (I2: a deleted
+        // Agent's outbox must not retry forever). The agent directory itself takes
+        // `channels.json` and `channel-pairing.json` with it (`deleteAgent` below);
+        // the two SQLite tables are the state that `rm -rf` cannot reach.
+        await channelRegistry.stopAgent(name);
+        try {
+          const drained = await channelOutbox()?.deadForAgent(
+            name,
+            "agent deletion: DELETE /agents/:name",
+          );
+          if (drained) {
+            console.log(
+              `[api-v1] CHANNEL_OUTBOX_TEARDOWN agent=${name} dead=${drained}`,
+            );
+          }
+          const mirrored = channels?.exchanges?.deleteForAgent(name) ?? 0;
+          if (mirrored) {
+            console.log(
+              `[api-v1] CHANNEL_EXCHANGES_PURGED agent=${name} rows=${mirrored}`,
+            );
+          }
+        } catch (error) {
+          // Teardown is best-effort and never reverses a deletion: an unreachable
+          // queue would leave the Agent half-purged, which is worse than a row that
+          // dies on its own when the next projection replaces it.
+          console.error(
+            "[api-v1] fallo drenando canales del Agent:",
+            c.get("correlationId"),
+            error,
+          );
+        }
+        await deleteAgent(env, name);
+        return c.body(null, 204);
+      });
 
   // --- §4.3b Env del Agent (Fase 1, §1.3 del plan) ---
   //
@@ -1074,12 +1122,12 @@ export function createApiV1Router(
       const kindsAfter = new Set(records.map((record) => record.kind));
       for (const kind of kindsBefore) {
         if (kindsAfter.has(kind)) continue;
-        const drained = await channelOutbox?.deadFor(
-          name,
-          kind,
-          "channel teardown: removed from the projection",
-        );
-        if (drained) {
+            const drained = await channelOutbox()?.deadFor(
+              name,
+              kind,
+              "channel teardown: removed from the projection",
+            );
+            if (drained) {
           console.log(
             `[api-v1] CHANNEL_OUTBOX_TEARDOWN agent=${name} kind=${kind} dead=${drained}`,
           );
@@ -1243,12 +1291,12 @@ export function createApiV1Router(
           // FIX H4 (I2 + design §13): the removed kind's queue goes with it —
           // `dead`, without a single send. `deadFor` only touches
           // `pending`/`in_flight` rows, so delivered history stays readable.
-          const drained = await channelOutbox?.deadFor(
-            name,
-            kind,
-            "channel teardown: DELETE /channels/:kind",
-          );
-          if (drained) {
+              const drained = await channelOutbox()?.deadFor(
+                name,
+                kind,
+                "channel teardown: DELETE /channels/:kind",
+              );
+              if (drained) {
             console.log(
               `[api-v1] CHANNEL_OUTBOX_TEARDOWN agent=${name} kind=${kind} dead=${drained}`,
             );

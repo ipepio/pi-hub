@@ -229,4 +229,50 @@ describe("ChannelExchangeLog — append / feed / prune", () => {
     }
     assert.equal(log.listAfter("agent", 0).length, EXCHANGE_FEED_DEFAULT_LIMIT);
   });
+
+  // B2 (verify round, revocation 3c): Agent deletion is a purge, and the mirror
+  // feed is SQLite state that `deleteAgent()` (rm -rf of the agent dir) cannot
+  // reach. `prune()` is age-based, so without an agent-scoped delete the exchanges
+  // of a purged Agent would linger for 30 days — and a NEW Agent reusing the name
+  // would inherit somebody else's transcript.
+  it("deleteForAgent borra SOLO el feed del Agent purgado", () => {
+    const db = openMemoryDb();
+    const log = new ChannelExchangeLog(db);
+    log.append({
+      agentName: "agent",
+      turnId: "t-purged-1",
+      origin: "telegram",
+      chatId: "chat-1",
+      userText: "h",
+      replyText: "r",
+      now: NOW,
+    });
+    log.append({
+      agentName: "agent",
+      turnId: "t-purged-2",
+      origin: "proactive",
+      chatId: null,
+      userText: "",
+      replyText: "r2",
+      now: NOW + 1,
+    });
+    log.append({
+      agentName: "vecina",
+      turnId: "t-keep",
+      origin: "telegram",
+      chatId: "chat-9",
+      userText: "h",
+      replyText: "r",
+      now: NOW + 2,
+    });
+
+    assert.equal(log.deleteForAgent("agent"), 2);
+    assert.deepEqual(log.listAfter("agent", 0), [], "el feed del purgado desaparece");
+    assert.deepEqual(
+      log.listAfter("vecina", 0).map((row) => row.turnId),
+      ["t-keep"],
+      "el de otra Agent no se toca",
+    );
+    assert.equal(log.deleteForAgent("agent"), 0, "idempotente");
+  });
 });

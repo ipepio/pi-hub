@@ -226,3 +226,5 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     ),
   };
 }
+
+// Resolución de tipos refrescada (cutover slice c part 3b: PIHUB_CHANNEL_KINDS).

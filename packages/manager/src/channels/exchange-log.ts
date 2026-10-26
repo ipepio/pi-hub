@@ -90,6 +90,9 @@ const SQL_AFTER = `
 const SQL_LATEST = "SELECT COALESCE(MAX(id), 0) AS seq FROM channel_exchanges WHERE agent_name = ?";
 
 const SQL_PRUNE = "DELETE FROM channel_exchanges WHERE created_at < ?";
+    
+/** Agent purge (revocation 3c): the mirror of a deleted Agent has no owner left. */
+const SQL_DELETE_FOR_AGENT = "DELETE FROM channel_exchanges WHERE agent_name = ?";
 
 function toExchange(raw: RawExchange): ChannelExchange {
   return {
@@ -166,9 +169,25 @@ export class ChannelExchangeLog {
     return rows.map(toExchange);
   }
 
-  /** Drops rows outside the retention window; returns how many went away. */
-  prune(now: number): number {
-    const result = this.db.prepare(SQL_PRUNE).run(now - EXCHANGE_RETENTION_MS);
-    return Number(result.changes);
-  }
+      /** Drops rows outside the retention window; returns how many went away. */
+      prune(now: number): number {
+        const result = this.db.prepare(SQL_PRUNE).run(now - EXCHANGE_RETENTION_MS);
+        return Number(result.changes);
+      }
+    
+      /**
+       * Drops EVERY mirror row of one Agent and returns how many went away (spec
+       * `agent-channels` → Revocation semantics (c), Agent deletion).
+       *
+       * `prune()` cannot do this job: it is age-based, so the exchanges of a purged
+       * Agent would sit in the database for 30 days — and `channel_exchanges` is
+       * keyed by `agent_name`, so an Agent re-created with the same name would find
+       * somebody else's history behind its own cursor. The agent DIRECTORY is what
+       * `deleteAgent()` removes; this table lives in the Manager database, which is
+       * why the purge route has to say it out loud.
+       */
+      deleteForAgent(agentName: string): number {
+        const result = this.db.prepare(SQL_DELETE_FOR_AGENT).run(agentName);
+        return Number(result.changes);
+      }
 }

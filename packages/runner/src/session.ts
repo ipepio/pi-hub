@@ -185,6 +185,9 @@ export class SessionFactory {
 
   private platformSection(): string {
     if (!this.env.platformPromptEnabled) return "";
+    // `channelKinds` viene de PIHUB_CHANNEL_KINDS (cutover slice c part 3b):
+    // es la única señal de canales que le queda al Runner — el bot lo posee
+    // el Manager y el Runner no lee ningún secreto ni token.
     return buildPlatformPrompt({
       agentName: this.config.name,
       memoryEnabled: this.env.memoryEnabled,
