@@ -10,16 +10,45 @@ import type { AgentMemoryConfig, ThinkingLevel } from "@pihub/shared";
  * `env` es el store del Agent (no el global, ni el entorno de sistema): es
  * lo único de `resolveRunnerEnv` que el dashboard controla vía
  * `/api/v1/agents/:name/env`.
+ *
+ * `channels` entra por la misma razón (channels-and-mcp, slice (c)): el
+ * conjunto de canales proyectados cambia el comportamiento observable del
+ * Agent — y desde el cutover (part 3b) es LO ÚNICO que lo cambia en este
+ * terreno: el Runner ya no lee ningún token, así que la presencia de canal,
+ * su credencial y su rotación viajan como (kind, tokenDigest). El token lo
+ * posee el Manager (`channels/registry.ts`) y el digest lo pone el dashboard
+ * desde el vault.
+ *
+ * `telegramToken` SALIÓ del snapshot en el cutover: era el bot del Runner, y
+ * ese bot ya no existe. Dejarlo habría significado reiniciar el proceso por un
+ * campo que nadie lee; tenerlo en claro habría sido un secreto en una huella
+ * que sale por logs (la precedente es `supervisor.statusOf`, que sigue
+ * redactando el residuo legado antes de devolver un `AgentStatus`).
  */
+
+/**
+ * Un canal en la forma que la huella puede ver. `label` se acepta en el
+ * snapshot porque las rutas ya la tienen a mano, pero NO entra en la huella: no
+ * lo lee nadie al arrancar y reiniciar por una etiqueta mataría un turno vivo
+ * sin ningún efecto observable (runtime-projection: «label changes do NOT
+ * trigger restart», tasks (c-T4)).
+ */
+export interface AgentChannelFingerprintInput {
+  kind: string;
+  label?: string;
+  tokenDigest?: string;
+}
+
 export interface AgentRuntimeInputSnapshot {
   model?: string;
   thinkingLevel?: ThinkingLevel;
-  telegramToken?: string;
   ttsVoice?: string;
   memory?: AgentMemoryConfig;
   systemPrompt: string;
   env: Record<string, string>;
   packages: string[];
+  /** Canales proyectados del Agent. Ausente = ninguno (misma huella que `[]`). */
+  channels?: AgentChannelFingerprintInput[];
 }
 
 /**
@@ -35,12 +64,23 @@ export function agentRuntimeFingerprint(input: AgentRuntimeInputSnapshot): strin
   return JSON.stringify({
     model: input.model ?? null,
     thinkingLevel: input.thinkingLevel ?? null,
-    telegramToken: input.telegramToken ?? null,
     ttsVoice: input.ttsVoice ?? null,
     memory: input.memory?.sharedAccess ?? null,
     systemPrompt: input.systemPrompt,
     env: Object.entries(input.env).sort(([a], [b]) => a.localeCompare(b)),
     packages: [...input.packages].sort(),
+    // Proyectado a (kind, tokenDigest) y ordenado: es un conjunto, y el orden
+    // en que el caller lo mandó no es información.
+    channels: (input.channels ?? [])
+      .map((channel) => ({
+        kind: channel.kind,
+        tokenDigest: channel.tokenDigest ?? null,
+      }))
+      .sort(
+        (a, b) =>
+          a.kind.localeCompare(b.kind) ||
+          (a.tokenDigest ?? "").localeCompare(b.tokenDigest ?? ""),
+      ),
   });
 }
 
@@ -48,7 +88,6 @@ export function agentRuntimeFingerprint(input: AgentRuntimeInputSnapshot): strin
 export interface UpdateAgentRuntimeFields {
   model?: string;
   thinkingLevel?: ThinkingLevel;
-  telegramToken?: string | null;
   ttsVoice?: string | null;
   memory?: AgentMemoryConfig | null;
   enabled?: boolean;
@@ -58,7 +97,6 @@ export interface UpdateAgentRuntimeFields {
 export interface CurrentAgentRuntimeFields {
   model?: string;
   thinkingLevel?: ThinkingLevel;
-  telegramToken?: string;
   ttsVoice?: string;
   memory?: AgentMemoryConfig;
   enabled: boolean;
@@ -83,8 +121,6 @@ export function projectUpdatedAgent(
   return {
     model: input.model !== undefined ? input.model : config.model,
     thinkingLevel: input.thinkingLevel !== undefined ? input.thinkingLevel : config.thinkingLevel,
-    telegramToken:
-      "telegramToken" in input ? (input.telegramToken ?? undefined) : config.telegramToken,
     ttsVoice: "ttsVoice" in input ? (input.ttsVoice ?? undefined) : config.ttsVoice,
     memory: "memory" in input ? (input.memory ?? undefined) : config.memory,
     enabled: input.enabled !== undefined ? input.enabled : config.enabled,

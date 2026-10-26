@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export interface Migration {
     version: number;
@@ -248,6 +248,86 @@ CREATE UNIQUE INDEX triggers_create_idempotency
   WHERE create_idempotency_key IS NOT NULL;
 `;
 
+// Schema v4 (slice (c) part 2a, channels-and-mcp): outbox durable de mensajes
+// salientes hacia un Channel (`specs/pihub-manager-channels` → “Outbox — SQLite
+// migration v4”, design §2.2).
+//
+// Es una tabla NUEVA y puramente aditiva: ninguna fila existente se toca y ningún
+// CHECK anterior cambia, así que `up` no necesita `disableForeignKeys` (no hay
+// rebuild). No hay FK a `agents` porque el Manager no tiene tabla de Agents — el
+// nombre de Agent es texto, como en `triggers`/`initiatives`.
+//
+// La fila es a la vez reserva y registro de entrega, copiando la disciplina de
+// `human_request_deliveries` (v2, `:149-162`):
+//
+// - `id` ES la reserva: `pending:<uuid>` de por vida. El CHECK de prefijo hace que
+//   el formato sea dato, no comentario — una fila sin reserva no puede existir.
+// - `state` es la máquina de §2.2 (`pending → in_flight → delivered | pending |
+//   dead`); fuera de esos cuatro valores no entra nada (diagrama normativo).
+// - `attempts` + `next_attempt_at` dan el backoff exponencial; `attempts >= 8`
+//   llega a `dead` (decisión del worker, no de la tabla).
+// - `external_message_id` es el mensaje REAL devuelto por el transporte: su índice
+//   único parcial (`WHERE NOT NULL`) es lo que impide entregar dos veces la misma
+//   cosa tras “send OK, UPDATE fallido” (at-least-once con idempotencia).
+// - `in_flight_at` hace recuperable el lease: tras un crash del Manager la fila
+//   vuelve a la cola cuando expira (120 s), nunca se pierde.
+// - `last_error`/`delivered_at` son observables (I3) y el estado terminal:
+//   un `delivered` sin `delivered_at` o un `in_flight` sin `in_flight_at` son
+//   imposibles por CHECK, no por convención.
+//
+// `channel_exchanges` (design §1.2/§1.4, log de intercambios) va en la MISMA v4:
+// nunca se publicó un v4 sin ella, así que añadir la tabla aquí es aditivo sobre
+// un esquema no distribuido — y es el par de `channel_outbox`: la cola de salida
+// y el espejo que el Dashboard drena projection-in.
+//   - `turn_id` UNIQUE: el hook de entrega es at-least-once (igual que el outbox),
+//     así que la clave natural del intercambio es lo que impide duplicar la fila.
+//   - `origin` excluye `human` a propósito (CHECK): un turno web YA vive en el
+//     transcript autoritativo del Dashboard; reflejarlo aquí sería un segundo amo
+//     del mismo hecho. Solo entran `telegram` (reply de origen canal) y
+//     `proactive` (Iniciativa del agenda).
+//   - `user_text`/`reply_text` son texto plano del intercambio: no hay secretos
+//     aquí más allá de lo que el propio usuario escribió por el canal.
+const V4_CHANNEL_TABLES = `
+CREATE TABLE channel_outbox (
+  id TEXT NOT NULL PRIMARY KEY CHECK (substr(id, 1, 8) = 'pending:'),
+  agent_name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind = 'telegram'),
+  target TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending', 'in_flight', 'delivered', 'dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at INTEGER,
+  external_message_id TEXT,
+  in_flight_at INTEGER,
+  last_error TEXT,
+  delivered_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (state <> 'in_flight' OR in_flight_at IS NOT NULL),
+  CHECK (state <> 'delivered' OR delivered_at IS NOT NULL)
+);
+CREATE UNIQUE INDEX channel_outbox_external_message
+  ON channel_outbox(external_message_id)
+  WHERE external_message_id IS NOT NULL;
+CREATE INDEX channel_outbox_due
+  ON channel_outbox(state, next_attempt_at, id);
+CREATE INDEX channel_outbox_agent
+  ON channel_outbox(agent_name, kind, state, created_at, id);
+CREATE TABLE channel_exchanges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT NOT NULL,
+  turn_id TEXT NOT NULL UNIQUE,
+  origin TEXT NOT NULL CHECK (origin IN ('telegram', 'proactive')),
+  chat_id TEXT,
+  user_text TEXT NOT NULL DEFAULT '',
+  reply_text TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX channel_exchanges_agent
+  ON channel_exchanges(agent_name, id);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
     { version: 1, up: (db) => db.exec(V1_DDL) },
     {
@@ -268,6 +348,12 @@ export const MIGRATIONS: readonly Migration[] = [
         up: (db) => {
             db.exec(V3_REBUILD_TRIGGERS);
             db.exec(V3_TRIGGERS_INDEXES);
+        },
+    },
+    {
+        version: 4,
+        up: (db) => {
+            db.exec(V4_CHANNEL_TABLES);
         },
     },
 ];

@@ -74,12 +74,33 @@ import {
   customProviderV1Schema,
   managedProviderProjectionV1Schema,
   packageItemV1Schema,
+  pairingRequestV1Schema,
+  approvePairingV1Schema,
+  replaceChannelsV1Schema,
   replaceEnvV1Schema,
   skillContentV1Schema,
   replacePackagesV1Schema,
   setEnvValueV1Schema,
   updateAgentV1Schema,
 } from "./schemas.js";
+import type { ChannelAdapterFactory, ChannelKind } from "@pihub/channels";
+import { isChannelKind } from "@pihub/channels";
+    import { ChannelRuntimeRegistry, resolveDigest } from "../channels/registry.js";
+    import {
+      EXCHANGE_FEED_DEFAULT_LIMIT,
+      EXCHANGE_FEED_MAX_LIMIT,
+      type ChannelExchange,
+      type ChannelExchangeLog,
+    } from "../channels/exchange-log.js";
+import {
+  PairingError,
+  PairingMachine,
+  type ChannelPairing,
+} from "../channels/pairing.js";
+import {
+  readChannelRecords,
+  writeChannelRecords,
+} from "../channels/store.js";
 
 /**
  * La versión que reportan `/health` y `/status`. Sale del `package.json` de
@@ -115,6 +136,55 @@ export function correlationIdOf(c: {
 }
 
 /**
+ * Inyección de dependencias de canales para `/api/v1`. En producción el
+ * Manager usa el registry real (adapters grammy); los tests de rutas
+ * inyectan un factory falso para observar el lifecycle sin red.
+ */
+    export interface ApiV1ChannelDeps {
+      registry?: ChannelRuntimeRegistry;
+      adapterFactory?: ChannelAdapterFactory;
+      /**
+       * Manager-owned pairing machine. Default: a file-backed machine on the
+       * Agent's data dir; tests inject one with a fixed clock to exercise window
+       * expiry without sleeping.
+       */
+      pairing?: PairingMachine;
+      /**
+       * Projection-in feed (slice (c) part 3a, design §1.2): the
+       * `channel_exchanges` reader behind
+       * `GET /agents/:name/channel-exchanges`. The router cannot build it — it
+       * would need the SQLite driver `ManagerStore` hides — so the composition
+       * root hands it over. Absent = no channel persistence composed, and the
+       * feed is truthfully empty (nothing could have been mirrored).
+       */
+      exchanges?: ChannelExchangeLog;
+      /**
+       * Teardown drain (FIX H4, slice (c) review round 2; spec I2 + design §13):
+       * the `channel_outbox` door the two removal routes call so rows of a
+       * channel that left the projection reach the terminal `dead` state
+       * WITHOUT a delivery attempt. Structural on purpose — the router cannot
+       * build a `ChannelOutbox` (it needs the SQLite driver `ManagerStore`
+       * hides), and the composition root hands the live one over, late-bound
+       * exactly like `exchanges`. Absent = no queue composed, and the routes
+       * behave as before this fix (nothing to drain).
+       */
+      outbox?: ChannelOutboxTeardown;
+    }
+
+/**
+ * The only outbox face a channel-removal route needs. `deadFor` is idempotent
+ * by state (it only touches `pending`/`in_flight` rows) and returns how many
+ * rows it moved, which is what the route logs.
+ */
+export interface ChannelOutboxTeardown {
+  deadFor(
+    agentName: string,
+    kind: ChannelKind,
+    reason: string,
+  ): Promise<number>;
+}
+
+/**
  * Interfaz privada versionada del Manager (H01.01). Es la ÚNICA
  * frontera con el dashboard: se consume por HTTP contra la imagen
  * publicada, nunca importando código. Convive con las rutas `/api/*`
@@ -133,8 +203,31 @@ export function createApiV1Router(
     projection: Pick<AutonomyProjection, "snapshotForAgent">;
     control: AutonomyControl;
   },
+  channels?: ApiV1ChannelDeps,
 ): Hono<ApiV1Env> {
   const app = new Hono<ApiV1Env>();
+  /**
+   * Lifecycle de los adapters del Agent, propiedad del Manager (design §1.4). El
+   * factory por defecto habla con grammy; los tests de rutas inyectan uno
+   * falso para observar el lifecycle sin red.
+   */
+      const channelRegistry =
+        channels?.registry ??
+        new ChannelRuntimeRegistry({ adapterFactory: channels?.adapterFactory });
+      /**
+       * Pairing machine (design §2.1): the Manager is the only party that sees
+       * inbound, so binding a chat is its fact and the Dashboard mirrors it. Its
+       * state is one file per Agent, hashes only — never a plaintext code.
+       */
+  const pairing =
+    channels?.pairing ?? new PairingMachine({ dataDir: env.dataDir });
+  /**
+   * Outbox teardown door (FIX H4). Structural and OPTIONAL: the queue lives on
+   * the SQLite driver `ManagerStore` hides, so only the composition root can
+   * hand it over, and it does so LATE (the outbox is built after the app).
+   * Absent = nothing to drain, and a removal behaves as before this fix.
+   */
+  const channelOutbox = channels?.outbox;
   /** Idempotencia de turnos por instancia del Manager (spec §5). */
   const turnosVistos = new Map<string, string>();
   //
@@ -472,6 +565,7 @@ export function createApiV1Router(
       await c.req.json().catch(() => ({})),
     );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
+    warnLegacyTelegramToken("POST /agents", parsed.data);
     try {
       const config = await createAgent(env, parsed.data);
       await supervisor.start(config.name);
@@ -497,26 +591,29 @@ export function createApiV1Router(
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
     if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    const [status, systemPrompt, envKeys, packages] = await Promise.all([
+    const [status, systemPrompt, envKeys, packages, channels] = await Promise.all([
       supervisor.statusOf(config),
       readSystemPrompt(env, name),
       listEnvKeys(env.dataDir, name),
       listPackages(env, name),
+      observedChannels(env.dataDir, pairing, name),
     ]);
 
-    return c.json({ ...toAgentV1(status), systemPrompt, envKeys, packages });
+    return c.json({ ...toAgentV1(status), systemPrompt, envKeys, packages, channels });
   });
 
   // Spec §4.3. Faltaba: `contract-red` no lo cubre, asi que nadie lo
   // echo en falta hasta que el adapter del dashboard intento su camino
   // idempotente (POST -> 409 -> PATCH) y se comio un 404.
   //
-  // El reinicio se decide por HUELLA (restart-policy.ts), no por qué campo
-  // vino en el body: el dashboard reconcilia mandando el estado COMPLETO en
-  // cada llamada (model + systemPrompt en cada reconcile), así que decidir
-  // por presencia de campo reiniciaría el Runner en cada reconciliación aun
-  // sin cambios reales. Antes esto SOLO miraba telegramToken — cambiar el
-  // Model o la Persona se persistía y el Runner en marcha nunca se enteraba.
+      // El reinicio se decide por HUELLA (restart-policy.ts), no por qué campo
+      // vino en el body: el dashboard reconcilia mandando el estado COMPLETO en
+      // cada llamada (model + systemPrompt en cada reconcile), así que decidir
+      // por presencia de campo reiniciaría el Runner en cada reconciliación aun
+      // sin cambios reales. Antes esto SOLO miraba telegramToken — cambiar el
+      // Model o la Persona se persistía y el Runner en marcha nunca se enteraba.
+      // Desde el cutover (part 3b) `telegramToken` ya NO entra en la huella: el
+      // bot es del Manager y lo que mueve el arranque es `channels`.
   app.patch("/agents/:name", async (c) => {
     const name = c.req.param("name");
     const config = await readAgent(env.dataDir, name).catch(() => undefined);
@@ -526,7 +623,8 @@ export function createApiV1Router(
       await c.req.json().catch(() => ({})),
     );
     if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid agent payload");
-
+    warnLegacyTelegramToken(`PATCH /agents/${name}`, parsed.data);
+    
     try {
       const wasRunning = supervisor.state(name).state === "running";
       const antes = await snapshotRuntimeInput(env, config);
@@ -540,7 +638,6 @@ export function createApiV1Router(
         ...antes,
         model: proyectado.model,
         thinkingLevel: proyectado.thinkingLevel,
-        telegramToken: proyectado.telegramToken,
         ttsVoice: proyectado.ttsVoice,
         memory: proyectado.memory,
         systemPrompt: projectSystemPrompt(antes.systemPrompt, parsed.data),
@@ -894,7 +991,331 @@ export function createApiV1Router(
     return c.json({ packages: await listPackages(env, name) }, 202);
   });
 
-  // --- Skills desde contenido del dashboard ---
+  // --- Canales del Agent (channels-and-mcp, slice (c) part 1) ---
+  //
+  // El Manager es quien posee el ciclo de vida del bot: el token entra por
+  // esta ruta, vive en memoria del registry y NUNCA se escribe a
+  // `agent.json` ni se devuelve en ninguna lectura. La superficie GET/PUT
+  // es replace-all: `[]` para todos los adapters y vacía el estado (I2).
+  // Pairing y outbox son la parte 2 de este slice: aquí no hay todavía
+  // código de approval ni de cola de entrega.
+  //
+  // Forma del contrato D→P (decisión de slice (c)): `{kind, label?,
+  // token?, tokenDigest?, pairingWindowEndsAt?}`. No hay `sessionKey` — la
+  // sesión principal del Agent la resuelve el Manager (sesión unificada) —
+  // y no hay `status`: el estado de pairing es observable del Manager, y un
+  // canal revocado no se proyecta. `pairingWindowEndsAt` (null = ventana
+  // CERRADA) solo se guarda en el registro; parte 2 es quien la consume.
+  app.get("/agents/:name/channels", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    return c.json({ channels: await readChannelRecords(env.dataDir, name) });
+  });
+
+  app.put("/agents/:name/channels", async (c) => {
+    const name = c.req.param("name");
+    const config = await readAgent(env.dataDir, name).catch(() => undefined);
+    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+
+    const parsed = replaceChannelsV1Schema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success) return fail(c, "BAD_REQUEST", "Invalid channels payload");
+
+    try {
+      const wasRunning = supervisor.state(name).state === "running";
+      // FIX H4: the kinds that are about to LEAVE the projection. Read before
+      // `replaceAll`, which is what converges the observed set — after it, the
+      // removed kinds are already gone and their queue would be orphaned.
+      const kindsBefore = (await readChannelRecords(env.dataDir, name)).map(
+        (record) => record.kind,
+      );
+      const antes = await snapshotRuntimeInput(env, config);
+      // Solo (kind, tokenDigest) decide reinicio: una etiqueta no llega a la
+      // huella (restart-policy.ts), así que renombrar un canal no tumba el
+      // turno en curso. El digest se normaliza igual que en el registry, así
+      // que "token en claro" y "su digest" producen la MISMA huella.
+      const despuesProyectado = {
+        ...antes,
+        channels: parsed.data.channels.map((channel) => ({
+          kind: channel.kind,
+          label: channel.label,
+          tokenDigest: resolveDigest(channel),
+        })),
+      };
+      // enabled no cambia por esta ruta.
+      const action = decideRuntimeAction({
+        wasRunning,
+        wasEnabled: config.enabled,
+        isEnabled: config.enabled,
+        fingerprintChanged:
+          agentRuntimeFingerprint(antes) !==
+          agentRuntimeFingerprint(despuesProyectado),
+      });
+
+      if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+        return fail(
+          c,
+          "TURN_IN_PROGRESS",
+          "Agent has a turn in progress; retry after it finishes",
+        );
+      }
+
+      const records = await channelRegistry.replaceAll(
+        name,
+        parsed.data.channels,
+      );
+      await writeChannelRecords(env.dataDir, name, records);
+      // FIX H4 (I2 + design §13): a kind that left the projection also loses its
+      // queue — its rows go to `dead` WITHOUT a delivery attempt and without a
+      // farewell. Idempotent by state, so the same projection twice drains
+      // nothing; only the kinds that actually disappeared are touched.
+      const kindsAfter = new Set(records.map((record) => record.kind));
+      for (const kind of kindsBefore) {
+        if (kindsAfter.has(kind)) continue;
+        const drained = await channelOutbox?.deadFor(
+          name,
+          kind,
+          "channel teardown: removed from the projection",
+        );
+        if (drained) {
+          console.log(
+            `[api-v1] CHANNEL_OUTBOX_TEARDOWN agent=${name} kind=${kind} dead=${drained}`,
+          );
+        }
+      }
+      // I2 on the pairing side: a kind that left the projection also loses its
+      // binding and its outstanding codes.
+      await pairing.prune(
+        name,
+        records.map((record) => record.kind),
+      );
+      await aplicarRuntimeAction(supervisor, name, action);
+
+      return c.json({ channels: records }, 202);
+    } catch (error) {
+      console.error(
+        "[api-v1] fallo aplicando canales:",
+        c.get("correlationId"),
+        error,
+      );
+      return fail(c, "INTERNAL_ERROR", "Could not update channels");
+    }
+  });
+
+      // --- Pairing de canales (channels-and-mcp, slice (c) part 2a) ---
+      //
+      // The Dashboard creates the intent and mirrors the result; the binding
+      // itself is a Manager fact, because the Manager is the only party that
+      // sees inbound traffic. Two shapes of the same operation are exposed:
+      //   POST   …/pairing  — "this chat wants in": auto-pair while the projected
+      //                        window is open, a code outside it; with
+      //                        `decision: approve|reject` it is the command the
+      //                        Dashboard sends when the owner clicks.
+      //   POST   …/approve  — the owner's redemption of a code for one chat.
+      //   DELETE …/:kind    — silent teardown of one channel: adapter stopped,
+      //                        record dropped, pairing state dropped, restart
+      //                        decided by the runtime fingerprint.
+      // Codes are hashed at rest (`channels/pairing.ts`); the plaintext one
+      // crosses this response and nothing else. No route here can read a token.
+      app.post("/agents/:name/channels/:kind/pairing", async (c) => {
+        const name = c.req.param("name");
+        const kind = channelKindOfRoute(c.req.param("kind"));
+        if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
+          return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+        }
+        if (!kind) return fail(c, "BAD_REQUEST", "Unsupported channel kind");
+        const parsed = pairingRequestV1Schema.safeParse(
+          await c.req.json().catch(() => ({})),
+        );
+        if (!parsed.success)
+          return fail(c, "BAD_REQUEST", "Invalid pairing request payload");
+    
+        try {
+          if (parsed.data.decision === "approve") {
+            const state = await pairing.approve(name, kind, {
+              code: parsed.data.code as string,
+              externalChatId: parsed.data.externalChatId,
+            });
+            return c.json(pairingView(state), 200);
+          }
+          if (parsed.data.decision === "reject") {
+            const state = await pairing.reject(
+              name,
+              kind,
+              parsed.data.externalChatId,
+            );
+            return c.json(pairingView(state), 200);
+          }
+          const result = await pairing.requestPairing(
+            name,
+            kind,
+            parsed.data.externalChatId,
+          );
+          return c.json(
+            {
+              ...pairingView(result.pairing),
+              autoPaired: result.autoPaired,
+              ...(result.code ? { code: result.code } : {}),
+            },
+            200,
+          );
+        } catch (error) {
+          return pairingFailure(c, error, "pairing request");
+        }
+      });
+    
+      app.post("/agents/:name/channels/:kind/approve", async (c) => {
+        const name = c.req.param("name");
+        const kind = channelKindOfRoute(c.req.param("kind"));
+        if (!(await readAgent(env.dataDir, name).catch(() => undefined))) {
+          return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+        }
+        if (!kind) return fail(c, "BAD_REQUEST", "Unsupported channel kind");
+        const parsed = approvePairingV1Schema.safeParse(
+          await c.req.json().catch(() => ({})),
+        );
+        if (!parsed.success)
+          return fail(c, "BAD_REQUEST", "Invalid pairing approval payload");
+    
+        try {
+          const state = await pairing.approve(name, kind, {
+            code: parsed.data.code,
+            externalChatId: parsed.data.externalChatId,
+          });
+          return c.json(pairingView(state), 200);
+        } catch (error) {
+          return pairingFailure(c, error, "pairing approval");
+        }
+      });
+    
+      app.delete("/agents/:name/channels/:kind", async (c) => {
+        const name = c.req.param("name");
+        const kind = channelKindOfRoute(c.req.param("kind"));
+        const config = await readAgent(env.dataDir, name).catch(() => undefined);
+        if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+        if (!kind) return fail(c, "BAD_REQUEST", "Unsupported channel kind");
+    
+        const records = await readChannelRecords(env.dataDir, name);
+        const remaining = records.filter((record) => record.kind !== kind);
+        if (remaining.length === records.length) {
+          return fail(
+            c,
+            "CHANNEL_NOT_FOUND",
+            `agent has no "${kind}" channel`,
+          );
+        }
+    
+        try {
+          const wasRunning = supervisor.state(name).state === "running";
+          const antes = await snapshotRuntimeInput(env, config);
+          const despuesProyectado = {
+            ...antes,
+            channels: remaining.map((record) => ({
+              kind: record.kind,
+              label: record.label,
+              tokenDigest: record.tokenDigest,
+            })),
+          };
+          const action = decideRuntimeAction({
+            wasRunning,
+            wasEnabled: config.enabled,
+            isEnabled: config.enabled,
+            fingerprintChanged:
+              agentRuntimeFingerprint(antes) !==
+              agentRuntimeFingerprint(despuesProyectado),
+          });
+    
+          if ((action === "restart" || action === "stop") && hayTurnoVivo(name)) {
+            return fail(
+              c,
+              "TURN_IN_PROGRESS",
+              "Agent has a turn in progress; retry after it finishes",
+            );
+          }
+    
+          // Silent teardown (I2): stop first, then forget — no farewell message
+          // and no state left to observe.
+          await channelRegistry.remove(name, kind);
+          await writeChannelRecords(env.dataDir, name, remaining);
+          await pairing.remove(name, kind);
+          // FIX H4 (I2 + design §13): the removed kind's queue goes with it —
+          // `dead`, without a single send. `deadFor` only touches
+          // `pending`/`in_flight` rows, so delivered history stays readable.
+          const drained = await channelOutbox?.deadFor(
+            name,
+            kind,
+            "channel teardown: DELETE /channels/:kind",
+          );
+          if (drained) {
+            console.log(
+              `[api-v1] CHANNEL_OUTBOX_TEARDOWN agent=${name} kind=${kind} dead=${drained}`,
+            );
+          }
+          await aplicarRuntimeAction(supervisor, name, action);
+    
+          return c.json({ channels: remaining }, 202);
+        } catch (error) {
+          console.error(
+            "[api-v1] fallo removing channel:",
+            c.get("correlationId"),
+            error,
+          );
+              return fail(c, "INTERNAL_ERROR", "Could not remove channel");
+            }
+          });
+    
+          // --- Feed de intercambios (channels-and-mcp, slice (c) part 3a, c-I11) ---
+          //
+          // `channel_exchanges` es la única vía por la que un intercambio no-web
+          // llega al Dashboard: no existe dirección de confianza P→D (toda llamada
+          // es D→P), así que D DRENA projection-in con esta lectura y escribe la
+          // fila en su transcript autoritativo (design §1.2). Lo que el lector
+          // necesita saber, y nada más:
+          //   * `after` es EXCLUSIVO y las filas vienen ascendentes por `seq`: una
+          //     fila ya dreanada no vuelve a aparecer;
+          //   * `latestSeq` es el cursor GLOBAL del Agent, para que una página vacía
+          //     informe igualmente dónde está el lector;
+          //   * la página está acotada y el límite EFECTIVO se devuelve en `limit`
+          //     (pedir 99999 no es volcar la tabla);
+          //   * un Agent sin filas es 200 con `[]`: «no hay espejo» es el estado
+          //     normal de un Agent solo-web, no un error. Un 404 aquí solo significa
+          //     que el Agent no existe.
+          // Sin persistencia de canales compuesta (`channels.exchanges` ausente) el
+          // feed está vacío de forma VERAZ: nadie pudo reflejar un intercambio.
+          app.get("/agents/:name/channel-exchanges", async (c) => {
+            const name = c.req.param("name");
+            const config = await readAgent(env.dataDir, name).catch(() => undefined);
+            if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+    
+            const after = feedCursorOf(c.req.query("after"));
+            if (after === undefined) {
+              return fail(c, "BAD_REQUEST", "`after` must be a non-negative integer");
+            }
+            const limit = feedLimitOf(c.req.query("limit"));
+            const log = channels?.exchanges;
+    
+            if (!log) {
+              return c.json({
+                agentName: name,
+                after,
+                limit,
+                latestSeq: 0,
+                exchanges: [],
+              });
+            }
+    
+            return c.json({
+              agentName: name,
+              after,
+              limit,
+              latestSeq: log.latestSeq(name),
+              exchanges: log.listAfter(name, after, limit).map(exchangeView),
+            });
+          });
+    
+      // --- Skills desde contenido del dashboard ---
   // No reutilizan /packages: pi registra un source local como path interno.
   // Estas rutas exponen exclusivamente el skillId UUID que el dashboard
   // aportó, y mantienen ese source persistente mientras siga instalado.
@@ -1485,24 +1906,39 @@ async function snapshotRuntimeInput(
   env: PihubEnv,
   config: Pick<
     AgentConfig,
-    "name" | "model" | "thinkingLevel" | "telegramToken" | "ttsVoice" | "memory"
+    "name" | "model" | "thinkingLevel" | "ttsVoice" | "memory"
   >,
 ) {
-  const [systemPrompt, envStore, packages] = await Promise.all([
+  const [systemPrompt, envStore, packages, channels] = await Promise.all([
     readSystemPrompt(env, config.name),
     readEnvStore(env.dataDir, config.name),
     listPackages(env, config.name),
+    readChannelRecords(env.dataDir, config.name),
   ]);
   return {
     model: config.model,
     thinkingLevel: config.thinkingLevel,
-    telegramToken: config.telegramToken,
     ttsVoice: config.ttsVoice,
     memory: config.memory,
     systemPrompt,
     env: envStore,
     packages,
+    channels,
   };
+}
+
+/**
+ * Ventana de deprecación del cutover (R3/R10): `telegramToken` sigue
+ * aceptándose en el body para que un Dashboard que aún lo mande no reciba un 400
+ * en medio de un reconcile, pero YA NO ESCRIBE NADA: el sink (`agents.ts`) lo
+ * ignora y la huella no lo ve. El aviso por log es lo que queda de ese campo.
+ */
+function warnLegacyTelegramToken(route: string, data: unknown): void {
+  if (typeof data !== "object" || data === null || !("telegramToken" in data)) return;
+  console.warn(
+    `[pihub] ${route}: telegramToken es legado y se ignora; el canal de Telegram ` +
+      `se configura con PUT /api/v1/agents/<name>/channels`,
+  );
 }
 
 /** Aplica la decisión de `decideRuntimeAction` sobre el proceso del Runner. */
@@ -1551,14 +1987,134 @@ function scheduleGlobalReload(supervisor: Supervisor): void {
   }, 500);
 }
 
-/** Helper compartido por las rutas: traduce un código a su respuesta. */
-export function fail(
-  c: Context<ApiV1Env>,
-  code: ApiErrorCode,
-  message: string,
-) {
-  return c.json(
-    apiError(code, message, c.get("correlationId")),
-    HTTP_STATUS_BY_CODE[code] as ContentfulStatusCode,
-  );
-}
+    /** Helper compartido por las rutas: traduce un código a su respuesta. */
+    export function fail(
+      c: Context<ApiV1Env>,
+      code: ApiErrorCode,
+      message: string,
+    ) {
+      return c.json(
+        apiError(code, message, c.get("correlationId")),
+        HTTP_STATUS_BY_CODE[code] as ContentfulStatusCode,
+      );
+    }
+    
+    /**
+     * `:kind` de la ruta de canales. An unknown transport is a BAD_REQUEST, not a
+     * 404: the Agent exists and the channel does not — the difference the
+     * Dashboard has to be able to tell apart when it projects a kind this build
+     * does not ship.
+     */
+        function channelKindOfRoute(raw: string | undefined): ChannelKind | undefined {
+          return isChannelKind(raw) ? raw : undefined;
+        }
+    
+        /**
+         * Cursor del feed: entero ≥ 0 o `undefined`. Un `after` ilegible se rechaza
+         * en la ruta en vez de caer a 0 — caer a 0 re-dreanaría al Dashboard todo
+         * un historial ya proyectado, y el coste de ese error es silencio.
+         */
+        function feedCursorOf(raw: string | undefined): number | undefined {
+          if (raw === undefined || raw === "") return 0;
+          if (!/^\d+$/.test(raw)) return undefined;
+          const value = Number(raw);
+          return Number.isSafeInteger(value) ? value : undefined;
+        }
+    
+        /** Página acotada: el techo de `exchange-log.ts`, ni una consulta volcona. */
+        function feedLimitOf(raw: string | undefined): number {
+          const requested = raw === undefined || raw === "" ? NaN : Number(raw);
+          const base = Number.isFinite(requested)
+            ? Math.trunc(requested)
+            : EXCHANGE_FEED_DEFAULT_LIMIT;
+          return Math.min(Math.max(base, 1), EXCHANGE_FEED_MAX_LIMIT);
+        }
+    
+        /**
+         * Fila del espejo tal y como la consume D: el cursor (`seq`), el origen que
+         * la superficie web tiene que pintar, y el par de textos. Sin `agentName`
+         * repetido por fila (ya qualifica la respuesta) y sin ningún secreto.
+         */
+        function exchangeView(row: ChannelExchange) {
+          return {
+            seq: row.seq,
+            turnId: row.turnId,
+            origin: row.origin,
+            chatId: row.chatId,
+            userText: row.userText,
+            replyText: row.replyText,
+            createdAt: row.createdAt,
+          };
+        }
+    
+    /**
+     * Public view of the pairing machine. `state` is the BINDING (which chat the
+     * bot serves); `observedStatus` on the channel record stays the transport
+     * health — the two never overwrite each other (invariant I3). Pending chats
+     * are listed without their hashes: the Dashboard shows who is waiting, and
+     * the code is only ever known by the chat that asked for it.
+     */
+    function pairingView(pairing: ChannelPairing) {
+      return {
+        kind: pairing.kind,
+        state: pairing.state,
+        externalChatId: pairing.externalChatId,
+        pairedAt: pairing.pairedAt,
+        pendingChatIds: pairing.pending.map((row) => row.externalChatId),
+      };
+    }
+    
+    /**
+     * Superficie OBSERVADA de los canales de un Agent para el describe
+     * (`GET /agents/:name`, tasks c-I12). El Dashboard reconcilia contra UNA sola
+     * lectura, así que las filas de canales viajan aquí — pero solo la lista
+     * blanca observada:
+     *
+     * - `pairingState` / `externalChatId`: el VÍNCULO, hecho de la máquina de
+     *   pairing (`channels.json` no lo sabe: allí no se persiste a quién sirve
+     *   el bot).
+     * - `observedStatus` / `lastError` / `lastSeenAt`: la SALUD del transporte,
+     *   hecha del registro. Dos hechos distintos que nunca se sobrescriben (I3).
+     *
+     * Todo lo que pueda cargar un secreto (`token`, `tokenDigest`, el hash del
+     * código) y todo lo que es estado DESEADO (`label`, `updatedAt`) queda fuera:
+     * eso es de `GET …/channels`. Un describe nunca es la vía para leer una
+     * huella por fuera del Manager.
+     */
+    async function observedChannels(
+      dataDir: string,
+      pairing: PairingMachine,
+      name: string,
+    ) {
+      const records = await readChannelRecords(dataDir, name);
+      return Promise.all(
+        records.map(async (record) => {
+          const binding = await pairing.stateOf(name, record.kind);
+          return {
+            kind: record.kind,
+            pairingState: binding?.state ?? "unpaired",
+            externalChatId: binding?.externalChatId ?? null,
+            observedStatus: record.observedStatus,
+            lastError: record.lastError ?? null,
+            lastSeenAt: record.lastSeenAt ?? null,
+          };
+        }),
+      );
+    }
+    
+    /**
+     * A `PairingError` carries an `ApiErrorCode` verbatim — one closed catalogue,
+     * so the machine never needs to know HTTP. Anything else is an internal
+     * failure: logged with the correlation id, never described to the caller.
+     */
+    function pairingFailure(
+      c: Context<ApiV1Env>,
+      error: unknown,
+      what: string,
+    ) {
+      if (error instanceof PairingError) {
+        return fail(c, error.code, error.message);
+      }
+      console.error(`[api-v1] fallo en ${what}:`, c.get("correlationId"), error);
+      return fail(c, "INTERNAL_ERROR", "Could not process the pairing request");
+    }

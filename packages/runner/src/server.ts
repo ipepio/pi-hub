@@ -68,7 +68,10 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
       model: hub.modelId,
       streaming: hub.isStreaming,
       sessionId: hub.sessionId,
-      telegram: Boolean(config.telegramToken),
+      // Cutover slice (c) part 3b: el bot lo posee el Manager. El Runner ya no
+      // lee ningún token; la única señal de canal es la que inyecta
+      // `runnerEnvFor` (`PIHUB_CHANNEL_KINDS`) al spawn.
+      telegram: env.channelKinds.includes("telegram"),
       memory: env.memoryEnabled,
       stt: sttEnabled(env),
       tts: ttsEnabled(env),

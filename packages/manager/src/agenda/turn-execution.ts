@@ -40,6 +40,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ChannelKind } from "@pihub/channels";
 import WebSocket from "ws";
 import { hasLiveTurnForAgent } from "../api-v1/restart-policy.ts";
 import {
@@ -83,9 +84,32 @@ interface MensajeRunner {
  * metadata de despacho: no cambia el puente ni el mensaje `prompt` que el
  * Runner recibe.
  */
-export type TurnOrigin =
-  | { kind: "human" }
-  | { kind: "initiative"; initiativeId: string; cause: "trigger" | "callback" | "human" };
+    export type TurnOrigin =
+      | { kind: "human" }
+      | { kind: "initiative"; initiativeId: string; cause: "trigger" | "callback" | "human" }
+      /**
+       * Mensaje entrante de un canal (design §1.4): `channelKind` + `chatId` son
+       * lo que la entrega necesita para rutas (`delivery-router.ts`). El origen
+       * es METADATA del turno — el protocolo WS del Runner sigue sin conocerlo:
+       * un turno de canal se envía como `context: { kind: "human" }`, porque para
+       * el Runner «un mensaje que llega» ya es todo lo que significa.
+       */
+      | { kind: "channel"; channelKind: ChannelKind; chatId: string };
+
+    /**
+     * Turno terminado, tal y como lo ve el puente (design §1.4).
+     * Se emite con CUALQUIER terminal (`turn-complete`, `turn-aborted`,
+     * `turn-error`): el hook no decide nada, solo informa. `replyText` está vacío
+     * cuando el turno no produjo texto, y `userText` es el prompt que se envió.
+     */
+    export interface CompletedTurn {
+      readonly agentName: string;
+      readonly turnId: string;
+      readonly origin: TurnOrigin;
+      readonly userText: string;
+      readonly replyText: string;
+      readonly finalEvent: TurnSseEvent["event"];
+    }
 
 /** Comando de `startTurn`: todo lo que el puente necesita para abrir el turno. */
 export interface StartTurnCommand {
@@ -147,8 +171,15 @@ export interface TurnExecutionOptions {
   readonly requestId?: () => string;
   /** Duración capturada en `human_expires_at` al confirmar la pausa. */
   readonly expiryMs?: number;
-  /** Entrega posterior al COMMIT; callback fire-and-forget, nunca Promise. */
-  readonly onHumanRequest?: (request: HumanRequest) => void;
+      /** Entrega posterior al COMMIT; callback fire-and-forget, nunca Promise. */
+      readonly onHumanRequest?: (request: HumanRequest) => void;
+      /**
+       * Notificación de turno terminado (design §1.4): fire-and-forget, igual que
+       * `onHumanRequest`. Se invoca dentro de `finalizar`, antes de resolver
+       * `completion`, y un throw del consumidor NUNCA rompe el terminal — la
+       * entrega por canales es observable, no un prerequisito del turno.
+       */
+      readonly onTurnCompleted?: (turn: CompletedTurn) => void;
   /**
    * Watchdog de apertura/silencio (§4.6): si no llega `agent_start` en este
    * plazo desde `startTurn`, el turno se aborta con `turn-error`
@@ -204,6 +235,7 @@ export class TurnExecution {
   private readonly requestId: () => string;
   private readonly expiryMs: number;
   private readonly onHumanRequest: ((request: HumanRequest) => void) | undefined;
+  private readonly onTurnCompleted: ((turn: CompletedTurn) => void) | undefined;
   private readonly dispatchTimeoutMs: number;
   private readonly handshakeTimeoutMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
@@ -220,6 +252,7 @@ export class TurnExecution {
     // no duplicar aquí el default de configuración de `loadEnv`.
     this.expiryMs = options.expiryMs ?? 0;
     this.onHumanRequest = options.onHumanRequest;
+    this.onTurnCompleted = options.onTurnCompleted;
     this.dispatchTimeoutMs = options.dispatchTimeoutMs ?? 0;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     this.schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
@@ -279,8 +312,15 @@ export class TurnExecution {
         })
       : undefined;
 
-    let cerrado = false;
-    let timeoutHandle: TimerHandle | undefined;
+        let cerrado = false;
+        /**
+         * Respuesta acumulada del turno: `TurnExecution` es el único punto que ve
+         * todos los `text_delta` del Runner, así que aquí se forma el texto que
+         * después se entrega por el canal. Se reconstruye a partir del evento ya
+         * traducido (`chunk`) para no duplicar la tabla de equivalencias.
+         */
+        let replyText = "";
+        let timeoutHandle: TimerHandle | undefined;
     let handshakeTimeoutHandle: TimerHandle | undefined;
 
     /** `turn-error` público de una causa del catálogo (el código identifica la clase). */
@@ -359,27 +399,46 @@ export class TurnExecution {
       }
     };
 
-    /** Emite el terminal, cierra el socket, escribe T6 y resuelve `completion`. */
-    const finalizar = (terminal: TurnSseEvent, failureCause?: FailureCause) => {
-      if (cerrado || this.turnosVivos.get(clave)?.pausing) return;
-      cerrado = true;
-      cancelarTimeout();
-      cancelarHandshakeTimeout();
-      this.turnosVivos.delete(clave);
-      const escrituraFinal = emitir(terminal);
-      void escrituraFinal.then(
-        () => {
-          cerrarSocket();
-          escribirTerminalDurable(terminal, failureCause);
-          resolveCompletion(terminal);
-        },
-        () => {
-          cerrarSocket();
-          escribirTerminalDurable(terminal, failureCause);
-          resolveCompletion(terminal);
-        },
-      );
-    };
+        /**
+         * Notificación de turno terminado (design §1.4). Fire-and-forget y
+         * enmudecida contra fallos: si el router de entrega lanza, el terminal
+         * del SSE y la resolución de `completion` siguen su camino — un canal
+         * caído no puede convertir un turno correcto en un turno fallido.
+         */
+        const notificarTurnoCompletado = (terminal: TurnSseEvent): void => {
+          if (!this.onTurnCompleted) return;
+          try {
+            this.onTurnCompleted({
+              agentName,
+              turnId,
+              origin: command.origin,
+              userText: message,
+              replyText,
+              finalEvent: terminal.event,
+            });
+          } catch (error) {
+            console.error(`[pihub] TURN_COMPLETED_CALLBACK_FAILED ${clave}:`, error);
+          }
+        };
+
+        /** Emite el terminal, cierra el socket, escribe T6 y resuelve `completion`. */
+        const finalizar = (terminal: TurnSseEvent, failureCause?: FailureCause) => {
+          if (cerrado || this.turnosVivos.get(clave)?.pausing) return;
+          cerrado = true;
+          cancelarTimeout();
+          cancelarHandshakeTimeout();
+          this.turnosVivos.delete(clave);
+          const escrituraFinal = emitir(terminal);
+          const cerrar = () => {
+            cerrarSocket();
+            escribirTerminalDurable(terminal, failureCause);
+            // Antes de resolver `completion`: el consumidor del hook (el router)
+            // debe ver el turno cerrado, no a medias.
+            notificarTurnoCompletado(terminal);
+            resolveCompletion(terminal);
+          };
+          void escrituraFinal.then(cerrar, cerrar);
+        };
 
     /**
      * Intercepta el mensaje crudo antes de `toTurnEvent`: ese traductor no
@@ -511,6 +570,7 @@ export class TurnExecution {
 
       // El watchdog se apaga con la primera actividad del Runner.
       if (evento.event === "turn-start") cancelarTimeout();
+      if (evento.event === "chunk") replyText += String(evento.data.delta ?? "");
 
       const terminal =
         evento.event === "turn-complete" ||

@@ -15,6 +15,7 @@ import {
 } from "@pihub/shared";
 import path from "node:path";
 import { runnerEntry } from "./paths.js";
+import { readChannelRecords } from "./channels/store.js";
 
 /**
  * Env de memoria que se inyecta al runner. El dir de Shared Memory solo existe
@@ -38,12 +39,20 @@ export function memoryEnvFor(
   return memoryEnv;
 }
 
-/** Compone el entorno final del Runner a partir del entorno ya filtrado. */
+/** Compone el entorno final del Runner a partir del entorno ya filtrado.
+ *
+ * `channelKinds` (cutover, slice (c) part 3b): es la ÚNICA señal de canales que
+ * recibe el Runner. No hay ningún secreto aquí: el bot lo posee el Manager y el
+ * Runner solo necesita saber si hay un canal para su propio prompt de plataforma
+ * y para el booleano de `/api/status`. Se deja fuera cuando está vacío para que
+ * un arranque sin canales produzca un entorno idéntico al de antes.
+ */
 export function runnerEnvFor(
   storeEnv: NodeJS.ProcessEnv,
   env: PihubEnv,
   config: AgentConfig,
   callbackToken: string,
+  channelKinds: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const paths = agentPaths(env.dataDir, config.name);
   const globalDir = dataPaths(env.dataDir).globalDir;
@@ -54,7 +63,14 @@ export function runnerEnvFor(
     PI_CODING_AGENT_DIR: globalDir,
     PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
     ...memoryEnvFor(env, config),
+    // Antes del cutover este era también el camino por el que el Runner filtraba
+    // a qué usuarios respondía su propio bot. El allowlist dejó de tener efecto
+    // en el Runner; se conserva porque es la config de plataforma que el Agent
+    // puede inspeccionar, no porque la consuma nadie.
     PIHUB_TELEGRAM_ALLOWED_USERS: env.telegramAllowedUsers.join(","),
+    ...(channelKinds.length > 0
+      ? { PIHUB_CHANNEL_KINDS: channelKinds.join(",") }
+      : {}),
     PIHUB_RUNNER_CALLBACK_TOKEN: callbackToken,
     PIHUB_MANAGER_PORT: String(env.managerPort),
     // The Runner needs the service credential in its own env to (a) authorize
@@ -145,8 +161,18 @@ export class Supervisor {
       config.name,
       process.env,
     );
-    const callbackToken = this.callbackTokenSource();
-    const runnerEnv = runnerEnvFor(storeEnv, this.env, config, callbackToken);
+        const callbackToken = this.callbackTokenSource();
+        // Cutover (R3): el Runner no lee canales ni tokens — se lo dice este env.
+        const channelKinds = [
+          ...new Set((await readChannelRecords(this.env.dataDir, config.name)).map((record) => record.kind)),
+        ].sort();
+        const runnerEnv = runnerEnvFor(
+          storeEnv,
+          this.env,
+          config,
+          callbackToken,
+          channelKinds,
+        );
     const proc = spawn(process.execPath, [runnerEntry], {
       env: runnerEnv,
       cwd: paths.workspaceDir,
@@ -314,8 +340,20 @@ export class Supervisor {
   async statusOf(config: AgentConfig): Promise<AgentStatus> {
     const { state, pid } = this.state(config.name);
     // El token de Telegram nunca sale por la API: solo el boolean `telegram`.
+    // La redacción se QUEDA aunque el campo sea legado: un `agent.json` escrito
+    // antes del cutover, o editado a mano, no puede convertir `GET /agents` en un
+    // chorreo de credenciales.
     const { telegramToken: _telegramToken, ...safe } = config;
-    return { ...safe, state, pid, telegram: Boolean(config.telegramToken) };
+    // Cutover (part 3b): `telegram` pasa a ser OBSERVADO desde el canal, no desde
+    // el config del Runner. Un residuo legado en disco ya no pinta el chip del
+    // panel; lo que lo pinta es que exista un registro de canal proyectado.
+    const channelRecords = await readChannelRecords(this.env.dataDir, config.name);
+    return {
+      ...safe,
+      state,
+      pid,
+      telegram: channelRecords.some((record) => record.kind === "telegram"),
+    };
   }
 
   async stopAll(): Promise<void> {

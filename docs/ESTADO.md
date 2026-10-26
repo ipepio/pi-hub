@@ -7,7 +7,7 @@
 ## Verificado
 
 | Capacidad | Estado |
-|---|---|
+| --- | --- |
 | Manager HTTP (Hono), Supervisor y panel web | Funciona |
 | Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
 | API privada `/api/v1` | Funciona |
@@ -46,7 +46,7 @@ verificación separada contra un Manager real; no forma parte de `npm test`.
 ## Modos de Runtime
 
 | Modo | Configuración | Administración | Panel |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Gobernador** | `PIHUB_PANEL_ENABLED=true` | Operador local | Montado |
 | **Gobernado** | `PIHUB_PANEL_ENABLED=false` | Dashboard/control plane externo | No montado |
 
@@ -137,7 +137,7 @@ Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md)
 ## Dónde encontrar cada cosa
 
 | Necesidad | Documento |
-|---|---|
+| --- | --- |
 | Instalar, operar y entender los modos | [`../README.md`](../README.md) |
 | Contribuir y probar | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | Métodos y contrato HTTP | [`manager-api-v1.md`](manager-api-v1.md) |

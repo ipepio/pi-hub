@@ -13,6 +13,7 @@
     "@earendil-works/pi-coding-agent": "0.80.3",
     "@hono/node-server": "^1.13.0",
     "@js-temporal/polyfill": "0.5.1",
+    "@pihub/channels": "0.10.0",
     "@pihub/providers": "0.10.0",
     "@pihub/shared": "0.10.0",
     "hono": "^4.6.0",

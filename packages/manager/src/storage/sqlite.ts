@@ -3,6 +3,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runMigrations } from "./migrations.ts";
 import { AgendaRepository } from "../agenda/index.ts";
+import {
+  openChannelPersistence,
+  type ChannelPersistence,
+} from "../channels/persistence.ts";
 
 // Todo el acceso a SQLite del Manager pasa por este módulo. El driver es
 // `node:sqlite`, el módulo integrado de Node: pihub se instala como servicio
@@ -27,6 +31,13 @@ export interface SqliteDb {
 export interface ManagerStore {
   /** Repositorio de Agenda (barrel de `agenda/`). No expone el driver. */
   readonly agenda: AgendaRepository;
+  /**
+   * Persistencia de canales (migración v4: `channel_outbox` + `channel_exchanges`).
+   * Fachada estrecha, no el driver: `channels/persistence.ts` es la puerta para
+   * encolar dreñar y leer el espejo, igual que `agenda` encapsula su propio uso de
+   * SQLite. El `SqliteDb` crudo sigue sin salir de `storage/`.
+   */
+  readonly channels: ChannelPersistence;
   /** Ruta completa del fichero `.db` (los ficheros WAL/SHM viven a su lado). */
   readonly file: string;
   close(): void;
@@ -61,7 +72,12 @@ export async function openManagerStore(dataDir: string): Promise<ManagerStore> {
   const db = new DatabaseSync(file);
   configurePragmas(db);
   runMigrations(db);
-  return { agenda: new AgendaRepository(db), file, close: () => db.close() };
+    return {
+      agenda: new AgendaRepository(db),
+      channels: openChannelPersistence(db),
+      file,
+      close: () => db.close(),
+    };
 }
 
 /**

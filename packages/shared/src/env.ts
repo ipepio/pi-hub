@@ -19,6 +19,14 @@ export interface PihubEnv {
   oauthProviders: string[];
   telegramAllowedUsers: number[];
   /**
+   * Kinds de canal que el Manager tiene proyectados para ESTE Agent
+   * (`PIHUB_CHANNEL_KINDS`, lista separada por comas; la inyecta `runnerEnvFor`
+   * desde `channels.json`). Cutover slice (c) part 3b: es la única señal de
+   * canales que le queda al Runner — el bot lo posee el Manager, y el Runner no
+   * lee ningún secreto ni ningún token. Vacío = sin canales.
+   */
+  channelKinds: string[];
+  /**
    * Chat privado primario de Telegram para la entrega de preguntas humanas
    * (PIHUB_TELEGRAM_PRIMARY_CHAT_ID, [ÁRBITRO-1]): ausente = panel-only y
    * cero llamadas a Telegram (fail-closed). Debe ser miembro de
@@ -159,6 +167,7 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
   const telegramAllowedUsers = list(env.PIHUB_TELEGRAM_ALLOWED_USERS)
     .map(Number)
     .filter((n) => !Number.isNaN(n));
+  const channelKinds = [...new Set(list(env.PIHUB_CHANNEL_KINDS))];
   return {
     dataDir: env.PIHUB_DATA_DIR ?? "/data",
     apiToken: env.API_TOKEN ?? "",
@@ -175,6 +184,7 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): PihubEnv {
     platformPromptEnabled: bool(env.PIHUB_PLATFORM_PROMPT_ENABLED, true),
     oauthProviders: list(env.PIHUB_OAUTH_PROVIDERS),
     telegramAllowedUsers,
+    channelKinds,
     telegramPrimaryChatId: parseTelegramPrimaryChatId(
       env.PIHUB_TELEGRAM_PRIMARY_CHAT_ID,
       telegramAllowedUsers,

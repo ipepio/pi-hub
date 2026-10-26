@@ -2,7 +2,6 @@ import { loadEnv, readAgent, scrubProtectedProcessEnv } from "@pihub/shared";
 import { SessionFactory } from "./session.js";
 import { ChatHub } from "./hub.js";
 import { startServer } from "./server.js";
-import { startTelegram } from "./telegram.js";
 
 const env = loadEnv();
 const agentName = process.env.PIHUB_AGENT_NAME;
@@ -30,10 +29,8 @@ if (!config) {
 const factory = new SessionFactory(env, config);
 const hub = new ChatHub(factory);
 const server = startServer(env, config, hub, factory);
-const telegram = startTelegram(env, config, factory);
 
 function shutdown(): void {
-  telegram?.stop();
   hub.reset();
   server.close();
   process.exit(0);

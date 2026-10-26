@@ -767,3 +767,25 @@ El resto de errores del dominio:
    Manager/Runner, no una cola durable.
 6. `/api/v1` no debe ganar capacidades nuevas sin documentación y pruebas de
    contrato contra un Manager real.
+
+## 13. Channels (slice c de channels-and-mcp)
+
+Los canales son propiedad del Manager: el adapter vive acá (no en el Runner),
+el pairing es una máquina de estados propia, y la entrega saliente pasa por un
+outbox durable en SQLite (v4). El Runner quedó como endpoint puro de turnos.
+
+| Método | Path | Semántica |
+|---|---|---|
+| GET | `/api/v1/agents/:name/channels` | Superficie observada: `{channels:[...]}` con estado/`externalChatId`/`lastError`/`lastSeenAt`. Nunca expone tokens ni hashes. |
+| PUT | `/api/v1/agents/:name/channels` | Replace-all gobernado por el dashboard: `{channels:[{kind, label?, token?, tokenDigest?, pairingWindowEndsAt?}]}`. Schema estricto — campos de más rechazan. `token` ausente = sin credencial (nunca `""`). `pairingWindowEndsAt` null/ausente = ventana cerrada (tombstone del unbind manual). `[]` = remover todos (I2: detiene adapters, drena el outbox a estado terminal). |
+| POST | `/api/v1/agents/:name/channels/:kind/pairing` | Emite código de pairing para un chat que pide vincularse. Solo si no hay binding activo (no se roba un canal ya vinculado). |
+| POST | `/api/v1/agents/:name/channels/:kind/approve` | `{code, externalChatId}` — verifica el código (timing-safe) y vincula. Post-ventana siempre disponible. |
+| DELETE | `/api/v1/agents/:name/channels/:kind` | Desvincula/remueve: detiene adapter, limpia binding, drena outbox. |
+| GET | `/api/v1/agents/:name/channel-exchanges?after=<seq>` | Feed espejo de intercambios de canal (proyección-in para el dashboard), acotado. |
+
+Invariantes: el auto-pair solo vincula el primer chat dentro de la ventana
+proyectada; pasado ese punto, todo binding exige código + aprobación. El
+fingerprint de restart lleva `(kind, tokenDigest)` — jamás el token en claro.
+El token vive solo en el store del Manager; nunca en `agent.json`, snapshots
+ni logs. El apagado detiene los adapters entre `loop.stop` y
+`supervisor.stopAll`.

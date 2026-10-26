@@ -50,6 +50,15 @@ export interface ServerLike {
 }
 
 /**
+ * Cara del drenado del outbox (slice (c) part 3a, `channels/outbox-worker.ts`).
+ * Estructural: el arranque solo sabe que se puede arrancar y parar.
+ */
+export interface OutboxWorkerLike {
+  start(): void;
+  stop(options?: { graceMs?: number }): void | Promise<void>;
+}
+
+/**
  * Superficie del almacén que la composición usa: el `agenda` para la
  * recuperación y `close` (shutdown). Estructural a propósito: los tests
  * pueden pasar un fake de `agenda` y producción pasa el `ManagerStore` real.
@@ -86,8 +95,20 @@ export interface StartupDeps<
   openStore: () => Promise<S>;
   /** Providers del runtime; `initialize()` corre antes de la recuperación (protocolo §7.1). */
   providers: P;
-  /** Provisión declarativa de agentes (`provisionAgents(env)`). */
-  provision: () => Promise<void>;
+      /** Provisión declarativa de agentes (`provisionAgents(env)`). */
+      provision: () => Promise<void>;
+      /**
+       * Aserción del doble bot (cutover R3, `channels/cutover.ts`): si un Agent
+       * conserva el `telegramToken` legado EN CUANTO Convive con un canal
+       * proyectado, el Manager aborta. OPCIONAL porque el corte es transicional: el
+       * guard desaparece cuando ningún `agent.json` tenga ya el campo.
+       *
+       * Corre tras `provision` (es quien puede escribir configs) y ANTES de levantar
+       * un solo Runner, de publicar HTTP o de arrancar el Loop — el mismo criterio
+       * que `recoverRunningOnStartup`: mejor no arrancar que servir con dos dueños
+       * del mismo bot.
+       */
+      assertNoDoubleTelegramBot?: () => Promise<void>;
   /** Construye el Supervisor (`new Supervisor(env)`). */
   createSupervisor: () => Sup;
   /** Construye el `TurnExecution` compartido antes de `createApp` (D2); `store.agenda` queda disponible. */
@@ -98,11 +119,19 @@ export interface StartupDeps<
   createApp: (deps: { providers: P; supervisor: Sup; oauth: O; turns: T; store: S }) => A;
   /** Construye el `AgendaLoop` con el repo, el Supervisor y el `TurnExecution` compartidos. */
   createLoop: (deps: { store: S; supervisor: Sup; turns: T }) => Loop;
-  /** Publica HTTP (`serve`) — el último paso: nada despacha antes de recuperar. */
-  serve: (app: A) => ServerLike;
-}
-
-/** Piezas del arranque que `index.ts` conserva para shutdown y fases posteriores. */
+      /** Publica HTTP (`serve`) — el último paso: nada despacha antes de recuperar. */
+      serve: (app: A) => ServerLike;
+      /**
+       * Drenado del outbox de canales (slice (c) part 3a, §2.2): lo fabrica la
+       * composición de canales — necesita el almacén (tablas v4) y el
+       * `TurnExecution` compartido — y lo ARRANCA/PARA esta composición, porque el
+       * cuándo es un contrato de apagado, no una decisión de canal. OPCIONAL: un
+       * arranque sin canales no dreña nada.
+       */
+      createOutboxWorker?: (deps: { store: S; turns: T }) => OutboxWorkerLike | undefined;
+    }
+    
+    /** Piezas del arranque que `index.ts` conserva para shutdown y fases posteriores. */
 export interface StartupRuntime<
   S extends StartupStore,
   Sup extends SupervisorLike,
@@ -121,15 +150,42 @@ export interface StartupRuntime<
   readonly server: ServerLike;
   /** Resultado observable de la recuperación (log §7.3). */
   readonly recovery: StartupRecoveryResult;
+  /**
+   * Drenado del outbox (slice (c) part 3a): compuesto y ARRANCADO por `runStartup`
+   * después de `serve`, y parado por `shutdownRuntime`. `undefined` cuando el
+   * arranque no compone canales — el apagado de un Manager sin bot es idéntico al
+   * de antes.
+   */
+  readonly outbox?: OutboxWorkerLike;
 }
 
 /**
- * Superficie del shutdown (Fase 3.7, §9.7): las cuatro piezas que se cierran en
- * orden. Estructural a propósito: el test pasa fakes sin el arranque y `index.ts`
- * pasa el `StartupRuntime` real (el `store` solo necesita `close` aquí).
+ * Superficie del shutdown (Fase 3.7, §9.7): las piezas que se cierran en orden.
+ * Estructural a propósito: el test pasa fakes sin el arranque y `index.ts` pasa el
+ * `StartupRuntime` real (el `store` solo necesita `close` aquí).
+ *
+ * `channels` es OPCIONAL y va SEGUNDA — tras `loop.stop`, antes de
+ * `supervisor.stopAll`. Los `ChannelAdapter` los vive el Manager, no el Runner, así
+ * que nada los para si el apagado no los menciona: el bot seguiría haciendo
+ * long-polling durante el SIGTERM (y con systemd habría dos bots concurrentes en el
+ * reinicio). Después del loop, para que ningún turno de agenda produzca un mensaje
+ * nuevo que encolar; antes de los Runners, para que ningún inbound entre en un
+ * proceso que ya se está muriendo. Un arranque sin canales compuestos se apaga
+ * exactamente igual que antes — de ahí que el campo sea opcional.
  */
 export interface ShutdownRuntime {
   readonly loop: LoopLike;
+  /**
+   * Drenado del outbox (slice (c) part 3a), SEGUNDO en el apagado: después de
+   * `loop.stop` (ningún turno de agenda encola nada nuevo) y ANTES de parar los
+   * adapters (un envío todavía en vuelo necesita el transporte vivo para poder
+   * confirmarse). `stop()` deja de reclamar y espera la gracia máxima; lo que no
+   * se confirme se queda `in_flight` A PROPÓSITO — reinventarlo sería permitir que
+   * un segundo proceso envíe lo que el primero ya metió en la cable — y el lease
+   * de la siguiente arrancada es lo que lo devuelve a la cola.
+   */
+  readonly outbox?: OutboxWorkerLike;
+  readonly channels?: { stopAll(): Promise<void> };
   readonly supervisor: { stopAll(): Promise<void> };
   readonly store: { close(): void };
   readonly server: ServerLike;
@@ -189,13 +245,16 @@ export async function runStartup<
   await deps.providers.initialize(); //    3. Providers.initialize
   await deps.provision(); //              4. provisionAgents
 
+  // 4b. Cutover R3: nada arranca un Runner, nada publica HTTP, mientras dos
+  //     procesos puedan estar sondeando el mismo token de Telegram.
+  await deps.assertNoDoubleTelegramBot?.();
+
   // 5. Recuperación al arranque (§7.1): entre `provision` y `new Supervisor`.
   //    ADR 0007 + barrido `chain_deadline_at` en una sola tx (§7.2). Si lanza,
   //    `STARTUP_RECOVERY_FAILED` propaga y ni `startAll` ni `serve` se ejecutan
   //    (§7.4): el Manager aborta sin publicar HTTP y systemd reintenta.
-  const recovery = store.agenda.recoverRunningOnStartup(Date.now());
-  logRecovery(recovery);
-
+      const recovery = store.agenda.recoverRunningOnStartup(Date.now());
+      logRecovery(recovery);
   const supervisor = deps.createSupervisor(); // 6. new Supervisor
   await supervisor.startAll(); //              7. Supervisor.startAll
 
@@ -209,20 +268,37 @@ export async function runStartup<
   // 12. Fase 3.5 (§1.2, D2): el Loop se compone y arranca DESPUÉS de `serve`.
   const loop = deps.createLoop({ store, supervisor, turns });
   loop.start();
-
-  return { store, supervisor, turns, loop, app, server, recovery };
+    
+  // 13. Slice (c) part 3a: el corazón del outbox. Se compone sobre el
+  //     `TurnExecution` ya existente y se arranca al final, con el mismo
+  //     criterio que el Loop (D2): nada reclama antes de que el proceso esté
+  //     sirviendo y el estado durable sea consistente.
+  const outbox = deps.createOutboxWorker?.({ store, turns });
+  outbox?.start();
+    
+  return { store, supervisor, turns, loop, app, server, recovery, outbox };
 }
 
 /**
- * Orden del apagado (§1.3, D3; criterio verificable de Fase 3.7):
- * `loop.stop` PRIMERO — gracia acotada + abort de los turnos en vuelo; nunca
- * se escribe `failed` en shutdown — después `supervisor.stopAll()` (mata
- * Runners), `store.close()` (SQLite) y `server.close()` (HTTP). `loop.stop`
- * primero es lo que evita que un apagado marque como `failed` turnos que solo
- * fueron interrumpidos. `index.ts` la llama desde SIGTERM/SIGINT y luego sale.
- */
+  * Orden del apagado (§1.3, D3; criterio verificable de Fase 3.7):
+  * `loop.stop` PRIMERO — gracia acotada + abort de los turnos en vuelo; nunca
+  * se escribe `failed` en shutdown — después el drenado del outbox (deja de
+  * reclamar con los adapters aún vivos; slice (c) part 3a), `channels.stopAll`
+  * (para los bots), `supervisor.stopAll()` (mata Runners), `store.close()`
+  * (SQLite) y `server.close()` (HTTP). `loop.stop`
+  * primero es lo que evita que un apagado marque como `failed` turnos que solo
+  * fueron interrumpidos. `index.ts` la llama desde SIGTERM/SIGINT y luego sale.
+  */
 export async function shutdownRuntime(runtime: ShutdownRuntime): Promise<void> {
   await runtime.loop.stop();
+  if (runtime.outbox) {
+    console.log("[pihub] parando el drenado del outbox...");
+    await runtime.outbox.stop();
+  }
+  if (runtime.channels) {
+    console.log("[pihub] parando adapters de canal...");
+    await runtime.channels.stopAll();
+  }
   console.log("[pihub] parando agentes...");
   await runtime.supervisor.stopAll();
   runtime.store.close();

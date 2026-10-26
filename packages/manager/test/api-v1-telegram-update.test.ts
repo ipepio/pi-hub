@@ -3,23 +3,62 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readAgent, scaffoldAgentDirs, scaffoldGlobalDirs, writeAgent } from "@pihub/shared";
+import {
+  readAgent,
+  scaffoldAgentDirs,
+  scaffoldGlobalDirs,
+  writeAgent,
+  type AgentConfig,
+} from "@pihub/shared";
 import { createApiV1Router } from "../dist/api-v1/routes.js";
 import { Supervisor as RealSupervisor } from "../dist/supervisor.js";
+import { writeChannelRecords } from "../dist/channels/store.js";
 import type { Supervisor } from "../src/supervisor.ts";
 
-async function setup() {
+// Cutover (channels-and-mcp, slice (c) part 3b, proposal R3).
+//
+// Este fichero era LA prueba de que `telegramToken` movía el Runner: rotar el
+// token reiniciaba, quitarlo reiniciaba, y el booleano `telegram` salía del
+// config. Ese contrato caducó: el bot de Telegram ahora es del Manager
+// (`channels/registry.ts`) y lo que mueve la huella de arranque es el canal
+// proyectado (`restart-policy.ts: channels`), no un secreto del Agent.
+//
+// Lo que sigue vivo aquí es el contrato que el corte NO toca:
+// - un secreto jamás sale por la API (redacción de `statusOf`);
+// - un Agent parado nunca se arranca solo por un PATCH;
+// - la deprecación es TOLERANTE: un caller que siga mandando `telegramToken`
+//   recibe 200, no un 400 en medio de un reconcile (ventana de un release, R10),
+//   pero el campo no escribe nada.
+
+async function setup(): Promise<string> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "pihub-api-v1-telegram-"));
   await scaffoldGlobalDirs(dataDir);
   await scaffoldAgentDirs(dataDir, "agent");
   await writeAgent(dataDir, {
     name: "agent",
     port: 4100,
+    // Residuo de antes del corte: un `agent.json` real aún puede tenerlo.
     telegramToken: "old-token",
     enabled: true,
     createdAt: "2026-08-01T00:00:00.000Z",
   });
   return dataDir;
+}
+
+function statusOfFake(state: "running" | "stopped") {
+  return async (config: AgentConfig) => {
+    // Espejo de `Supervisor.statusOf`: el token se redacta SIEMPRE.
+    const { telegramToken: _telegramToken, ...safe } = config;
+    return {
+      ...safe,
+      state,
+      port: config.port,
+      pid: state === "running" ? 42 : undefined,
+      // Desde el corte, `telegram` viene del registro de canal, y aquí no hay
+      // ningún canal proyectado.
+      telegram: false,
+    };
+  };
 }
 
 function runningSupervisor(restarts: string[]): Supervisor {
@@ -29,16 +68,7 @@ function runningSupervisor(restarts: string[]): Supervisor {
       restarts.push(name);
     },
     stop: async () => {},
-    statusOf: async (config: { name: string; telegramToken?: string }) => {
-      const { telegramToken: _telegramToken, ...safe } = config;
-      return {
-        ...safe,
-        state: "running",
-        port: 4100,
-        pid: 42,
-        telegram: Boolean(config.telegramToken),
-      };
-    },
+    statusOf: statusOfFake("running"),
   } as unknown as Supervisor;
 }
 
@@ -54,107 +84,97 @@ function stoppedSupervisor(actions: string[]): Supervisor {
     stop: async () => {
       actions.push("stop");
     },
-    statusOf: async (config: { name: string; telegramToken?: string }) => {
-      const { telegramToken: _telegramToken, ...safe } = config;
-      return {
-        ...safe,
-        state: "stopped",
-        port: 4100,
-        telegram: Boolean(config.telegramToken),
-      };
-    },
+    statusOf: statusOfFake("stopped"),
   } as unknown as Supervisor;
 }
 
-test("statusOf nunca proyecta el token de Telegram y conserva el booleano", async () => {
-  const status = await new RealSupervisor({ dataDir: "/data" }).statusOf({
-    name: "agent",
-    port: 4100,
-    telegramToken: "secret-token",
-    enabled: true,
-    createdAt: "2026-08-01T00:00:00.000Z",
+function patch(dataDir: string, supervisor: Supervisor, body: unknown) {
+  const app = createApiV1Router({ dataDir, apiToken: "service-token" }, supervisor);
+  return app.request("http://pihub.test/agents/agent", {
+    method: "PATCH",
+    headers: {
+      authorization: "Bearer service-token",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
+}
 
-  assert.equal("telegramToken" in status, false);
-  assert.equal(status.telegram, true);
-});
-
-test("PATCH /agents/:name con el mismo telegramToken no reinicia el Runner", async () => {
+test("statusOf nunca proyecta el token legado y `telegram` ya no depende de él", async () => {
   const dataDir = await setup();
   try {
-    const restarts: string[] = [];
-    const supervisor = runningSupervisor(restarts);
-    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, supervisor);
+    const supervisor = new RealSupervisor({ dataDir } as never);
+    const config = await readAgent(dataDir, "agent");
+    assert.ok(config);
 
-    const response = await app.request("http://pihub.test/agents/agent", {
-      method: "PATCH",
-      headers: {
-        authorization: "Bearer service-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ telegramToken: "old-token" }),
-    });
+    const sinCanal = await supervisor.statusOf(config);
+    assert.equal("telegramToken" in sinCanal, false);
+    assert.equal(sinCanal.telegram, false, "un residuo legado ya no pinta un bot");
 
-    assert.equal(response.status, 200);
-    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, "old-token");
-    assert.deepEqual(restarts, []);
+    // Con el canal proyectado por el Dashboard, el booleano se vuelve cierto sin
+    // que ningún secreto entre en la respuesta.
+    await writeChannelRecords(dataDir, "agent", [
+      { kind: "telegram", observedStatus: "active", updatedAt: 1 },
+    ]);
+    const conCanal = await supervisor.statusOf(config);
+    assert.equal(conCanal.telegram, true);
+    assert.equal("telegramToken" in conCanal, false);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("PATCH /agents/:name acepta telegramToken para un Agent existente", async () => {
+test("PATCH /agents/:name con el MISMO telegramToken legado: 200, sin reinicio y sin escribirlo", async () => {
   const dataDir = await setup();
   try {
     const restarts: string[] = [];
-    const supervisor = runningSupervisor(restarts);
-    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, supervisor);
-
-    const response = await app.request("http://pihub.test/agents/agent", {
-      method: "PATCH",
-      headers: {
-        authorization: "Bearer service-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ telegramToken: "new-token" }),
+    const response = await patch(dataDir, runningSupervisor(restarts), {
+      telegramToken: "old-token",
     });
 
     assert.equal(response.status, 200);
-    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, "new-token");
-    assert.deepEqual(restarts, ["agent"]);
-    assert.doesNotMatch(await response.text(), /new-token/);
+    assert.deepEqual(restarts, [], "el campo legado no forma parte de la huella");
+    const onDisk = await readAgent(dataDir, "agent");
+    assert.equal("telegramToken" in (onDisk ?? {}), false, "no se persiste");
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("PATCH /agents/:name sin telegramToken no reinicia el Runner", async () => {
+test("PATCH /agents/:name con un telegramToken NUEVO tampoco rota ningún bot", async () => {
+  // Antes del corte este era el caso "rotar el token reinicia". Ahora rotar un
+  // token es `PUT /agents/:name/channels` (digest → huella); por el PATCH no pasa
+  // nada observable, y ni una palabra del secreto llega al cuerpo de la respuesta.
   const dataDir = await setup();
   try {
     const restarts: string[] = [];
-    const app = createApiV1Router(
-      { dataDir, apiToken: "service-token" },
-      runningSupervisor(restarts),
-    );
-
-    // Cuerpo vacío a propósito, no `{model: "new-model"}` como antes: con la
-    // huella de arranque (restart-policy.ts) un cambio de MODEL sí reinicia
-    // —es el bug 1 que se acaba de arreglar—, así que usarlo como "campo
-    // irrelevante" haría que este test afirmara justo lo contrario de lo que
-    // ahora es correcto. Lo que este test verifica es que un PATCH sin
-    // ningún campo no reinicia por sí solo.
-    const response = await app.request("http://pihub.test/agents/agent", {
-      method: "PATCH",
-      headers: {
-        authorization: "Bearer service-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({}),
+    const response = await patch(dataDir, runningSupervisor(restarts), {
+      telegramToken: "new-token",
     });
+    const body = await response.text();
 
     assert.equal(response.status, 200);
-    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, "old-token");
     assert.deepEqual(restarts, []);
+    assert.doesNotMatch(body, /new-token/);
+    assert.equal("telegramToken" in ((await readAgent(dataDir, "agent")) ?? {}), false);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("PATCH /agents/:name limpia el token legado que había en disco", async () => {
+  // Cualquier escritura del Manager por `/api/v1` purga el residuo: así el
+  // `agent.json` deja de ser nunca un camino por el que un secreto de canal
+  // llegue al Runner (el guard `channels/cutover.ts` protege el intervalo
+  // entre el despliegue y esa primera escritura).
+  const dataDir = await setup();
+  try {
+    const restarts: string[] = [];
+    const response = await patch(dataDir, runningSupervisor(restarts), {});
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(restarts, []);
+    assert.equal("telegramToken" in ((await readAgent(dataDir, "agent")) ?? {}), false);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
@@ -162,29 +182,18 @@ test("PATCH /agents/:name sin telegramToken no reinicia el Runner", async () => 
 
 test("PATCH /agents/:name de un Agent parado nunca lo arranca", async () => {
   const cases = [
-    { name: "mismo token", payload: { telegramToken: "old-token" } },
-    { name: "token distinto", payload: { telegramToken: "new-token" } },
+    { name: "mismo token legado", payload: { telegramToken: "old-token" } },
+    { name: "otro token legado", payload: { telegramToken: "new-token" } },
     { name: "token quitado", payload: { telegramToken: null } },
-    { name: "campo omitido", payload: { model: "new-model" } },
+    { name: "cambio de modelo", payload: { model: "new-model" } },
+    { name: "body vacío", payload: {} },
   ] as const;
 
   for (const currentCase of cases) {
     const dataDir = await setup();
     try {
       const actions: string[] = [];
-      const app = createApiV1Router(
-        { dataDir, apiToken: "service-token" },
-        stoppedSupervisor(actions),
-      );
-
-      const response = await app.request("http://pihub.test/agents/agent", {
-        method: "PATCH",
-        headers: {
-          authorization: "Bearer service-token",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(currentCase.payload),
-      });
+      const response = await patch(dataDir, stoppedSupervisor(actions), currentCase.payload);
 
       assert.equal(response.status, 200, currentCase.name);
       assert.deepEqual(actions, [], currentCase.name);
@@ -194,28 +203,18 @@ test("PATCH /agents/:name de un Agent parado nunca lo arranca", async () => {
   }
 });
 
-test("PATCH /agents/:name con telegramToken null quita el bot y reinicia el Runner", async () => {
+test("PATCH /agents/:name con telegramToken null es un no-op deprecado, no un reinicio", async () => {
   const dataDir = await setup();
   try {
     const restarts: string[] = [];
-    const app = createApiV1Router(
-      { dataDir, apiToken: "service-token" },
-      runningSupervisor(restarts),
-    );
-
-    const response = await app.request("http://pihub.test/agents/agent", {
-      method: "PATCH",
-      headers: {
-        authorization: "Bearer service-token",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ telegramToken: null }),
+    const response = await patch(dataDir, runningSupervisor(restarts), {
+      telegramToken: null,
     });
     const body = await response.text();
 
     assert.equal(response.status, 200);
-    assert.equal((await readAgent(dataDir, "agent"))?.telegramToken, undefined);
-    assert.deepEqual(restarts, ["agent"]);
+    assert.equal("telegramToken" in ((await readAgent(dataDir, "agent")) ?? {}), false);
+    assert.deepEqual(restarts, [], "quitar un campo legado no tumba un turno vivo");
     assert.match(body, /"telegram":false/);
     assert.doesNotMatch(body, /telegramToken/);
   } finally {

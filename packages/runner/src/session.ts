@@ -188,7 +188,7 @@ export class SessionFactory {
     return buildPlatformPrompt({
       agentName: this.config.name,
       memoryEnabled: this.env.memoryEnabled,
-      telegram: Boolean(this.config.telegramToken),
+      telegram: this.env.channelKinds.includes("telegram"),
       sessionType: this.sessionType,
     });
   }

@@ -11,6 +11,7 @@ import {
   writeAgent,
 } from "@pihub/shared";
 import { createApiV1Router } from "../dist/api-v1/routes.js";
+import { writeChannelRecords } from "../dist/channels/store.js";
 import type { Supervisor } from "../src/supervisor.ts";
 
 // Bug 4: la spec §4.3 promete GET /api/v1/agents/:name y no existía.
@@ -112,7 +113,85 @@ test("GET /agents/:name exige la credencial de servicio", async () => {
   }
 });
 
-test("GET /agents (listado) NO expone systemPrompt/envKeys/packages", async () => {
+// Slice (c) part 2b, item 1 (tasks c-I12): `GET /agents/:name` is the single
+// describe the Dashboard reconciles against, so the channel rows have to be
+// readable without a second round trip to `…/channels`. The whitelist is
+// OBSERVED state only — `kind`, `pairingState` (the binding), `externalChatId`,
+// `observedStatus` (transport health), `lastError`, `lastSeenAt`. Everything
+// that could carry a secret or a desired-state claim stays out:
+// `token`, `tokenDigest`, the pairing code hash, and even `label`/`updatedAt`,
+// which belong to `…/channels`.
+test("GET /agents/:name incluye channels[] SOLO con los campos observados de la lista blanca", async () => {
+  const dataDir = await setup();
+  try {
+    await writeChannelRecords(dataDir, "agent", [
+      {
+        kind: "telegram",
+        label: "bot principal",
+        tokenDigest: "a".repeat(64),
+        observedStatus: "error",
+        lastError: "401 Unauthorized",
+        lastSeenAt: 1_700_000_000_000,
+        updatedAt: 1_700_000_000_001,
+      },
+    ]);
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+
+    const response = await app.request("http://pihub.test/agents/agent", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const raw = await response.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.channels, [
+      {
+        kind: "telegram",
+        // Sin vínculo de pairing, el estado del BINDING es "unpaired" aunque la
+        // marca del transporte esté en "error": dos hechos distintos (I3).
+        pairingState: "unpaired",
+        externalChatId: null,
+        observedStatus: "error",
+        lastError: "401 Unauthorized",
+        lastSeenAt: 1_700_000_000_000,
+      },
+    ]);
+
+    // Ningún secreto ni huella: la proyección observada no puede servir para
+    // comparar tokens por fuera del Manager.
+    assert.equal(raw.includes("a".repeat(64)), false);
+    assert.doesNotMatch(raw, /tokenDigest/);
+    assert.doesNotMatch(raw, /pairingCodeHash/);
+    assert.doesNotMatch(raw, /"label"/);
+    assert.doesNotMatch(raw, /"updatedAt"/);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// I2 en la superficie describe: un Agent sin canales reporta `[]`, nunca
+// `undefined` — el dashboard diferencia "sin canales" de "campo no implementado".
+test("GET /agents/:name sin canales reporta channels: [] (nunca undefined)", async () => {
+  const dataDir = await setup();
+  try {
+    const app = createApiV1Router({ dataDir, apiToken: "service-token" }, fakeSupervisor());
+
+    const response = await app.request("http://pihub.test/agents/agent", {
+      method: "GET",
+      headers: { authorization: "Bearer service-token" },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.ok(Array.isArray(body.channels));
+    assert.deepEqual(body.channels, []);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+    test("GET /agents (listado) NO expone systemPrompt/envKeys/packages", async () => {
   const dataDir = await setup();
   try {
     await fs.writeFile(agentPaths(dataDir, "agent").systemPromptFile, "Persona secreta.", "utf8");
