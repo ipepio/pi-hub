@@ -22,6 +22,7 @@ import {
   type AgentPaths,
   type ModelInfo,
   type PihubEnv,
+  channelKindsOf,
   ASK_HUMAN_TOOL_NAME,
   type SessionType,
 } from "@pihub/shared";
@@ -191,7 +192,7 @@ export class SessionFactory {
     return buildPlatformPrompt({
       agentName: this.config.name,
       memoryEnabled: this.env.memoryEnabled,
-      telegram: this.env.channelKinds.includes("telegram"),
+      telegram: channelKindsOf(this.env).includes("telegram"),
       sessionType: this.sessionType,
     });
   }
