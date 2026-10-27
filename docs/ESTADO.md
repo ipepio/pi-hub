@@ -1,10 +1,22 @@
 # Estado de pihub
 
-> Última verificación: **2026-09-04** · versión **v0.10.0** · release publicada
-> desde HEAD `05515f9` con digest
-> `ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4`.
+> Última verificación: **2026-10-26** · versión **v0.11.0** · release de
+> branch `feat/channels-and-mcp` (cutover de canales, change
+> `channels-and-mcp`) — **pendiente**: merge a main, build/publicación de
+> imagen y digest. La release publicada anterior es v0.10.0 (HEAD `05515f9`,
+> digest
+> `ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4`).
 
-## Verificado
+## Verificado (0.11.0, branch)
+
+- Targeted suites del change de canales: 873+ tests, 0 fail (`channels-*`,
+  `api-v1-*`, storage, agenda, runner, shared; el root `npm test` sigue
+  sub-seleccionando suites).
+- Typecheck: 0 errores (7 workspaces).
+- Verificación integral del change (matriz + checklist de deploy):
+  `goguest-ai-dashboard-new/openspec/changes/archive/channels-and-mcp/verify-report.md`.
+
+## Verificado (0.10.0, publicada)
 
 | Capacidad | Estado |
 | --- | --- |

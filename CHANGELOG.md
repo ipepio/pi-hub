@@ -5,6 +5,50 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-26
+
+### Added
+
+- **Canales Manager-owned (cutover de canales)**: el bot de Telegram vive en el
+  Manager (`packages/channels`, seam `ChannelAdapter` + adapter de grammy) — el
+  Runner queda como endpoint puro de turnos y `agent.json` ya no lleva
+  `telegramToken`. La única señal de canales que le queda al Runner es
+  `PIHUB_CHANNEL_KINDS` (sin secretos ni tokens).
+- **Pairing gobernado**: auto-pair del primer chat dentro de la ventana
+  proyectada por el dashboard (1 h); fuera de ventana, código + aprobación
+  (comparación timing-safe); unbind manual no re-arma la ventana
+  (`pairing_window_closed_at`).
+- **Outbox durable en SQLite (v4)**: entrega saliente con reserva, backoff
+  exponencial, idempotencia por `external_message_id` y drain a estado
+  terminal; sobrevive restarts del Manager.
+- **Delivery-by-origin + espejo projection-in**: el chat de Telegram comparte
+  la sesión principal del agent; lo hablado por web no se empuja al canal, lo
+  del canal se refleja en la web (feed `GET /agents/:name/channel-exchanges`
+  + tabla `channel_exchanges`); lo proactivo va a ambos.
+- **Superficie observada**: `GET /agents/:name` expone `channels[]` (estado
+  observado del Manager, lista blanca cerrada — jamás tokens ni hashes).
+- **Apagado ordenado**: los adapters se detienen entre `loop.stop` y
+  `supervisor.stopAll`; un arranque sin canales compuestos se apaga igual que
+  antes.
+
+### Changed
+
+- **Cutover**: `agent.json.telegramToken` dejó de escribirse y leerse; el
+  fingerprint de restart lleva `(kind, tokenDigest)` — nunca el token en
+  claro. El guard de doble bot limpia el residuo con warning (no aborta el
+  arranque). Migración de esquema a v4 (`channel_outbox`).
+- `PIHUB_TELEGRAM_ALLOWED_USERS` queda como segunda línea de defensa; su
+  re-enforcement por el adapter es follow-up.
+
+### Known issues (heredados, no regresiones de 0.11.0)
+
+- La idempotencia de la ruta de turnos sigue siendo in-memory (la reserva
+  durable de Agenda existe pero no está cableada a esa ruta).
+- El guard CSRF del panel legacy `/api/*` mantiene su hueco histórico.
+- `PIHUB_TELEGRAM_ALLOWED_USERS` no se re-fuerza todavía (ver Changed).
+
+
+
 ## [0.10.0] — 2026-09-04
 
 ### Added
