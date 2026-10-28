@@ -35,7 +35,7 @@ import {
   readSystemPrompt,
   updateAgent,
 } from "../agents.js";
-import { TurnExecution } from "../agenda/turn-execution.js";
+import { TurnExecution, type TurnHandle } from "../agenda/turn-execution.js";
 import { DomainError } from "../agenda/errors.js";
 import { listModels } from "../models.js";
 import {
@@ -67,6 +67,7 @@ import {
   isDuplicateTurn,
   rememberTurn,
   type TurnEventProfile,
+  type TurnSseEvent,
 } from "./turns.js";
 import { diffPackages } from "./package-sync.js";
 import {
@@ -1826,20 +1827,37 @@ export function createApiV1Router(
     if (yaVisto !== undefined) {
       return c.json({ turnId: yaVisto, duplicate: true });
     }
-    rememberTurn(turnosVistos, idempotencyKey, turnId);
 
     const estado = await supervisor.statusOf(config);
     if (estado.state !== "running") {
       return fail(c, "RESOURCE_UNAVAILABLE", "Agent is not running");
     }
 
+    // Admisión (T4a, S2): `startTurn` reserva el turno del Agent de forma
+    // SÍNCRONA antes de crear el socket del Runner. Si el Agent ya tiene un
+    // turno vivo —de la web, de Telegram o de una Initiative— esta ruta
+    // responde `409 TURN_IN_PROGRESS` en JSON **antes** de abrir el SSE: un
+    // 200 con un stream que nunca ejecuta mentiría sobre lo que ha pasado.
+    //
+    // Los eventos pueden llegar antes de que exista el stream, así que se
+    // encolan y se vuelcan en orden en cuanto `streamSSE` arranca (el puente
+    // entrega un evento solo cuando el anterior se entregó, así que el orden
+    // del volcado y el de los eventos posteriores no se cruzan).
+    const pendientes: Array<{ evento: TurnSseEvent; liberar: () => void }> = [];
+    let escribir: ((evento: TurnSseEvent) => Promise<void>) | undefined;
+    const entregar = (evento: TurnSseEvent): Promise<void> => {
+      if (escribir) return escribir(evento);
+      return new Promise<void>((liberar) => pendientes.push({ evento, liberar }));
+    };
+
     // Puente WebSocket → SSE (Fase 3.1): el puente WS→eventos→terminal vive
     // en `TurnExecution` (compartido con el Loop); esta ruta es un adaptador
     // fino que traduce los eventos a SSE. El Runner solo acepta prompts por
     // WS (`/ws`), y la spec §7 prohíbe exponer WebSockets al dashboard: el
     // Manager traduce. El puerto del Runner NUNCA sale de aquí.
-    return streamSSE(c, async (stream) => {
-      const handle = turns.startTurn({
+    let handle: TurnHandle;
+    try {
+      handle = turns.startTurn({
         agentName: name,
         turnId,
         idempotencyKey,
@@ -1849,16 +1867,39 @@ export function createApiV1Router(
         runnerPort: estado.port,
         eventProfile,
         origin: { kind: "human" },
-        onEvent: (evento) =>
-          stream.writeSSE({
-            event: evento.event,
-            data: JSON.stringify(evento.data),
-          }),
+        onEvent: entregar,
       });
+    } catch (error) {
+      if (error instanceof DomainError && error.code === "TURN_IN_PROGRESS") {
+        return fail(c, "TURN_IN_PROGRESS", "Agent already has a live turn");
+      }
+      throw error;
+    }
+
+    // La key se recuerda SOLO cuando el turno está aceptado. Recordarla antes
+    // de la admisión envenenaba el reintento: el caller recibía
+    // `{duplicate:true}` de un turno que nunca ejecutó. Un turno aceptado
+    // conserva exactamente su semántica idempotente de la spec §5.
+    rememberTurn(turnosVistos, idempotencyKey, turnId);
+
+    return streamSSE(c, async (stream) => {
+      const enviar = (evento: TurnSseEvent) =>
+        stream.writeSSE({
+          event: evento.event,
+          data: JSON.stringify(evento.data),
+        });
+
+      escribir = enviar;
+      for (const { evento, liberar } of pendientes.splice(0)) {
+        await enviar(evento);
+        liberar();
+      }
 
       // Si el cliente se va, se corta el turno: mantener el WS abierto
       // contra un Runner que sigue generando sería una fuga. El cliente ya
-      // no puede recibir un terminal, así que este camino no escribe SSE.
+      // no puede recibir un terminal, así que este camino no escribe SSE. La
+      // admisión se libera con el terminal que produce ese corte, nunca por
+      // el corte en sí.
       stream.onAbort(() => handle.disconnect());
       await handle.completion;
     });

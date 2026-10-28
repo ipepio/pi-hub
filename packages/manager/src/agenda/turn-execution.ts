@@ -23,7 +23,10 @@
  *   la ruta original (§4.6) desaparece;
  * - un envío del prompt que falla tras aceptar el turno → `turn-error`
  *   (causa `dispatch_failed`);
- * - `disconnect()` (el cliente se fue) → `turn-error` (`runner_unavailable`).
+ * - `disconnect()` (el cliente HTTP/SSE se fue) **no** es un terminal: pide al
+ *   Runner que aborte y el turno conserva la admisión hasta el terminal real
+ *   (`close`/`agent_end` → `turn-aborted`). El sink de ese cliente queda anulado
+ *   (ya no puede recibir nada), así que ese terminal no se entrega a nadie.
  *
  * Cuando se inyecta el repositorio durable (Fase 3.2: tests y futuro Loop),
  * el terminal se escribe además con `turns.complete` en la misma transacción
@@ -55,7 +58,12 @@ import type { RunnerCapability } from "@pihub/shared";
 
 /** Turno vivo con WS abierto contra el Runner (clave `agentName:turnId`). */
 interface TurnoVivo {
-  ws: WebSocket;
+  /**
+   * Socket contra el Runner. `undefined` solo entre la reserva de admisión de
+   * `startTurn` y la creación del socket: no hay `await` en medio, así que
+   * ningún observador externo ve una reserva sin socket.
+   */
+  ws: WebSocket | undefined;
   abortRequested: boolean;
   /** Latch de la tx de pausa: ningún terminal tardío puede ganarle al COMMIT. */
   pausing: boolean;
@@ -145,7 +153,11 @@ export interface TurnHandle {
    * después de confirmar durablemente `waiting_human`.
    */
   readonly waitingHuman?: Promise<{ initiativeId: string; requestId: string } | null>;
-  /** El cliente se fue (abort del stream SSE): corta el WS contra el Runner y produce terminal. */
+  /**
+   * El cliente se fue (abort del stream SSE). **No** es un terminal: se pide al
+   * Runner que aborte y el turno sigue contando para la admisión hasta que el
+   * Runner cierre de verdad. El sink de este cliente deja de recibir eventos.
+   */
   disconnect(): void;
 }
 
@@ -280,6 +292,15 @@ export class TurnExecution {
    * una pausa cuyo write falla, que conserva ambos canales pendientes.
    * Un `close` sin terminal limpio, error de conexión o timeout publican
    * `turn-error` en vez del cierre mudo de la ruta original.
+   *
+   * **Admisión (T4a, S2)**: un Agent ejecuta como máximo UN turno, sin importar
+   * el origen (web, Telegram o autonomía). La comprobación y la reserva son
+   * SÍNCRONAS y ocurren ANTES de crear el socket: dos llamadas en el mismo tick
+   * no pueden colarse entre «mirar» y «abrir», y un turno rechazado no deja
+   * ningún WS abierto contra el Runner. La reserva se libera SOLO por el
+   * terminal (o por la pausa humana durable), nunca por un abort ni porque el
+   * cliente se vaya. Un segundo turno del mismo Agent lanza `DomainError`
+   * `TURN_IN_PROGRESS` (→ `409` en `/api/v1`).
    */
   startTurn(command: StartTurnCommand): TurnHandle {
     const {
@@ -292,11 +313,29 @@ export class TurnExecution {
       onEvent,
     } = command;
 
-    const ws = this.createWebSocket(
-      `ws://127.0.0.1:${runnerPort}/ws?sessionKey=${encodeURIComponent(sessionKey)}`,
-    );
-
     const clave = `${agentName}:${turnId}`;
+
+    if (this.hasLiveTurnForAgent(agentName)) {
+      throw new DomainError(
+        "TURN_IN_PROGRESS",
+        `agent "${agentName}" already has a live turn`,
+      );
+    }
+    const turno: TurnoVivo = { ws: undefined, abortRequested: false, pausing: false };
+    this.turnosVivos.set(clave, turno);
+
+    let ws: WebSocket;
+    try {
+      ws = this.createWebSocket(
+        `ws://127.0.0.1:${runnerPort}/ws?sessionKey=${encodeURIComponent(sessionKey)}`,
+      );
+    } catch (error) {
+      // Sin socket no hay ningún camino que libere la reserva: o se libera
+      // aquí o el Agent queda bloqueado para siempre.
+      this.turnosVivos.delete(clave);
+      throw error;
+    }
+    turno.ws = ws;
 
     let resolveCompletion!: (terminal: TurnSseEvent) => void;
     const completion = new Promise<TurnSseEvent>((resolve) => {
@@ -352,11 +391,18 @@ export class TurnExecution {
     // terminal cerraría el stream antes de que su propia escritura se
     // vaciara y `turn-complete` NO llegaría nunca al cliente — encontrado
     // con un turno real, no en los tests unitarios.
-    let escrituras: Promise<void> = Promise.resolve();
-    const emitir = (evento: TurnSseEvent): Promise<void> => {
-      escrituras = escrituras.then(() => onEvent?.(evento) ?? Promise.resolve());
-      return escrituras;
-    };
+        let escrituras: Promise<void> = Promise.resolve();
+        /**
+         * Salida hacia el cliente HTTP/SSE de ESTE turno. `disconnect()` la anula:
+         * el cliente ya no está, así que ni sus eventos ni el terminal posterior se
+         * le entregan (el terminal se escribe igual en T6 y resuelve `completion`).
+         * Es por turno, no de la instancia: un turno nuevo no hereda una desconexión.
+         */
+        let sink = onEvent;
+        const emitir = (evento: TurnSseEvent): Promise<void> => {
+          escrituras = escrituras.then(() => sink?.(evento) ?? Promise.resolve());
+          return escrituras;
+        };
 
     const cerrarSocket = () => {
       try {
@@ -521,13 +567,13 @@ export class TurnExecution {
     };
 
     ws.on("open", () => {
-      if (cerrado) {
+      // La entrada del registro ya existe: la puso la reserva de admisión antes
+      // de crear este socket, así que aquí NO se reemplaza (borraría un
+      // `abortRequested` marcado en el intervalo).
+      if (cerrado || this.turnosVivos.get(clave) !== turno) {
         cerrarSocket();
         return;
       }
-      // Registrado solo tras `open`: mandar `{type:"abort"}` antes de que el
-      // WS esté realmente conectado no es seguro.
-      this.turnosVivos.set(clave, { ws, abortRequested: false, pausing: false });
 
       // No se envía el prompt inmediatamente: se espera `ready` del Runner.
       // El handshake tiene su propio watchdog (P3.1): si el Runner no envía
@@ -625,7 +671,13 @@ export class TurnExecution {
     return {
       completion,
       ...(waitingHuman ? { waitingHuman } : {}),
-      disconnect: () => finalizar(turnError("runner_unavailable"), "runner_unavailable"),
+          // El cliente se fue, pero la ejecución sigue: se pide el abort y el slot
+          // se conserva hasta el terminal real del Runner. Liberar aquí admitiría
+          // un segundo turno contra un Runner que aún está trabajando (S2).
+          disconnect: () => {
+            sink = undefined;
+            this.abort(agentName, turnId);
+          },
     };
   }
 
@@ -641,12 +693,18 @@ export class TurnExecution {
     if (!turno) return false;
 
     turno.abortRequested = true;
+    const ws = turno.ws;
+    if (ws === undefined) {
+      // Reserva de admisión todavía sin socket: el abort queda marcado y el
+      // cierre, cuando exista, publica `turn-aborted`. La admisión NO se libera.
+      return true;
+    }
     try {
-      turno.ws.send(JSON.stringify({ type: "abort" }));
+      ws.send(JSON.stringify({ type: "abort" }));
     } catch {
       // El close del socket resolverá el turno con turn-aborted igualmente.
       try {
-        turno.ws.close();
+        ws.close();
       } catch {
         // Ya estaba cerrado.
       }

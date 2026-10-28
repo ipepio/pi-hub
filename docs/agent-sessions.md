@@ -1,11 +1,11 @@
 # Sesiones de un Agent (catálogo durable)
 
 Esta nota describe el **catálogo durable de sesiones** que el Manager estrena en la
-unidad T3 del ODD `odd/tasks/agent-session-workspace.md` (specs S2 y S7). Es el
-sustrato de identidad sobre el que se apoyarán la admisión de un único turno
-cross-origin (T4), el transcript compartido (T5) y los comandos de sesión de
-Telegram (T6); ninguno de esos comportamientos está implementado todavía y este
-documento no los promete.
+unidad T3 del ODD `odd/tasks/agent-session-workspace.md` (specs S2 y S7), y la
+**admisión de un único turno por Agent** de la unidad T4a. Es el sustrato de
+identidad sobre el que se apoyarán el transcript compartido (T5) y los comandos de
+sesión de Telegram (T6); ninguno de esos dos comportamientos está implementado
+todavía y este documento no los promete.
 
 ## Modelo
 
@@ -187,9 +187,152 @@ Un Agent a medias dejaría el historial anterior disponible para el siguiente qu
 reutilice el nombre; purgar después de borrar el directorio respondería 500 sobre
 un Agent que ya no está.
 
-## Lo que esta unidad NO hace
+## Admisión: un turno por Agent (T4a)
 
-- No bloquea sesiones concurrentes ni admite un único turno cross-origin (T4).
+S2 exige «at most one executing turn across web, Telegram and autonomy». La regla
+vive en **un solo sitio**, `TurnExecution.startTurn` (`agenda/turn-execution.ts`),
+que es el puente compartido por la ruta HTTP `POST /agents/:name/turns`, el
+inbound de canales y el Loop de autonomía:
+
+- la comprobación y la reserva son **síncronas** y ocurren **antes** de crear el
+  socket contra el Runner: dos peticiones en el mismo tick no pueden colarse entre
+  «mirar» y «abrir», y un turno rechazado no deja ningún WS abierto;
+- un segundo turno del **mismo** Agent se rechaza con el `DomainError`
+  `TURN_IN_PROGRESS`, que la frontera HTTP traduce al código cerrado del catálogo:
+  `409 TURN_IN_PROGRESS`. En `POST /api/v1/agents/:name/turns` la respuesta es
+  **JSON y sale antes de abrir el SSE**, así que un rechazo nunca se disfraza de
+  `200` con un stream que no ejecuta nada;
+- no se mira el `sessionKey` ni el origen: el turno de una sesión B del mismo
+  Agent mientras la sesión A ejecuta también se rechaza. Agents **distintos**
+  siguen ejecutando en paralelo;
+- la admisión se libera **solo** por el terminal existente (`turn-complete`,
+  `turn-aborted`, `turn-error`) o por la pausa humana durable. `POST
+  …/turns/:turnId/abort` **no** la libera: el abort marca el turno y el Agent
+  sigue ocupado hasta que el Runner cierra. Tampoco la libera que el cliente
+  HTTP/SSE se vaya: `disconnect()` **pide el mismo abort** contra el Runner y el
+  turno conserva su sitio en la admisión hasta el terminal real, que es lo único
+  que libera. Ese corte no publica ningún terminal propio, y el sink de ese
+  cliente queda anulado, así que el terminal posterior no se entrega a un stream
+  que ya no existe (se escribe igual en el repositorio durable);
+- la `idempotencyKey` se recuerda **solo** cuando el turno fue aceptado. Una
+  petición rechazada por ocupado no queda envenenada — el mismo caller puede
+  reintentar con la misma key cuando el Agent quede libre — y un replay de un
+  turno ya aceptado sigue devolviendo `{turnId, duplicate:true}` sin ejecutar
+  (spec §5).
+
+## Qué hace cada origen no HTTP cuando su turno es rechazado (T4b)
+
+La admisión es del `TurnExecution`; la **política** del origen que se queda fuera
+es de cada origen, y estas son las dos que existen:
+
+- **Inbound de canales** (`channels/inbound.ts`). Un mensaje de un chat enlazado
+  cuyo turno se rechaza por ocupado **no se ejecuta** y **no se queda en la cola**
+  para ejecutarse por sorpresa después: se descarta, se registra en el log y el
+  usuario recibe por el mismo outbox —con la misma política de reintento que el
+  resto de mensajes de sistema— un aviso del catálogo `channels/labels.ts` que
+  dice que el mensaje no se ha ejecutado y que puede volver a enviarlo cuando el
+  turno en curso termine. Nunca se abre un segundo turno ni se simula una
+  respuesta del modelo. El aviso va **solo** al chat enlazado: el emparejamiento
+  se resuelve antes, así que un remitente ajeno no recibe nada.
+  El drenado consume **todos** sus rechazos (resolver, cola u outbox): cada fallo
+  se registra y el drenado sigue con el mensaje siguiente de esa cola, sin dejar
+  promesas rechazadas sin consumidor y sin perder el drenado futuro. Un outbox
+  caído no tumba el proceso.
+- **Loop de autonomía** (`agenda/loop.ts`). Antes de reclamar, el Loop consulta la
+  MISMA autoridad (`TurnExecution.hasLiveTurnForAgent`) de forma síncrona y sin
+  ningún `await` entre la lectura, el claim y `startTurn`. Si el Agent tiene un
+  turno vivo —humano, de canal o de otra Initiative— su Initiative sigue
+  `queued`: no se reclama ningún turno, no se marca `failed` y no se quema nada.
+  El Agent ocupado no gasta el slot del dial, así que otro Agent inactivo arranca
+  en el mismo tick; cuando el turno ajeno termina, el `tick` periódico reevalúa y
+  la despacha. La matriz `errored`/`stopped` y el round-robin entre Agents no
+  cambian.
+
+Lo que sigue abierto en **T4c**, y este documento no promete todavía: la
+reconciliación tras un reinicio del Manager (su registro de turnos vivos es en
+memoria, así que un Manager recién arrancado podría admitir un segundo turno
+contra un Runner que sigue ejecutando — el Runner ya lo rechaza, ver abajo, pero
+el Manager aún no lo presenta como `409`) y la parte del fencing del Supervisor
+que no es el puerto. La semántica de `disconnect()` **sí** está hecha (pide abort
+y no libera, ver arriba) y el arranque del Supervisor ya está fenced contra un
+puerto ocupado (ver la sección siguiente).
+
+## Defensa del Runner: una ejecución por proceso (T4c, parcial)
+
+La admisión del Manager es en memoria: si el Manager se reinicia, o si su propio
+proceso pierde la conexión, el Manager puede creer que el Agent está libre
+mientras el Runner sigue ejecutando. Por eso la defensa **autoritativa**
+vive también en el proceso que tiene la `AgentSession`, y ya está implementada:
+
+- **Una gate por Runner** (`packages/runner/src/execution-gate.ts`), compartida
+  por el hub por defecto y todos los hubs keyed (`SessionHubRegistry` se la
+  adjunta a cada `ChatHub`, incluido el que construye el arranque). No es un
+  singleton global: dos Agents en procesos distintos no se ven.
+- **Admisión síncrona antes del primer `await`**, es decir antes de crear la
+  `AgentSession`: dos prompts del mismo tick no pueden colarse entre «mirar» y
+  «crear». La gate se mantiene hasta que la promesa del `prompt` del SDK se
+  asienta, que en el SDK instalado (0.80.3) ocurre **después** de `agent_end`
+  (`_runAgentPrompt` → `agent.finishRun`).
+- **Sin cola**: un segundo prompt se rechaza con `ExecutionBusyError`
+  (`code: "TURN_IN_PROGRESS"`, código de protocolo interno). No se encola como
+  `followUp` del SDK, porque se ejecutaría más tarde sin que nadie lo pidiera.
+- **El error del rechazo va solo al socket que lo pidió.** El borde WS nunca
+  difunde el rechazo al hub del turno activo: un `error` ahí se leería como un
+  terminal falso. Una promesa rechazada sin consumidor tumbaría el Runner, así
+  que `prompt`, `abort`, `new_session` y `set_model` siempre tienen consumidor.
+- **El abort no libera la admisión**: lo hace el asentamiento real del SDK. Una
+  petición de abort, un cliente que se desconecta o un observador que se va no
+  pueden soltar la ejecución de otra generación.
+- **`new_session`, `reset()` y `set_model` no tocan una generación en curso**:
+  `new_session`/`set_model` se rechazan mientras el turno corre (la ruta HTTP
+  `POST /api/session/new` responde con el error del hub) y `reset()` —que también
+  usan la recarga de recursos y el apagado— se ignora en silencio con log en vez
+  de descartar la sesión que ejecuta.
+
+    Lo que esta defensa **no** hace todavía: reconciliar el estado del Manager tras
+    su reinicio, preservar el turno cuando el Manager pide `abort`, ni aplicar un
+    protocolo de propiedad del puerto entre procesos. T4c no está terminado.
+
+    ## Fencing del arranque del Supervisor (T4c, parcial)
+
+    Antes de abrir el log del Runner y de spawnearlo, el Supervisor comprueba que el
+    puerto del Agent **se pueda atar en exclusiva**. Es un fence *fail-closed*: si el
+    puerto ya está ocupado, ese arranque no ocurre. La decisión es **rechazar**, no
+    adoptar ni reclamar: no se habla con el ocupante, no se asume que sea un Runner
+    de un Manager anterior ni se le manda ninguna señal.
+
+    - **Dónde vive.** En el camino común `spawnRunner` (`supervisor.ts`), no en
+      `start`: así quedan fenced el arranque inicial (`startAll`/`start`) y también el
+      **auto-reinicio** tras una salida inesperada.
+    - **Cómo se mide.** Un `net.createServer().listen({ host, port, exclusive: true })`
+      sobre la MISMA dirección que ata el Runner real (`0.0.0.0`), cerrado antes del
+      spawn y acotado a 5 s. La dirección importa: en Darwin un socket que escucha en
+      `127.0.0.1:P` no impide atar `0.0.0.0:P` (y al revés), así que sondear otra
+      dirección daría falsos «libre» en esta máquina. `EADDRINUSE` produce un error
+      explícito y cualquier otro fallo de bind (permisos, dirección no disponible)
+      también rechaza: no se arranca `a ciegas`.
+    - **Qué ve el usuario.** `start()` rechaza, el Agent queda `stopped` (nunca
+      «en marcha») y `runnerPortOf()` devuelve `undefined`, así que el panel no
+      pinta un Runner que no existe. Ni siquiera se abre `runner.log` ni se emite la
+      credencial de callback del spawn.
+    - **Auto-reinicio.** El rechazo del fence durante un auto-reinicio se consume y se
+      registra dentro de `supervisor.ts`: sin ese consumidor sería un
+      `unhandledRejection` que tumbaría el Manager entero. El Agent sigue `stopped` y
+      el fallo queda en el log; el arranque inicial, en cambio, sí ve el error.
+    - **Idempotencia.** Si el Supervisor ya tiene un hijo vivo de ese Agent, `start()`
+      devuelve sin sondear nada.
+
+    Lo que este fence **no** hace y no se debe leer como si lo hiciera: no cierra la
+    ventana entre el sondeo y el bind del Runner (TOCTOU), no prueba propiedad del
+    puerto y no implementa ningún protocolo de traspaso. La garantía de una sola
+    ejecución por Agent sigue siendo la gate del Runner. Consecuencia operativa: si
+    quedó un Runner huérfano (por ejemplo, un proceso suelto de un Manager anterior)
+    el Supervisor **se niega** a arrancar ese Agent hasta que el puerto quede libre;
+    entonces basta con arrancar/`restart` del Agent, y si no queda libre porque el
+    Manager entero conserva estado viejo, un reinicio completo del runtime.
+
+    ## Lo que esta unidad NO hace
+
 - No persiste ni sirve el transcript completo (T5).
 - No expone comandos `/new`, `/sessions`, `/session` en Telegram (T6).
 - No reanuda el contexto del Runner tras un reinicio por sí mismo: la continuidad

@@ -12,6 +12,8 @@ import {
 import type { InboundMessage } from "@pihub/channels";
 import { PairingMachine } from "../src/channels/pairing.ts";
 import { writeChannelRecords, type ChannelRecord } from "../src/channels/store.ts";
+import { systemLabel } from "../src/channels/labels.ts";
+import { DomainError } from "../src/agenda/errors.ts";
 import {
   ChannelInboundHandler,
   INBOUND_QUEUE_DEPTH,
@@ -224,7 +226,190 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
   });
 });
 
-describe("ChannelInboundHandler — auto-pair consumption (item 2)", () => {
+    describe("ChannelInboundHandler — Agent ocupado (S2 / T4b)", () => {
+      it("no ejecuta un segundo turno: contesta por el outbox con UN aviso de sistema", async () => {
+        const dataDir = await setup();
+        await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);
+        const pairing = new PairingMachine({ dataDir });
+        await pairing.requestPairing("agent", "telegram", "12345");
+
+        // El turno vivo de OTRO origen (la web) es lo que rechaza `startTurn` en
+        // producción: aquí se simula con el MISMO DomainError.
+        const vivo = { live: true };
+        const pasados: StartTurnCommand[] = [];
+        const turns = {
+          startTurn(command: StartTurnCommand): TurnHandle {
+            if (vivo.live) {
+              throw new DomainError(
+                "TURN_IN_PROGRESS",
+                `agent "${command.agentName}" already has a live turn`,
+              );
+            }
+            pasados.push(command);
+            return {
+              completion: Promise.resolve({
+                event: "turn-complete",
+                data: { turnId: command.turnId },
+              } as TurnSseEvent),
+              disconnect(): void {},
+            };
+          },
+        } as unknown as Pick<import("../src/agenda/turn-execution.ts").TurnExecution, "startTurn">;
+
+        const enqueued: Array<{ chatId: string; text: string }> = [];
+        const logs: string[] = [];
+        const handler = new ChannelInboundHandler({
+          dataDir,
+          pairing,
+          turns,
+          resolveRunner: async () => ({ port: 4100 }),
+          enqueue: ((input) => {
+            enqueued.push({ chatId: input.chatId, text: input.text });
+          }) satisfies EnqueueFn,
+          log: (line) => logs.push(line),
+        });
+
+        await handler.handleAsync("agent", "telegram", inbound("hola", "1"));
+        await handler.idle();
+
+        assert.equal(pasados.length, 0, "el mensaje no se ejecutó: ni un turno del modelo");
+        assert.deepEqual(
+          enqueued,
+          [{ chatId: "12345", text: systemLabel("turnBusy") }],
+          "exactamente un aviso de sistema al chat ENLAZADO, con el texto del catálogo",
+        );
+        assert.equal(
+          handler.queueDepth("agent", "telegram"),
+          0,
+          "el mensaje rechazado no se queda en la cola para ejecutarse por sorpresa",
+        );
+        assert.ok(logs.some((line) => line.includes("busy")), `rechazo registrado: ${logs.join("|")}`);
+
+        // El turno vivo del Agent termina: el reenvío del usuario SÍ se ejecuta.
+        vivo.live = false;
+        await handler.handleAsync("agent", "telegram", inbound("hola", "2"));
+        await handler.idle();
+        assert.equal(pasados.length, 1, "el reintento posterior ejecuta el turno");
+        assert.equal(pasados[0]!.message, "hola");
+        assert.equal(enqueued.length, 1, "el reintento no repite el aviso de ocupado");
+      });
+
+      it("un outbox roto no deja una promesa rechazada suelta y el drenado sigue vivo", async () => {
+        const dataDir = await setup();
+        await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);
+        const pairing = new PairingMachine({ dataDir });
+        await pairing.requestPairing("agent", "telegram", "12345");
+
+        const vivo = { live: true };
+        const pasados: StartTurnCommand[] = [];
+        const turns = {
+          startTurn(command: StartTurnCommand): TurnHandle {
+            if (vivo.live) {
+              throw new DomainError("TURN_IN_PROGRESS", "agent ocupado");
+            }
+            pasados.push(command);
+            return {
+              completion: Promise.resolve({
+                event: "turn-complete",
+                data: { turnId: command.turnId },
+              } as TurnSseEvent),
+              disconnect(): void {},
+            };
+          },
+        } as unknown as Pick<import("../src/agenda/turn-execution.ts").TurnExecution, "startTurn">;
+
+        const logs: string[] = [];
+        const handler = new ChannelInboundHandler({
+          dataDir,
+          pairing,
+          turns,
+          resolveRunner: async () => ({ port: 4100 }),
+          enqueue: () => {
+            throw new Error("outbox roto");
+          },
+          log: (line) => logs.push(line),
+        });
+
+        // `unhandledRejection` es el síntoma real del bug: un `void
+        // next.finally(...)` dejaba una promesa derivada rechazada sin consumidor.
+        const sinConsumidor: unknown[] = [];
+        const observador = (reason: unknown): void => {
+          sinConsumidor.push(reason);
+        };
+        process.on("unhandledRejection", observador);
+        try {
+          await handler.handleAsync("agent", "telegram", inbound("hola", "1"));
+          await handler.idle();
+          await tick();
+          await tick();
+          assert.deepEqual(
+            sinConsumidor,
+            [],
+            "un outbox caído se registra; no puede tumbar el proceso",
+          );
+          assert.ok(
+            logs.some((line) => line.includes("outbox roto")),
+            `el fallo del outbox queda registrado: ${logs.join("|")}`,
+          );
+          assert.equal(handler.queueDepth("agent", "telegram"), 0);
+
+          // El drenado NO se perdió: el mismo chat vuelve a ejecutar al liberarse.
+          vivo.live = false;
+          await handler.handleAsync("agent", "telegram", inbound("hola", "2"));
+          await handler.idle();
+          assert.equal(pasados.length, 1, "el drenado posterior sigue funcionando");
+        } finally {
+          process.off("unhandledRejection", observador);
+        }
+      });
+
+      it("un fallo del resolver se registra y no pierde los mensajes que vienen detrás", async () => {
+        const dataDir = await setup();
+        await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);
+        const pairing = new PairingMachine({ dataDir });
+        await pairing.requestPairing("agent", "telegram", "12345");
+
+        const sink = fakeTurns();
+        const logs: string[] = [];
+        let intentos = 0;
+        const handler = new ChannelInboundHandler({
+          dataDir,
+          pairing,
+          turns: sink.turns,
+          resolveRunner: async () => {
+            intentos += 1;
+            if (intentos === 1) throw new Error("resolver roto");
+            return { port: 4100 };
+          },
+          enqueue: () => {},
+          log: (line) => logs.push(line),
+        });
+
+        await handler.handleAsync("agent", "telegram", inbound("primero", "1"));
+        await handler.handleAsync("agent", "telegram", inbound("segundo", "2"));
+        await tick();
+        await tick();
+        assert.deepEqual(
+          sink.commands.map((command) => command.message),
+          ["segundo"],
+          "el mensaje cuyo resolver falló se registra y el siguiente se ejecuta",
+        );
+        assert.ok(logs.some((line) => line.includes("resolver roto")), logs.join("|"));
+
+        sink.started[0]!();
+        await handler.idle();
+      });
+    });
+
+    describe("ChannelInboundHandler — catálogo de labels de sistema (S4)", () => {
+      it("el aviso de ocupado dice que el mensaje NO se ejecutó y que se puede reintentar", () => {
+        const texto = systemLabel("turnBusy");
+        assert.match(texto, /no se ha ejecutado/i, "el usuario debe saber que su mensaje no corrió");
+        assert.match(texto, /vuelve a enviarlo/i, "y que puede reintentar cuando termine el turno");
+      });
+    });
+
+    describe("ChannelInboundHandler — auto-pair consumption (item 2)", () => {
   it("ventana abierta: el primer mensaje enlaza el chat y ADEMÁS se procesa", async () => {
     const dataDir = await setup();
     await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);

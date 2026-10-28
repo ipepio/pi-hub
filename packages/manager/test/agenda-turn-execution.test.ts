@@ -32,6 +32,7 @@ import {
   type TimerHandle,
   type TurnSseEvent,
 } from "../src/agenda/turn-execution.ts";
+import { DomainError } from "../src/agenda/errors.ts";
 import type { SqliteDb } from "../src/storage/sqlite.ts";
 import { runMigrations } from "../src/storage/migrations.ts";
 import { AgendaRepository } from "../src/agenda/index.ts";
@@ -96,44 +97,67 @@ function insertRunningInitiative(
  * Envía `ready` automáticamente al conectar (P3.1 handshake).
  * @param behavior - función que configura handlers de mensajes en el socket
  * @param capabilities - capacidades a anunciar en `ready` (vacío = legacy)
+ * @param readyDelayMs - retraso del `ready`; un valor alto deja abierta la
+ *   ventana entre `open` y el despacho del prompt (abort antes del despacho)
  */
-async function startRunner(
-  behavior: (socket: FakeRunnerSocket) => void,
-  capabilities?: string[],
-): Promise<{ port: number; close: () => Promise<void> }> {
-  const runner = new WebSocketServer({ port: 0 });
-  await new Promise<void>((resolve) => runner.once("listening", () => resolve()));
-  const address = runner.address();
-  assert.ok(address && typeof address === "object");
-  runner.on("connection", (socket) => {
-    const s = socket as unknown as FakeRunnerSocket;
-    // P3.1: enviar ready después de que el cliente haya registrado sus handlers
-    setTimeout(() => {
-      const readyMsg: Record<string, unknown> = {
-        type: "ready",
-        agent: "test-agent",
-        sessionId: "test-session",
-      };
-      if (capabilities && capabilities.length > 0) {
-        readyMsg.capabilities = capabilities;
-      }
-      s.send(JSON.stringify(readyMsg));
-    }, 5);
-    behavior(s);
-  });
-  let closed = false;
-  const close = () =>
-    new Promise<void>((resolve) => {
-      if (closed) {
-        resolve();
-        return;
-      }
-      closed = true;
-      runner.close(() => resolve());
-    });
-  openRunners.push(close);
-  return { port: address.port, close };
-}
+    async function startRunner(
+      behavior: (socket: FakeRunnerSocket) => void,
+      capabilities?: string[],
+      readyDelayMs = 5,
+    ): Promise<{ port: number; close: () => Promise<void> }> {
+      const runner = new WebSocketServer({ port: 0 });
+      await new Promise<void>((resolve) => runner.once("listening", () => resolve()));
+      const address = runner.address();
+      assert.ok(address && typeof address === "object");
+      /**
+       * Clientes que ESTE runner fake abrió. El teardown los termina antes de
+       * cerrar el servidor: `server.close()` solo llama a su callback cuando no
+       * queda ningún cliente, así que un handshake a medio abrir colgaba el
+       * suite entero. Solo se tocan los sockets de este `startRunner`: nunca se
+       * busca ni se mata ningún proceso ajeno al test.
+       */
+      const clients: WebSocket[] = [];
+      runner.on("connection", (socket) => {
+        clients.push(socket);
+        const s = socket as unknown as FakeRunnerSocket;
+        // P3.1: enviar ready después de que el cliente haya registrado sus handlers
+        setTimeout(() => {
+          // El socket pudo cerrarse antes (abort en la ventana de handshake): un
+          // `ready` sobre un socket cerrado es ruido, no parte del escenario.
+          if (socket.readyState !== socket.OPEN) return;
+          const readyMsg: Record<string, unknown> = {
+            type: "ready",
+            agent: "test-agent",
+            sessionId: "test-session",
+          };
+          if (capabilities && capabilities.length > 0) {
+            readyMsg.capabilities = capabilities;
+          }
+          s.send(JSON.stringify(readyMsg));
+        }, readyDelayMs);
+        behavior(s);
+      });
+      let closed = false;
+      const close = () =>
+        new Promise<void>((resolve) => {
+          if (closed) {
+            resolve();
+            return;
+          }
+          closed = true;
+          for (const client of clients.splice(0)) {
+            if (client.readyState === client.CLOSED) continue;
+            try {
+              client.terminate();
+            } catch {
+              // Ya estaba cerrado.
+            }
+          }
+          runner.close(() => resolve());
+        });
+      openRunners.push(close);
+      return { port: address.port, close };
+    }
 
 /** Comando base de `startTurn` para los tests. */
 function command(overrides: Partial<StartTurnCommand> = {}): StartTurnCommand {
@@ -180,7 +204,35 @@ class EventCollector {
   }
 }
 
-function fakeSupervisor(port: number): Supervisor {
+    /** Espera a que una condición observable del Runner se cumpla (cota externa). */
+    async function waitUntil(
+      predicate: () => boolean,
+      message: string,
+      timeoutMs = 2000,
+    ): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error(message);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+
+    /** Espera una promesa con cota: un terminal que no llega falla, no cuelga el suite. */
+    async function within<T>(promise: Promise<T>, message: string, timeoutMs = 2000): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+
+    function fakeSupervisor(port: number): Supervisor {
   return {
     state: () => ({ state: "running", pid: 42 }),
     statusOf: async () => ({ state: "running", port, pid: 42 }),
@@ -458,46 +510,153 @@ describe("TurnExecution — el puente WS→eventos→terminal (Fase 3.1 + 3.2)",
     ]);
   });
 
-  it("disconnect() (el cliente se fue) corta el WS y resuelve completion con turn-error", async () => {
-    let resolveServerClosed!: () => void;
-    const serverClosed = new Promise<void>((resolve) => {
-      resolveServerClosed = resolve;
-    });
-    const runner = await startRunner((socket) => {
-      socket.on("close", () => resolveServerClosed());
-      socket.on("message", (raw) => {
-        const message = JSON.parse(String(raw)) as { type?: string };
-        if (message.type === "prompt") socket.send(JSON.stringify({ type: "agent_start" }));
+      it("disconnect() pide abort y mantiene la admisión hasta el terminal real del Runner", async () => {
+        const aborts: string[] = [];
+        const sockets: FakeRunnerSocket[] = [];
+        const runner = await startRunner((socket) => {
+          sockets.push(socket);
+          socket.on("message", (raw) => {
+            const message = JSON.parse(String(raw)) as { type?: string };
+            if (message.type === "prompt") socket.send(JSON.stringify({ type: "agent_start" }));
+            // El Runner NO cierra el turno al recibir el abort: sigue trabajando
+            // hasta que el test decide el desenlace. Esa ventana es exactamente lo
+            // que la admisión del Manager debe seguir protegiendo.
+            if (message.type === "abort") aborts.push(message.type);
+          });
+        });
+
+        const turns = new TurnExecution({ apiToken: "service-token" });
+        const collector = new EventCollector();
+        const handle = turns.startTurn(
+          command({ runnerPort: runner.port, onEvent: (e) => collector.push(e) }),
+        );
+
+        await collector.waitFor((e) => e.event === "turn-start");
+        assert.equal(turns.hasLiveTurnForAgent("agent"), true);
+
+        handle.disconnect();
+
+        // La despedida del cliente se traduce en un abort REAL contra el Runner…
+        await waitUntil(() => aborts.length === 1, "el abort no llegó al Runner");
+        // …y NO en un terminal: la admisión sigue tomada porque el Runner sigue
+        // ejecutando. Un cliente que se va no prueba que la ejecución haya cesado.
+        assert.equal(
+          turns.hasLiveTurnForAgent("agent"),
+          true,
+          "la desconexión del cliente no libera el Agent",
+        );
+        assert.equal(turns.hasAnyLiveTurn(), true);
+        assert.throws(
+          () => turns.startTurn(command({ turnId: "turn-2", runnerPort: runner.port })),
+          (error: unknown) =>
+            error instanceof DomainError && error.code === "TURN_IN_PROGRESS",
+          "un segundo turno del mismo Agent sigue rechazado con el abort en vuelo",
+        );
+        assert.equal(sockets.length, 1, "el turno rechazado no abre un segundo socket");
+
+        // El WS NO se cierra por la despedida: el turno vive hasta el terminal del
+        // Runner (un `send` sobre un socket cerrado lanzaría aquí).
+        sockets[0].send(JSON.stringify({ type: "agent_end" }));
+        const terminal = await within(
+          handle.completion,
+          "el terminal no llegó tras el agent_end del Runner",
+        );
+        assert.equal(terminal?.event, "turn-aborted");
+        assert.equal(turns.hasLiveTurnForAgent("agent"), false);
+        assert.equal(turns.hasAnyLiveTurn(), false);
+
+        // Solo con el terminal real se admite el turno siguiente del Agent.
+        const segundo = turns.startTurn(command({ turnId: "turn-2", runnerPort: runner.port }));
+        await waitUntil(() => sockets.length === 2, "el segundo turno no llegó al Runner");
+        sockets[1].send(JSON.stringify({ type: "agent_end" }));
+        assert.equal(
+          (await within(segundo.completion, "el segundo turno no terminó")).event,
+          "turn-complete",
+        );
       });
-    });
 
-    const turns = new TurnExecution({ apiToken: "service-token" });
-    const collector = new EventCollector();
-    const handle = turns.startTurn(command({ runnerPort: runner.port, onEvent: (e) => collector.push(e) }));
+      it("un sink SSE que rechaza tras la desconexión no cuelga ni duplica el terminal", async () => {
+        const sockets: FakeRunnerSocket[] = [];
+        const runner = await startRunner((socket) => {
+          sockets.push(socket);
+          socket.on("message", (raw) => {
+            const message = JSON.parse(String(raw)) as { type?: string };
+            if (message.type === "prompt") socket.send(JSON.stringify({ type: "agent_start" }));
+            if (message.type === "abort") {
+              // El terminal llega DESPUÉS de que el cliente se fue: su sink ya no
+              // acepta nada, y aun así el turno debe cerrarse una sola vez.
+              socket.send(JSON.stringify({ type: "text_delta", delta: "tarde" }));
+              socket.send(JSON.stringify({ type: "agent_end" }));
+            }
+          });
+        });
 
-    await collector.waitFor((e) => e.event === "turn-start");
-    assert.equal(turns.hasLiveTurnForAgent("agent"), true);
+        const turns = new TurnExecution({ apiToken: "service-token" });
+        const entregados: string[] = [];
+        let clienteFuera = false;
+        const handle = turns.startTurn(
+          command({
+            runnerPort: runner.port,
+            onEvent: (evento) => {
+              if (clienteFuera) throw new Error("el stream SSE ya está cerrado");
+              entregados.push(evento.event);
+            },
+          }),
+        );
 
-    handle.disconnect();
-    const terminal = await handle.completion;
-    // Fase 3.2: el corte también es un terminal — no puede haber un turno
-    // aceptado sin terminal.
-    assert.equal(terminal?.event, "turn-error");
-    assert.equal(turns.hasLiveTurnForAgent("agent"), false);
-    assert.equal(turns.hasAnyLiveTurn(), false);
+        await waitUntil(() => entregados.includes("turn-start"), "el turno no arrancó");
+        clienteFuera = true;
+        handle.disconnect();
 
-    // El WS contra el Runner se cortó de verdad: no queda una fuga generando.
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("el WS del Runner no se cerró tras disconnect()")),
-        1000,
-      );
-      void serverClosed.then(() => {
-        clearTimeout(timer);
-        resolve();
+        const terminal = await within(
+          handle.completion,
+          "un sink caído colgó el terminal del turno",
+        );
+        assert.equal(terminal?.event, "turn-aborted");
+        assert.deepEqual(
+          entregados,
+          ["turn-start"],
+          "un sink caído no recibe más eventos ni fabrica un terminal",
+        );
+        assert.equal(turns.hasLiveTurnForAgent("agent"), false);
       });
-    });
-  });
+
+      it("un abort pedido antes del despacho no ejecuta el prompt", async () => {
+        const prompts: unknown[] = [];
+        const sockets: FakeRunnerSocket[] = [];
+        // `ready` tardío: la ventana entre `open` y el despacho queda abierta.
+        const runner = await startRunner(
+          (socket) => {
+            sockets.push(socket);
+            socket.on("message", (raw) => {
+              const message = JSON.parse(String(raw)) as { type?: string };
+              if (message.type === "prompt") prompts.push(message);
+              // El abort pedido antes del despacho cierra el socket, igual que
+              // el Runner real cuando no hay nada que ejecutar: sin ese cierre
+              // el turno no tendría ningún terminal posible y el test colgaría.
+              if (message.type === "abort") socket.close();
+            });
+          },
+          undefined,
+          50,
+        );
+
+        const turns = new TurnExecution({ apiToken: "service-token" });
+        const handle = turns.startTurn(command({ runnerPort: runner.port }));
+        await waitUntil(() => sockets.length === 1, "el socket no llegó al Runner");
+
+        // El socket ya está abierto pero el turno aún no se despachó.
+        assert.equal(turns.abort("agent", TURN_ID), true);
+
+        const terminal = await within(handle.completion, "el turno no terminó tras el abort");
+        assert.equal(terminal?.event, "turn-aborted");
+        assert.deepEqual(
+          prompts,
+          [],
+          "un turno cancelado antes del despacho no ejecuta nada en el Runner",
+        );
+        assert.equal(turns.hasLiveTurnForAgent("agent"), false);
+      });
 
   it("el registro distingue turnos por Agent y libera cada uno al terminar", async () => {
     // El Runner fake no manda `agent_end` hasta recibir `abort`: así el turno

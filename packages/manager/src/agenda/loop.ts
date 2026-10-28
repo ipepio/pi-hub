@@ -5,8 +5,10 @@
  * El dispatcher central: saca Initiatives `queued` de las Agendas y las
  * ejecuta como turnos por `TurnExecution`, respetando el dial de concurrencia
  * global y la exclusión por Agent (ADR 0004: nunca dos Initiatives del mismo
- * Agent en paralelo; un humano sí puede conversar mientras una corre). Vive en
- * `agenda/loop.ts` (D1), arranca después de `serve` (D2) y compone el cierre
+ * Agent en paralelo). Desde T4a/T4b (S2) un Agent ejecuta **un solo turno en
+ * total**, así que un turno humano o de canal vivo también lo excluye: su
+ * Initiative sigue `queued` hasta que ese turno termine (ver `dispatchStep`).
+ * Vive en `agenda/loop.ts` (D1), arranca después de `serve` (D2) y compone el cierre
  * de `runStartup` **antes** de `stopAll` (§1.3, D3).
  *
  * Orden del `tick` (§2.1): barridos T9/T10 → disparo de Triggers `schedule`
@@ -33,8 +35,13 @@
  * inexistente devuelve `stopped` en `supervisor.state` y se trata igual que
  * `stopped` (tensión señalada en §5.1, no resuelta: se queda `queued`).
  *
- * Despacho (§4.5, §4.2): claim unificado (`claimInitiative`, T7+T2 en una
- * sola tx) y después `TurnExecution.startTurn`. El Loop espera el primer canal
+ * Despacho (§4.5, §4.2): admisión, claim unificado (`claimInitiative`, T7+T2
+ * en una sola tx) y después `TurnExecution.startTurn`. Los tres pasos son
+ * SÍNCRONOS y consecutivos: entre la lectura de
+ * `hasLiveTurnForAgent` y el claim no hay ningún `await`, así que no queda
+ * ventana para que un turno ajeno se cuele. Si el Agent ya tiene un turno vivo,
+ * la Initiative ni se reclama ni se marca `failed`; el `tick` periódico la
+ * reevalúa. El Loop espera el primer canal
  * que resuelva entre el terminal SSE público (`completion`) y la pausa durable
  * interna (`waitingHuman`). En ambos casos libera su handle local y hace
  * wakeup; no cierra nada: T6 o `pauseRunningForHuman` ya hicieron la escritura
@@ -81,6 +88,15 @@ export interface LoopSupervisor {
 export interface LoopTurnExecution {
   startTurn(command: StartTurnCommand): TurnHandle;
   abort(agentName: string, turnId: string): boolean;
+  /**
+   * ¿Tiene el Agent un turno VIVO, de cualquier origen? Es la MISMA autoridad que
+   * rechaza un segundo turno (`TurnExecution.hasLiveTurnForAgent`), no una copia
+   * del estado durable: el registro de turnos vivos tiene un solo dueño.
+   *
+   * El Loop la consulta de forma SÍNCRONA antes del claim (S2 / T4b): un Agent
+   * ocupado por un turno humano o de canal no puede ejecutar una Initiative.
+   */
+  hasLiveTurnForAgent(agentName: string): boolean;
 }
 
 /** Superficie de `AgendaRepository` que el Loop usa (estructural: tests con fakes). */
@@ -297,6 +313,24 @@ export class AgendaLoop {
     if (capacidad <= 0) return;
     const due = this.safeRun("initiatives.listDue", () => this.agenda.initiatives.listDue(now));
     if (!due || due.length === 0) return;
+
+    // Admisión por Agent (S2 / T4b): `listRunning` es la verdad DURABLE (solo
+    // Initiatives), así que por sí sola no ve un turno humano ni uno de canal.
+    // `TurnExecution.hasLiveTurnForAgent` sí, y es la autoridad que rechaza un
+    // segundo turno; sin esta lectura el Loop reclamaba la Initiative y
+    // quemaba su turno (`failed`/`dispatch_failed`) por estar el Agent ocupado.
+    //
+    // Se suman a `ocupados` ANTES de seleccionar, para que el dial no gaste su
+    // único slot en un Agent que no puede ejecutar: así otro Agent inactivo
+    // arranca en este mismo tick. Solo se consultan Agents despachables: la
+    // matriz `errored`/`stopped` se sigue aplicando después, en
+    // `despacharOEvaluar`, y no depende de la admisión.
+    for (const ini of due) {
+      if (ocupados.has(ini.agentName)) continue;
+      if (this.supervisor.state(ini.agentName).state !== "running") continue;
+      if (this.turns.hasLiveTurnForAgent(ini.agentName)) ocupados.add(ini.agentName);
+    }
+
     for (const ini of this.seleccionar(due, ocupados, capacidad)) {
       this.despacharOEvaluar(ini, now);
     }

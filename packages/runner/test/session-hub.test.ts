@@ -4,11 +4,13 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ChatHub, SessionHubRegistry } from "../src/hub.ts";
-import { SessionFactory } from "../src/session.ts";
+import { ExecutionBusyError } from "../src/execution-gate.ts";
+import { SessionFactory, type ResolvedModel } from "../src/session.ts";
 import {
   ASK_HUMAN_TOOL_NAME,
   SCHEDULE_TRIGGER_TOOL_NAME,
   REVOKE_TRIGGER_TOOL_NAME,
+  type ServerWsMessage,
 } from "@pihub/shared";
 import { askHumanTool } from "../src/ask-human.ts";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -266,16 +268,312 @@ test("explicit new_session never resumes the discarded conversation", async () =
   const originalSessionId = managers[0].getSessionId();
   assert.ok(originalSessionId);
 
-  const newSessionId = await hub.newSession();
-  assert.strictEqual(
-    managers.length,
-    2,
-    "new_session crea un segundo SessionManager",
+    const newSessionId = await hub.newSession();
+    assert.strictEqual(
+      managers.length,
+      2,
+      "new_session crea un segundo SessionManager",
+    );
+    assert.notStrictEqual(
+      managers[1].getSessionId(),
+      originalSessionId,
+      "new_session da un session ID nuevo: nunca reabre la conversación descartada",
+    );
+    assert.strictEqual(newSessionId, managers[1].getSessionId());
+  });
+
+// ---------------------------------------------------------------------------
+// T4c — una sola ejecución por Runner (S2), aunque el Manager pierda su mapa
+// de turnos o la conexión se caiga. El borde del SDK está falsificado; la gate
+// de ejecución es la de producción.
+// ---------------------------------------------------------------------------
+
+/** Resuelve en el siguiente turno del bucle de eventos: deja asentar los `then`. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * AgentSession del SDK falsificada: `prompt()` devuelve una promesa que el
+ * test resuelve a mano, que es lo único que el SDK real garantiza al asentarse
+ * (`agent_end` → listeners → `finishRun()` → la promesa del prompt resuelve).
+ */
+class FakeSdkSession {
+  isStreaming = false;
+  disposed = false;
+  aborts = 0;
+  readonly prompts: string[] = [];
+  readonly models: string[] = [];
+  readonly key: string;
+  private settleRun?: () => void;
+  private failRun?: (error: Error) => void;
+
+  constructor(key: string) {
+    this.key = key;
+  }
+
+  subscribe(): () => void {
+    return () => {};
+  }
+
+  prompt(text: string): Promise<void> {
+    this.isStreaming = true;
+    this.prompts.push(text);
+    return new Promise<void>((resolve, reject) => {
+      this.settleRun = () => {
+        this.isStreaming = false;
+        this.settleRun = undefined;
+        resolve();
+      };
+      // El SDK real rechaza el prompt ANTES del run (sin modelo o sin
+      // credenciales): no emite ningún `agent_end`, solo rechaza.
+      this.failRun = (error: Error) => {
+        this.isStreaming = false;
+        this.failRun = undefined;
+        reject(error);
+      };
+    });
+  }
+
+  async setModel(model: ResolvedModel): Promise<void> {
+    this.models.push(`${model.provider}/${model.id}`);
+  }
+
+  /** El abort del SDK espera a que el agente quede idle: NO resuelve el run
+   *  por sí mismo. Aquí simula un run que sigue con tools en curso. */
+  async abort(): Promise<void> {
+    this.aborts += 1;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+  }
+
+  /** Asienta el run en curso como lo haría el SDK al terminar de verdad. */
+  finish(): void {
+    this.settleRun?.();
+  }
+
+  /** Rechaza el prompt antes del run (preflight del SDK: sin credenciales). */
+  fail(message: string): void {
+    this.failRun?.(new Error(message));
+  }
+}
+
+/** Factory keyed cuyo `create()` puede quedar pendiente a demanda. */
+function fakeRuntime(
+  options: { deferredCreation?: boolean; resolveModelTo?: ResolvedModel } = {},
+) {
+  const sessions: FakeSdkSession[] = [];
+  const creations: Array<() => void> = [];
+  const provider = (sessionKey: string) => ({
+    config: { model: "proveedor/modelo" },
+    sessionType: "human" as const,
+    async create(): Promise<unknown> {
+      if (options.deferredCreation) {
+        await new Promise<void>((resolve) => creations.push(resolve));
+      }
+      const session = new FakeSdkSession(sessionKey);
+      sessions.push(session);
+      return session;
+    },
+    async resolveModel(): Promise<ResolvedModel | undefined> {
+      return options.resolveModelTo;
+    },
+    // P3.6: la factory real la expone y newSession() la invoca tras reset().
+    useFreshCreation(): void {},
+  });
+  const factory = {
+    config: { model: "proveedor/modelo" },
+    sessionType: "human",
+    forSession: provider,
+  };
+  return { factory, sessions, creations };
+}
+
+test("una sola ejecución por Runner: otra sessionKey no puede ejecutar mientras la primera corre", async () => {
+  const runtime = fakeRuntime();
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const sessionA = registry.forKey("channel-a");
+  const sessionB = registry.forKey("channel-b");
+
+  await sessionA.prompt("mensaje A");
+  assert.equal(registry.isStreaming, true, "una ejecución en curso cuenta como trabajo pendiente");
+
+  // Misma hub y hub distinta: la admisión es del RUNNER, no de la clave.
+  await assert.rejects(sessionA.prompt("mensaje A2"), ExecutionBusyError);
+  await assert.rejects(sessionB.prompt("mensaje B"), ExecutionBusyError);
+  assert.deepEqual(
+    runtime.sessions.map((session) => session.key),
+    ["channel-a"],
+    "un prompt rechazado no llega a crear la sesión de la otra clave",
   );
-  assert.notStrictEqual(
-    managers[1].getSessionId(),
-    originalSessionId,
-    "new_session da un session ID nuevo: nunca reabre la conversación descartada",
+
+  runtime.sessions[0].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false, "el asentamiento real del SDK libera la ejecución");
+
+  await sessionB.prompt("mensaje B");
+  assert.deepEqual(runtime.sessions.map((session) => session.key), ["channel-a", "channel-b"]);
+  runtime.sessions[1].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false);
+});
+
+test("que un suscriptor se desconecte no libera la ejecución en curso", async () => {
+  const runtime = fakeRuntime();
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const hub = registry.forKey("channel-a");
+  const unsubscribe = hub.subscribe(() => {});
+
+  await hub.prompt("mensaje A");
+  unsubscribe();
+
+  assert.equal(registry.isStreaming, true, "el observador que se va no es el turno");
+  await assert.rejects(registry.forKey("channel-b").prompt("mensaje B"), ExecutionBusyError);
+
+  runtime.sessions[0].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false);
+});
+
+test("un abort pedido no libera la ejecución: solo el asentamiento real del SDK lo hace", async () => {
+  const runtime = fakeRuntime();
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const hub = registry.forKey("channel-a");
+
+  await hub.prompt("mensaje A");
+  await hub.abort();
+
+  assert.equal(runtime.sessions[0].aborts, 1, "el abort llegó al SDK");
+  assert.equal(
+    registry.isStreaming,
+    true,
+    "el abort es una intención: el run (y sus tools) sigue en curso",
   );
-  assert.strictEqual(newSessionId, managers[1].getSessionId());
+  await assert.rejects(registry.forKey("channel-b").prompt("mensaje B"), ExecutionBusyError);
+
+  runtime.sessions[0].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false);
+});
+
+test("la admisión cubre la ventana de creación de la sesión", async () => {
+  const runtime = fakeRuntime({ deferredCreation: true });
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const started = registry.forKey("channel-a").prompt("mensaje A");
+  await settle();
+
+  assert.equal(runtime.sessions.length, 0, "la creación sigue pendiente");
+  assert.equal(
+    registry.isStreaming,
+    true,
+    "una creación en curso ya es trabajo pendiente del Runner",
+  );
+  await assert.rejects(registry.forKey("channel-b").prompt("mensaje B"), ExecutionBusyError);
+
+  runtime.creations[0]();
+  await started;
+  assert.equal(runtime.sessions.length, 1);
+
+  runtime.sessions[0].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false);
+});
+
+test("reset()/newSession() no pueden descartar una ejecución en curso", async () => {
+  const runtime = fakeRuntime();
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const hub = registry.forKey("channel-a");
+
+  await hub.prompt("mensaje A");
+  const running = runtime.sessions[0];
+
+  hub.reset();
+  assert.equal(running.disposed, false, "reset no puede descartar la sesión que ejecuta");
+  await assert.rejects(hub.newSession(), /ejecución/);
+  await assert.rejects(registry.forKey("channel-b").prompt("mensaje B"), ExecutionBusyError);
+
+  running.finish();
+  await settle();
+
+  // Ya libre: reset() vuelve a descartar y newSession() crea de verdad.
+  hub.reset();
+  assert.equal(running.disposed, true);
+  await hub.newSession();
+  assert.equal(runtime.sessions.length, 2, "newSession sin ejecución sigue creando una sesión");
+});
+
+test("un turno que falla libera la admisión y solo avisa a los suscriptores de ese turno", async () => {
+  const runtime = fakeRuntime();
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const hub = registry.forKey("channel-a");
+  const other = registry.forKey("channel-b");
+  const hubMessages: ServerWsMessage[] = [];
+  const otherMessages: ServerWsMessage[] = [];
+  hub.subscribe((message) => hubMessages.push(message));
+  other.subscribe((message) => otherMessages.push(message));
+
+  await hub.prompt("mensaje A");
+  const failure = "No hay credenciales configuradas para el proveedor";
+  runtime.sessions[0].fail(failure);
+  await settle();
+
+  assert.deepEqual(
+hubMessages,
+[{ type: "error", message: failure }],
+"el fallo del turno se avisa a los suscriptores de ESE turno, y solo como error",
+  );
+  assert.deepEqual(otherMessages, [], "el fallo no se difunde a otra hub");
+  assert.equal(registry.isStreaming, false, "un turno fallido también libera la admisión");
+  assert.equal(
+runtime.sessions[0].disposed,
+false,
+"un fallo no descarta la sesión: la conversación sigue siendo reutilizable",
+  );
+
+  // La admisión quedó libre de verdad: el siguiente prompt se acepta.
+  await other.prompt("mensaje B");
+  assert.deepEqual(runtime.sessions.map((session) => session.key), [
+"channel-a",
+"channel-b",
+  ]);
+  runtime.sessions[1].finish();
+  await settle();
+  assert.equal(registry.isStreaming, false);
+});
+
+test("cambiar el modelo durante la admisión se rechaza y no descarta ni libera la ejecución", async () => {
+  const target = { provider: "proveedor", id: "otro" } as unknown as ResolvedModel;
+  const runtime = fakeRuntime({ deferredCreation: true, resolveModelTo: target });
+  const registry = new SessionHubRegistry(runtime.factory as never);
+  const hub = registry.forKey("channel-a");
+  const started = hub.prompt("mensaje A");
+  await settle();
+
+  await assert.rejects(hub.setModel("proveedor/otro"), /en curso/);
+  assert.equal(runtime.sessions.length, 0, "el cambio de modelo rechazado no crea una sesión");
+  assert.equal(registry.isStreaming, true, "el cambio de modelo rechazado no libera la admisión");
+  await assert.rejects(
+registry.forKey("channel-b").prompt("mensaje B"),
+ExecutionBusyError,
+  );
+
+  runtime.creations[0]();
+  await started;
+  assert.deepEqual(
+runtime.sessions[0].models,
+[],
+"el SDK no recibe un cambio de modelo a mitad del turno",
+  );
+
+  runtime.sessions[0].finish();
+  await settle();
+  await hub.setModel("proveedor/otro");
+  assert.deepEqual(
+runtime.sessions[0].models,
+["proveedor/otro"],
+"sin turno en curso, el cambio de modelo sí se aplica sobre la misma sesión",
+  );
+  assert.equal(registry.isStreaming, false);
 });

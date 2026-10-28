@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createWriteStream } from "node:fs";
+import { createServer } from "node:net";
 import {
   agentPaths,
   dataPaths,
@@ -106,7 +107,73 @@ const MAX_RESTARTS = 5;
 const RESTART_WINDOW_MS = 60_000;
 const CALLBACK_TOKEN_RE = /^[0-9a-fA-F]{64}$/;
 
+/**
+ * Dirección que el sondeo de puerto intenta atar. Es la MISMA que usa el Runner
+ * (`packages/runner/src/server.ts`, `hostname: "0.0.0.0"`): en Darwin un socket que
+ * escucha en `127.0.0.1:P` no impide atar `0.0.0.0:P` ni al revés, así que sondear
+ * otra dirección produciría falsos «libre».
+ */
+const RUNNER_BIND_HOST = "0.0.0.0";
+/** Cota del sondeo: un `listen` que no responde no puede colgar el arranque. */
+const PORT_PROBE_TIMEOUT_MS = 5_000;
+
 type CallbackTokenSource = () => string;
+
+/**
+ * Fence fail-closed del arranque (T4c). Comprueba que el puerto del Runner se puede
+ * atar en exclusiva ANTES de abrir el log o spawnear, para que un spawn condenado a
+ * `EADDRINUSE` no quede registrado como «en marcha» detrás de un ocupante vivo.
+ *
+ * No adopta, no interroga y no mata al ocupante, y NO prueba propiedad del puerto:
+ * entre cerrar el sondeo y el bind del Runner sigue existiendo una ventana (TOCTOU)
+ * que solo cerraría un protocolo de traspaso que aquí no existe.
+ */
+async function assertRunnerPortAvailable(
+  agentName: string,
+  port: number,
+): Promise<void> {
+  // Puerto efímero (`0`): el Runner lo resolverá al atar y no hay nada que sondear.
+  if (!Number.isInteger(port) || port <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const probe = createServer();
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    timer = setTimeout(() => {
+      probe.close();
+      settle(
+        new Error(
+          `[supervisor] el sondeo del puerto ${port} de ${agentName} no respondió en ${PORT_PROBE_TIMEOUT_MS}ms; no se arranca`,
+        ),
+      );
+    }, PORT_PROBE_TIMEOUT_MS);
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE") {
+        const busy = new Error(
+          `[supervisor] el puerto ${port} del Runner de ${agentName} ya está ocupado: no se arranca (el ocupante no se adopta ni se mata)`,
+        );
+        busy.name = "RunnerPortBusyError";
+        settle(busy);
+        return;
+      }
+      settle(
+        new Error(
+          `[supervisor] no se pudo comprobar que el puerto ${port} de ${agentName} esté libre (${error.code ?? error.message}); no se arranca`,
+        ),
+      );
+    });
+    // El sondeo se cierra ANTES de resolver: el Runner necesita el puerto ya.
+    probe.listen({ host: RUNNER_BIND_HOST, port, exclusive: true }, () => {
+      probe.close(() => settle());
+    });
+  });
+}
 
 function randomCallbackToken(): string {
   return randomBytes(32).toString("hex");
@@ -150,6 +217,9 @@ export class Supervisor {
 
   private async spawnRunner(config: AgentConfig): Promise<void> {
     const paths = agentPaths(this.env.dataDir, config.name);
+    await assertRunnerPortAvailable(config.name, config.port);
+    // Fence fail-closed: se llama aquí (y no en `start`) para que el auto-reinicio
+    // quede fenced igual. Si el puerto está ocupado no se abre el log ni se spawnea.
     const log = createWriteStream(path.join(paths.root, "runner.log"), {
       flags: "a",
     });
@@ -213,13 +283,24 @@ export class Supervisor {
       console.warn(
         `[supervisor] ${config.name} terminó (código ${code}); reinicio en ${delay}ms`,
       );
-      setTimeout(() => {
-        void readAgent(this.env.dataDir, config.name).then((fresh) => {
-          if (fresh?.enabled) void this.spawnRunner(fresh);
+          setTimeout(() => {
+            readAgent(this.env.dataDir, config.name)
+              .then((fresh) =>
+                fresh?.enabled ? this.spawnRunner(fresh) : undefined,
+              )
+              .catch((error: unknown) => {
+                // El fence también puede rechazar en un auto-reinicio. Sin este
+                // consumidor, `void this.spawnRunner(...)` sería un
+                // `unhandledRejection` que tumba el Manager entero; el Agent queda
+                // `stopped` (nunca «en marcha») y el motivo se registra.
+                console.error(
+                  `[supervisor] no se pudo reiniciar ${config.name}:`,
+                  error,
+                );
+              });
+          }, delay);
         });
-      }, delay);
-    });
-  }
+      }
 
   private withinWindow(name: string): boolean {
     const managed = this.processes.get(name);

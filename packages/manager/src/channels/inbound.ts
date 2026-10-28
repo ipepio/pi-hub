@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ChannelKind, InboundMessage } from "@pihub/channels";
-import type { TurnExecution } from "../agenda/turn-execution.ts";
+import { DomainError } from "../agenda/errors.ts";
+import type { TurnExecution, TurnHandle } from "../agenda/turn-execution.ts";
 import { PairingError, type PairingMachine } from "./pairing.ts";
 import { readChannelRecords } from "./store.ts";
+import { systemLabel } from "./labels.ts";
 
 /**
  * Inbound handler (design §1.4, tasks c-I6) — the consumer of the `onInbound`
@@ -39,6 +41,10 @@ import { readChannelRecords } from "./store.ts";
  * `TURN_IN_PROGRESS` discipline would refuse a second anyway). Overflow drops
  * the newest message with a log line — the same documented ephemerality as the
  * in-memory turn-idempotency map (`api-v1/turns.ts`): a restart loses it too.
+ * A message REFUSED because the Agent already has a live turn (S2 / T4b) is
+ * not re-queued for a surprise later run either: it is dropped with a system
+ * notice through the outbox (copy in `labels.ts`), and every rejection of the
+ * drain (resolver, queue, outbox) is logged so the rest of the queue survives.
  */
 
 /** Messages waiting behind a live turn, per `(agent, kind)`. */
@@ -63,16 +69,22 @@ export function mainSessionKeyOf(agentName: string): string {
 }
 
 /**
- * Reply to a sender the channel is not bound to. Copy is a design non-decision
- * (§6.1); what is pinned is that the code travels and the message is not an
- * Agent answer.
+ * Reply to a sender the channel is not bound to. Copy lives in the system-label
+ * catalogue (`labels.ts`, S4); what is pinned here is that the code travels and
+ * the message is not an Agent answer.
  */
 export function pairingCodeReplyText(code: string): string {
-  return (
-    `Este canal aún no está emparejado. Pide al propietario del agente que ` +
-    `introduzca este código de emparejamiento: ${code}\n` +
-    `Caduca en 1 hora y solo funciona desde este chat.`
-  );
+  return systemLabel("pairingCode", { code });
+}
+
+/**
+ * Reply to a bound chat whose message was NOT executed because the Agent already
+ * has a live turn (S2 / T4b). It is a system message sent through the outbox —
+ * never an Agent answer and never a queued message that would run later by
+ * surprise — so the user knows the message was dropped and can resend it.
+ */
+export function busyTurnReplyText(): string {
+  return systemLabel("turnBusy");
 }
 
 export interface ChannelInboundDeps {
@@ -238,20 +250,31 @@ export class ChannelInboundHandler {
   /** One drain per key, chained so turns for an Agent never overlap. */
   private drain(key: string, agentName: string, kind: ChannelKind, chatId: string): void {
     const previous = this.tails.get(key) ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        for (;;) {
-          const queue = this.queues.get(key);
-          if (!queue || queue.length === 0) return;
-          const item = queue.shift() as QueuedInbound;
+    const next = previous.catch(() => undefined).then(async () => {
+      for (;;) {
+        const queue = this.queues.get(key);
+        if (!queue || queue.length === 0) return;
+        const item = queue.shift() as QueuedInbound;
+        try {
           await this.runTurn(agentName, kind, chatId, item);
+        } catch (error) {
+          // Un fallo del resolver, de la cola o del outbox se REGISTRA y el
+          // drenado sigue con el siguiente item de ESTA cola: un mensaje roto no
+          // puede quedarse con el drenado ni perder los que vienen detrás.
+          this.log(
+            `inbound message failed agent=${agentName} kind=${kind} message=${item.message.messageId}: ${String(error)}`,
+          );
         }
-      });
-    this.tails.set(key, next);
-    void next.finally(() => {
-      if (this.tails.get(key) === next) this.tails.delete(key);
+      }
     });
+    this.tails.set(key, next);
+    // `next` ya no rechaza (el bucle consume cada fallo), pero el cleanup se
+    // escribe con los DOS callbacks: un `void next.finally(...)` fabrica una
+    // promesa derivada que rechaza y se queda sin consumidor.
+    const olvidar = (): void => {
+      if (this.tails.get(key) === next) this.tails.delete(key);
+    };
+    void next.then(olvidar, olvidar);
   }
 
   private async runTurn(
@@ -267,20 +290,42 @@ export class ChannelInboundHandler {
     }
 
     const turnId = this.newTurnId();
-    const handle = this.turns.startTurn({
-      agentName,
-      turnId,
-      // El id de transporte del chat es la clave de idempotencia: un reenvío del
-      // mismo mensaje (long polling at-least-once) no genera un segundo turno.
-      idempotencyKey: `channel:${kind}:${chatId}:${item.message.messageId}`,
-      correlationId: turnId,
-      sessionKey: item.sessionKey,
-      message: item.message.text,
-      runnerPort: runner.port,
-      eventProfile: "basic",
-      // Este es el hecho que hace que la respuesta vuelva por el outbox.
-      origin: { kind: "channel", channelKind: kind, chatId },
-    });
+    let handle: TurnHandle;
+    try {
+      handle = this.turns.startTurn({
+        agentName,
+        turnId,
+        // El id de transporte del chat es la clave de idempotencia: un reenvío del
+        // mismo mensaje (long polling at-least-once) no genera un segundo turno.
+        idempotencyKey: `channel:${kind}:${chatId}:${item.message.messageId}`,
+        correlationId: turnId,
+        sessionKey: item.sessionKey,
+        message: item.message.text,
+        runnerPort: runner.port,
+        eventProfile: "basic",
+        // Este es el hecho que hace que la respuesta vuelva por el outbox.
+        origin: { kind: "channel", channelKind: kind, chatId },
+      });
+    } catch (error) {
+      // Admisión (S2 / T4b): el Agent ya tiene un turno vivo —de la web, de otro
+      // chat o de una Initiative— y `startTurn` lo rechaza ANTES de abrir nada.
+      // El mensaje NO se ejecuta y NO se encola para más tarde: se descarta con
+      // un aviso de sistema por el outbox (misma política de entrega y reintento
+      // que el resto de mensajes de sistema) y el usuario puede reenviarlo.
+      if (error instanceof DomainError && error.code === "TURN_IN_PROGRESS") {
+        this.log(
+          `inbound rejected agent=${agentName} kind=${kind} message=${item.message.messageId}: agent busy`,
+        );
+        await this.enqueue({
+          agentName,
+          kind,
+          chatId,
+          text: busyTurnReplyText(),
+        });
+        return;
+      }
+      throw error;
+    }
     await handle.completion;
   }
 }

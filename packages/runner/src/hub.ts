@@ -1,6 +1,7 @@
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { ServerWsMessage, SessionType } from "@pihub/shared";
 import { ASK_HUMAN_TOOL_NAME } from "@pihub/shared";
+import { ExecutionBusyError, ExecutionGate } from "./execution-gate.ts";
 import type { ResolvedModel, SessionFactory } from "./session.js";
 
 type Listener = (message: ServerWsMessage) => void;
@@ -8,6 +9,12 @@ type Listener = (message: ServerWsMessage) => void;
 /** Sesión web compartida del agente: un AgentSession activo, N clientes suscritos. */
 export class ChatHub {
   private readonly factory: SessionFactory;
+  /** Gate de ejecución compartida con TODAS las hubs del Runner (ver `execution-gate.ts`). */
+  private gate: ExecutionGate;
+  /** Identidad de esta hub dentro de la gate (diagnóstico y token de liberación). */
+  private readonly label: string;
+  /** true desde la admisión hasta el asentamiento real del SDK (incluye la creación). */
+  private executing = false;
   private session?: AgentSession;
   private creating?: Promise<AgentSession>;
   private unsubscribe?: () => void;
@@ -19,8 +26,25 @@ export class ChatHub {
   /** Latch: solo una emisión Ask por prompt. */
   private _askEmittedThisPrompt = false;
 
-  constructor(factory: SessionFactory) {
+  constructor(factory: SessionFactory, gate?: ExecutionGate, label = "default") {
     this.factory = factory;
+    this.gate = gate ?? new ExecutionGate();
+    this.label = label;
+  }
+
+  /**
+   * El registry de producción adjunta la MISMA gate a todas sus hubs: una
+   * ejecución por Runner, no por `sessionKey`. Una hub que ya ejecuta no puede
+   * cambiar de gate (se quedaría sin su latch de admisión).
+   */
+  attachExecutionGate(gate: ExecutionGate): void {
+    if (this.gate === gate) return;
+    if (this.isStreaming) {
+      throw new Error(
+        `No se puede cambiar la gate de ejecución de ${this.label} con un turno en curso`,
+      );
+    }
+    this.gate = gate;
   }
 
   /** Tipo de sesión actual (P3.1). Inmutable tras el primer prompt. */
@@ -118,20 +142,75 @@ export class ChatHub {
     }
   }
 
-  /** Lanza un prompt sin bloquear; los resultados llegan por eventos. */
+  /**
+   * Lanza un prompt sin bloquear; los resultados llegan por eventos.
+   *
+   * **Admisión (T4c, S2)**: la gate se toma de forma SÍNCRONA, antes del primer
+   * `await` — es decir, antes de crear la sesión. Si ya hay una ejecución en
+   * curso, este prompt se RECHAZA con `ExecutionBusyError` en vez de encolarse
+   * como `followUp` del SDK: encolarlo lo ejecutaría más tarde, sin que nadie lo
+   * haya pedido en ese momento, y el cliente creería que su turno corre ya.
+   *
+   * La gate se mantiene hasta que la promesa del SDK se asienta (resuelve o
+   * rechaza), que es el único punto en el que el Runner confirma que dejó de
+   * ejecutar. El contrato de retorno no cambia: resuelve cuando el prompt fue
+   * ACEPTADO, no cuando la generación termina.
+   */
   async prompt(text: string, context?: { kind: "human" | "initiative" }): Promise<void> {
-    // P3.1: fijar tipo de sesión (solo el primer prompt cuenta)
-    if (context?.kind === "initiative") {
-      this._sessionType = "initiative";
+    if (!this.gate.tryAcquire(this.label)) {
+      throw new ExecutionBusyError(this.gate.currentHolder);
     }
-    // Resetear el latch Ask para este prompt
-    this._askEmittedThisPrompt = false;
+    this.executing = true;
 
-    const session = await this.ensureSession();
-    const options = session.isStreaming ? ({ streamingBehavior: "followUp" } as const) : undefined;
-    session.prompt(text, options).catch((error: unknown) => {
-      this.broadcast({ type: "error", message: error instanceof Error ? error.message : String(error) });
-    });
+    let run: Promise<void>;
+    try {
+      // P3.1: fijar tipo de sesión (solo el primer prompt cuenta)
+      if (context?.kind === "initiative") {
+        this._sessionType = "initiative";
+      }
+      // Resetear el latch Ask para este prompt
+      this._askEmittedThisPrompt = false;
+
+      const session = await this.ensureSession();
+      // Sin `streamingBehavior`: si el SDK ya está streaming, eso es un error real
+      // y se propaga; nunca se encola un turno ajeno en la sesión en curso.
+      run = session.prompt(text);
+    } catch (error) {
+      this.finishExecution();
+      throw error;
+    }
+
+    // Un fallo de la generación es del turno: se avisa a los suscriptores de
+    // ESTA hub (no rompe el proceso) y se libera la gate igual que un éxito.
+    void run.then(
+      () => this.finishExecution(),
+      (error: unknown) => {
+        this.finishExecution();
+        this.broadcastRunError(error);
+      },
+    );
+  }
+
+  /** Suelta el latch y la gate: SOLO con el prompt ya asentado (o nunca empezado). */
+  private finishExecution(): void {
+    this.executing = false;
+    this.gate.release(this.label);
+  }
+
+  /**
+   * Avisa del fallo de una generación a los suscriptores de esta hub. Un
+   * listener que lanza no puede dejar una promesa rechazada sin consumidor: la
+   * gate ya está liberada y el turno ya terminó.
+   */
+  private broadcastRunError(error: unknown): void {
+    try {
+      this.broadcast({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } catch (cause) {
+      console.error(`[runner] no se pudo emitir el error del turno de ${this.label}:`, cause);
+    }
   }
 
   async abort(): Promise<void> {
@@ -156,6 +235,13 @@ export class ChatHub {
   }
 
   async newSession(): Promise<string> {
+    if (this.isStreaming) {
+      // Descartar la AgentSession en ejecución la mataría por debajo y liberaría
+      // la admisión sin terminal real: la ruta que lo pide responde 409.
+      throw new Error(
+        "Hay una ejecución en curso; espera a que termine para crear una sesión nueva",
+      );
+    }
     this.reset();
     // P3.6: tras reset, la siguiente creación debe ser fresh: nunca reabrir la
     // sesión descartada aunque sea la más reciente del directorio.
@@ -165,8 +251,21 @@ export class ChatHub {
     return session.sessionId;
   }
 
-  /** Descarta la sesión activa (se recrea perezosamente con recursos frescos). */
+  /**
+   * Descarta la sesión activa (se recrea perezosamente con recursos frescos).
+   *
+   * Nunca descarta una ejecución en curso: `reset()` también lo invocan la
+   * recarga de recursos, el cierre del servidor y el apagado, así que rechaza en
+   * silencio (con log) en vez de lanzar. La sesión se descarta cuando la
+   * ejecución se asienta y la siguiente creación la reemplaza.
+   */
   reset(): void {
+    if (this.isStreaming) {
+      console.warn(
+        `[runner] reset() ignorado en ${this.label}: hay una ejecución en curso`,
+      );
+      return;
+    }
     this.unsubscribe?.();
     this.session?.dispose();
     this.session = undefined;
@@ -185,8 +284,13 @@ export class ChatHub {
     return this.factory.config.model;
   }
 
+  /**
+   * ¿Hay trabajo en curso en esta hub? Incluye la CREACIÓN de la sesión y la
+   * ventana entre el terminal del SDK y el asentamiento de su promesa, no solo
+   * `AgentSession.isStreaming`.
+   */
   get isStreaming(): boolean {
-    return this.session?.isStreaming ?? false;
+    return this.executing || this.session?.isStreaming === true;
   }
 }
 
@@ -197,10 +301,17 @@ export class ChatHub {
 export class SessionHubRegistry {
   private readonly hubs = new Map<string, ChatHub>();
   private readonly factory: SessionFactory;
+  /** UNA gate por Runner/registry: la comparten el hub por defecto y todas las keyed. */
+  private readonly gate = new ExecutionGate();
 
   constructor(factory: SessionFactory, defaultHub?: ChatHub) {
     this.factory = factory;
-    if (defaultHub) this.hubs.set("default", defaultHub);
+    if (defaultHub) {
+      // Producción pasa una hub ya construida: se le adjunta la gate del registry
+      // ANTES de que pueda recibir ningún prompt.
+      defaultHub.attachExecutionGate(this.gate);
+      this.hubs.set("default", defaultHub);
+    }
   }
 
   forKey(sessionKey: string): ChatHub {
@@ -208,13 +319,17 @@ export class SessionHubRegistry {
     const existing = this.hubs.get(key);
     if (existing) return existing;
 
-    const hub = new ChatHub(this.factory.forSession(key));
+    const hub = new ChatHub(this.factory.forSession(key), this.gate, key);
     this.hubs.set(key, hub);
     return hub;
   }
 
+  /**
+   * ¿Hay trabajo pendiente en el Runner? La gate manda (incluye la creación de
+   * la sesión y el asentamiento); el barrido de hubs es la red de seguridad.
+   */
   get isStreaming(): boolean {
-    return [...this.hubs.values()].some((hub) => hub.isStreaming);
+    return this.gate.busy || [...this.hubs.values()].some((hub) => hub.isStreaming);
   }
 
   reset(): void {
