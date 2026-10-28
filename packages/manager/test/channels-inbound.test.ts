@@ -145,6 +145,36 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
     assert.equal(enqueued.length, 0, "sin reply todavía: la entrega la decide el hook");
   });
 
+  it("el mensaje del humano llega al turno COMPLETO: el camino inbound no recorta", async () => {
+    const dataDir = await setup();
+    await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);
+    const pairing = new PairingMachine({ dataDir });
+    await pairing.requestPairing("agent", "telegram", "12345");
+
+    const sink = fakeTurns();
+    const handler = new ChannelInboundHandler({
+      dataDir,
+      pairing,
+      turns: sink.turns,
+      resolveRunner: async () => ({ port: 4100 }),
+      enqueue: () => {},
+    });
+
+    // T5a (S5): la mitad del humano de un mensaje largo de Telegram entra
+    // entera en el turno, que es la MISMA fuente de la que el espejo
+    // (`channel_exchanges.user_full_text`) toma su texto. Un recorte aquí se
+    // propagaría a la transcripción durable sin que nadie lo notara.
+    const largo = "Mensaje largo del humano por Telegram. ".repeat(40).padEnd(1_700, ".");
+    assert.ok(largo.length > 1_000, `fixture: ${largo.length} caracteres`);
+
+    await handler.handleAsync("agent", "telegram", inbound(largo, "9"));
+    await tick();
+
+    assert.equal(sink.commands.length, 1);
+    assert.equal(sink.commands[0]!.message, largo, "el prompt es el mensaje íntegro");
+    assert.equal(sink.commands[0]!.message.length, largo.length);
+  });
+
   it("los turnos de un mismo Agent se drenan en FIFO y no en paralelo", async () => {
     const dataDir = await setup();
     await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);

@@ -1,11 +1,15 @@
 # Sesiones de un Agent (catálogo durable)
 
 Esta nota describe el **catálogo durable de sesiones** que el Manager estrena en la
-unidad T3 del ODD `odd/tasks/agent-session-workspace.md` (specs S2 y S7), y la
-**admisión de un único turno por Agent** de la unidad T4a. Es el sustrato de
-identidad sobre el que se apoyarán el transcript compartido (T5) y los comandos de
-sesión de Telegram (T6); ninguno de esos dos comportamientos está implementado
-todavía y este documento no los promete.
+unidad T3 del ODD `odd/tasks/agent-session-workspace.md` (specs S2 y S7), la
+**admisión de un único turno por Agent** de la unidad T4a y la **política de
+persistencia del transcript** de la unidad T5a. Los comandos de sesión de Telegram
+(T6) y la migración/UI del dashboard (T5b) siguen pendientes, y este documento no
+los promete.
+
+La política de transcript tiene su propia sección (`## Transcript persistence
+policy (T5a)`): léela antes de tocar `channel_exchanges` o de prometer «historial
+completo» en una superficie.
 
 ## Modelo
 
@@ -331,9 +335,87 @@ vive también en el proceso que tiene la `AgentSession`, y ya está implementada
     entonces basta con arrancar/`restart` del Agent, y si no queda libre porque el
     Manager entero conserva estado viejo, un reinicio completo del runtime.
 
-    ## Lo que esta unidad NO hace
+## Transcript persistence policy (T5a)
 
-- No persiste ni sirve el transcript completo (T5).
+Decisión del usuario, verbatim: **«si, y recuerda documentar todo bien»**. Se concreta
+en tres reglas, y las tres se pueden comprobar en código.
+
+### 1. Quién es el dueño del transcript
+
+- El transcript **autoritativo y durable es del runtime**, por `sessionKey`: es el
+  directorio de sesión que el Runner ya guarda en disco y el contexto que reanuda un
+  turno nuevo. El Manager no lo reescribe y **no lo reconstruye** a partir de ningún
+  espejo.
+- El **Manager** produce los intercambios que ocurren fuera de la web (Telegram,
+  Initiative) y los persiste como hechos ocurridos. No hay dirección de confianza
+  P→D: el Dashboard los drena.
+- El **Dashboard es capa de presentación** de esos hechos. Su transcript propio es su
+  registro de lo que retransmitió (ADR 0100 del dashboard: guarda cada turno mientras
+  lo emite, y deliberadamente no le pide historial a pihub). Ni el Manager escribe el
+  transcript del dashboard ni el dashboard reconstruye el contexto del Runner.
+- Consecuencia que no hay que perder de vista: **reanudar contexto** es del Runner
+  (misma `sessionKey`); que el dashboard muestre el historial **no** reanuda nada.
+
+### 2. Qué guarda el espejo `channel_exchanges`
+
+Migración v6 (aditiva, `packages/manager/src/storage/migrations.ts`):
+
+| columna           | desde | contenido                                                        |
+|-------------------|-------|------------------------------------------------------------------|
+| `user_text`       | v4    | mitad del humano, **semántica intacta** (completa, sin recortes)   |
+| `reply_text`      | v4    | mitad del Agent, **semántica intacta**                            |
+| `user_full_text`  | v6    | mitad del humano acotada al techo documentado; NULL si es legacy  |
+| `reply_full_text` | v6    | mitad del Agent acotada al techo documentado; NULL si es legacy   |
+
+Reglas del escritor (`channels/exchange-log.ts`):
+
+- Toda fila **nueva** escribe las dos mitades full, también cuando una mitad es
+  vacía (un turno proactivo no tiene texto del humano: `""` es una mitad real).
+- El techo es `CHANNEL_FULL_TEXT_MAX_CHARS = 32_768` caracteres por mitad. Es un
+  **máximo duro documentado**, no un preview: hasta 32.768 el texto se guarda
+  literal. Por encima, la columna full guarda el **prefijo** de ese tamaño (un
+  `slice`, nunca una redacción ni un resumen) y `hasFull` sigue siendo `true`
+  porque el contrato define «completo» **hasta ese techo explícito**. El motivo del
+  techo es de forma, no de contenido: una fila no puede deshacer el acotado de
+  página del feed (`EXCHANGE_FEED_MAX_LIMIT`) ella sola.
+- **El recorte de preview no es del Manager.** El Manager nunca recortó al escribir;
+  el preview acotado es del Dashboard (`TEXT_PREVIEW_MAX_CHARS = 512` en
+  `packages/control-plane/src/agents/sync-channel-transcript.ts`, que compone
+  `userText → replyText` y recorta). Repartir el recorte entre las dos partes sería
+  tener dos dueños del mismo hecho; el dueño es D.
+- Un **replay** (mismo `turn_id`, hook de entrega at-least-once) no duplica ni
+  reescribe: `INSERT OR IGNORE` y se devuelve la fila que ya estaba.
+- No hay redacción nueva. Las dos columnas guardan lo que el humano escribió y lo que
+  el Agent respondió, igual que v4 documenta. La redacción de tokens existente vive
+  en otra parte y **no cambia**: solo afecta a líneas de log de arranque de canal
+  (`channels/registry.ts`, `describeStartFailure`), no al espejo.
+
+### 3. Filas legacy: historia READ-ONLY
+
+Lo que existía antes de v6 son filas de sesiones locales **antiguas** cuya identidad
+no correspondía a un contexto independiente del Runner. El usuario decidió que son
+**historia honesta e inmutable**: se muestran, no se reescriben y no prometen
+reanudación. Ver ADR 0107 del dashboard
+(`goguest-ai-dashboard-new/docs/adr/0107-keep-legacy-agent-sessions-read-only.md`).
+
+En el Manager eso significa, literalmente:
+
+- la migración **no hace backfill**: las columnas full quedan `NULL` para siempre;
+- `hasFull` es `false`, así que el feed dice la verdad sobre lo que no tiene en vez de
+  rellenar el hueco con el preview;
+- ninguna ruta ni escritura puede convertir una fila legacy en una fila con
+  transcripción completa: el único escritor es `append` y su `INSERT OR IGNORE` no
+  toca una fila existente.
+
+La contrapartida, que es la mitad útil de la decisión: las **sesiones nuevas** sí son
+reanudables, y su historial completo está disponible en las dos superficies a través
+del mismo feed.
+
+## Lo que esta unidad NO hace
+
+- No persiste ni sirve el transcript completo de una fila **legacy**: T5a entrega el
+  historial completo solo para filas nuevas; lo anterior es preview-only por decisión
+  del usuario (ADR 0107). Tampoco trae la migración/API/UI del dashboard (T5b).
 - No expone comandos `/new`, `/sessions`, `/session` en Telegram (T6).
 - No reanuda el contexto del Runner tras un reinicio por sí mismo: la continuidad
   del `sessionKey` es del Runner, que ya guarda su directorio por clave. Este

@@ -158,10 +158,13 @@ test("`after` es exclusivo y las filas vienen ascendentes por `seq`", async () =
     assert.deepEqual(Object.keys(first).sort(), [
       "chatId",
       "createdAt",
+      "hasFull",
       "origin",
+      "replyFullText",
       "replyText",
       "seq",
       "turnId",
+      "userFullText",
       "userText",
     ]);
     assert.equal(first.origin, "proactive");

@@ -2161,8 +2161,18 @@ function scheduleGlobalReload(supervisor: Supervisor): void {
     
         /**
          * Fila del espejo tal y como la consume D: el cursor (`seq`), el origen que
-         * la superficie web tiene que pintar, y el par de textos. Sin `agentName`
-         * repetido por fila (ya qualifica la respuesta) y sin ningún secreto.
+         * la superficie web tiene que pintar, el par de textos de siempre y —desde
+         * T5a (schema v6)— la mitad DURABLE de cada lado con su señal `hasFull`.
+         * Sin `agentName` repetido por fila (ya qualifica la respuesta) y sin
+         * ningún secreto: el espejo no guarda tokens ni credenciales, solo lo que
+         * el humano escribió y lo que el Agent respondió.
+         *
+         * `userText`/`replyText` son el preview que D ya pintaba: para una fila
+         * legacy son lo ÚNICO que existe (`hasFull: false`), y para una fila nueva
+         * siguen ahí sin cambiar de semántica. `userFullText`/`replyFullText` son
+         * las mitades completas (acotadas al techo documentado
+         * `CHANNEL_FULL_TEXT_MAX_CHARS`) y valen `null` en una fila anterior a v6:
+         * el feed dice la verdad sobre lo que no tiene, no rellena el hueco.
          */
         function exchangeView(row: ChannelExchange) {
           return {
@@ -2172,6 +2182,9 @@ function scheduleGlobalReload(supervisor: Supervisor): void {
             chatId: row.chatId,
             userText: row.userText,
             replyText: row.replyText,
+            userFullText: row.userFullText,
+            replyFullText: row.replyFullText,
+            hasFull: row.hasFull,
             createdAt: row.createdAt,
           };
         }

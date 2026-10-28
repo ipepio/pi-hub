@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export interface Migration {
     version: number;
@@ -374,6 +374,29 @@ CREATE INDEX channel_exchanges_agent
     );
     `;
     
+    // Schema v6 (T5a, agent-session-workspace): la mitad DURABLE del transcript,
+    // en el mismo espejo `channel_exchanges` que el Dashboard ya drena.
+    //
+    // Por qué DOS columnas nullable y no un rebuild de `user_text`/`reply_text`:
+    // - Las columnas v4 ya guardan la mitad completa de cada lado (el Manager nunca
+    //   recortó al escribir; el recorte de preview es del Dashboard). Reconstruirlas
+    //   no añadiría un dato: solo reescribiría filas legacy, y la decisión del
+    //   usuario (L16) es que las filas legacy son historia INMUTABLE.
+    // - Lo que faltaba era la SEÑAL: en v4 una fila vieja y una nueva son
+    //   indistinguibles (`user_text NOT NULL DEFAULT ''`). v6 añade el hecho
+    //   declarado «esta fila tiene transcripción completa», y NULL es el valor
+    //   honesto para todo lo anterior.
+    //
+    // Aditiva y sin backfill: dos columnas NULLables, ningún CHECK anterior cambia,
+    // ninguna fila existente se toca y no hay rebuild ⇒ no hace falta
+    // `disableForeignKeys`. El techo de cada mitad lo aplica el escritor
+    // (`channels/exchange-log.ts` → `CHANNEL_FULL_TEXT_MAX_CHARS`), porque es una
+    // regla de contenido, no de forma.
+    const V6_CHANNEL_FULL_TEXT = `
+    ALTER TABLE channel_exchanges ADD COLUMN user_full_text TEXT;
+    ALTER TABLE channel_exchanges ADD COLUMN reply_full_text TEXT;
+    `;
+
     export const MIGRATIONS: readonly Migration[] = [
     { version: 1, up: (db) => db.exec(V1_DDL) },
     {
@@ -406,6 +429,12 @@ CREATE INDEX channel_exchanges_agent
         version: 5,
         up: (db) => {
             db.exec(V5_AGENT_SESSIONS);
+        },
+    },
+    {
+        version: 6,
+        up: (db) => {
+            db.exec(V6_CHANNEL_FULL_TEXT);
         },
     },
 ];

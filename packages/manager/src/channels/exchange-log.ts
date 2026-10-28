@@ -39,6 +39,26 @@ export const EXCHANGE_FEED_MAX_LIMIT = 500;
 /** `telegram` = reply to a channel-origin turn; `proactive` = agenda Initiative. */
 export type ChannelExchangeOrigin = "telegram" | "proactive";
 
+/**
+ * Hard guard of ONE full half (T5a, S5).
+ *
+ * What the guard is, precisely — because the difference matters to the Dashboard:
+ *
+ * - It is a **documented HARD MAX**, not a preview. A half of up to 32,768
+ *   characters is mirrored *verbatim*; that is what `hasFull: true` promises, and
+ *   the cap is part of the contract (published in `docs/agent-sessions.md`), not a
+ *   silent degradation.
+ * - The historical columns `user_text`/`reply_text` keep EXACTLY today's semantics
+ *   (the complete halves, unbounded). This migration adds a durable, bounded mirror
+ *   and its honest signal; it does not redefine what was already written, and it
+ *   does not rewrite a single legacy row.
+ * - 32,768 is chosen as the boundary of what one exchange row can carry through
+ *   `GET …/channel-exchanges` without letting a single turn inflate a page: the feed
+ *   is bounded per call (`EXCHANGE_FEED_MAX_LIMIT`), and a half must not be able to
+ *   undo that on its own.
+ */
+export const CHANNEL_FULL_TEXT_MAX_CHARS = 32_768;
+
 export interface ChannelExchange {
   seq: number;
   agentName: string;
@@ -46,8 +66,24 @@ export interface ChannelExchange {
   origin: ChannelExchangeOrigin;
   /** Bound external chat id; `null` for a proactive message with no chat context. */
   chatId: string | null;
+  /** Complete human half as the mirror always stored it (v4 semantics, untouched). */
   userText: string;
+  /** Complete Agent half as the mirror always stored it (v4 semantics, untouched). */
   replyText: string;
+  /**
+   * Durable full human half (schema v6). `null` for every row that predates v6:
+   * the migration does not backfill, so a legacy row is preview-only and says so.
+   */
+  userFullText: string | null;
+  /** Durable full Agent half (schema v6); `null` for rows that predate v6. */
+  replyFullText: string | null;
+  /**
+   * `true` only when this row carries the durable full transcript — both halves
+   * present (an EMPTY half is a real half: a proactive turn has no human text but
+   * still has its reply). `false` is the honest answer for legacy rows, and readers
+   * must fall back to the preview columns instead of inventing text.
+   */
+  hasFull: boolean;
   createdAt: number;
 }
 
@@ -69,13 +105,16 @@ interface RawExchange {
   chat_id: string | null;
   user_text: string;
   reply_text: string;
+  user_full_text: string | null;
+  reply_full_text: string | null;
   created_at: number;
 }
 
 const SQL_APPEND = `
   INSERT OR IGNORE INTO channel_exchanges
-    (agent_name, turn_id, origin, chat_id, user_text, reply_text, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+    (agent_name, turn_id, origin, chat_id, user_text, reply_text,
+     user_full_text, reply_full_text, created_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
 const SQL_BY_TURN = "SELECT * FROM channel_exchanges WHERE turn_id = ?";
@@ -94,7 +133,20 @@ const SQL_PRUNE = "DELETE FROM channel_exchanges WHERE created_at < ?";
 /** Agent purge (revocation 3c): the mirror of a deleted Agent has no owner left. */
 const SQL_DELETE_FOR_AGENT = "DELETE FROM channel_exchanges WHERE agent_name = ?";
 
+/**
+ * Bounds ONE full half at the documented hard max. Slicing (never redaction, never
+ * summarisation) keeps the prefix of what the user actually wrote, so a truncated
+ * half is still truthful about its content up to the cap.
+ */
+function boundedHalf(text: string): string {
+  return text.length > CHANNEL_FULL_TEXT_MAX_CHARS
+    ? text.slice(0, CHANNEL_FULL_TEXT_MAX_CHARS)
+    : text;
+}
+
 function toExchange(raw: RawExchange): ChannelExchange {
+  const userFullText = raw.user_full_text ?? null;
+  const replyFullText = raw.reply_full_text ?? null;
   return {
     seq: raw.id,
     agentName: raw.agent_name,
@@ -103,6 +155,11 @@ function toExchange(raw: RawExchange): ChannelExchange {
     chatId: raw.chat_id,
     userText: raw.user_text,
     replyText: raw.reply_text,
+    userFullText,
+    replyFullText,
+    // Both halves or nothing: a row half-full of full text would be a shape the
+    // Dashboard cannot present honestly, and the writer never produces one.
+    hasFull: userFullText !== null && replyFullText !== null,
     createdAt: raw.created_at,
   };
 }
@@ -120,6 +177,16 @@ export class ChannelExchangeLog {
    * Appends one exchange, idempotently by `turn_id`. Returns the row that backs
    * the turn — the freshly inserted one, or the original when a replay got here
    * first (whose text wins because it is what D already drained).
+   *
+   * A NEW row always carries the durable full transcript (v6): both halves go into
+   * `user_full_text`/`reply_full_text` bounded by `CHANNEL_FULL_TEXT_MAX_CHARS`, so
+   * `hasFull` is `true`. The historical columns are written with the same text they
+   * always were (complete, unbounded) — this method changed WHERE the durable signal
+   * lives, not what an exchange means.
+   *
+   * A ROW THAT ALREADY EXISTS is never touched: `INSERT OR IGNORE` keeps the legacy
+   * row exactly as the user decided it must stay (READ-ONLY honest history), which is
+   * why its full columns remain NULL for ever instead of being backfilled on retry.
    */
   append(input: AppendExchangeInput): ChannelExchange {
     if (!input.agentName) throw new RangeError("exchange needs an agent_name");
@@ -139,6 +206,8 @@ export class ChannelExchangeLog {
         input.chatId ?? null,
         input.userText,
         input.replyText,
+        boundedHalf(input.userText),
+        boundedHalf(input.replyText),
         input.now,
       );
 
