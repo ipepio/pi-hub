@@ -7,6 +7,10 @@ import {
   openChannelPersistence,
   type ChannelPersistence,
 } from "../channels/persistence.ts";
+import {
+  openAgentSessionCatalogue,
+} from "../sessions/persistence.ts";
+import type { AgentSessionCatalogue } from "../sessions/catalogue.ts";
 
 // Todo el acceso a SQLite del Manager pasa por este módulo. El driver es
 // `node:sqlite`, el módulo integrado de Node: pihub se instala como servicio
@@ -37,7 +41,18 @@ export interface ManagerStore {
    * encolar dreñar y leer el espejo, igual que `agenda` encapsula su propio uso de
    * SQLite. El `SqliteDb` crudo sigue sin salir de `storage/`.
    */
-  readonly channels: ChannelPersistence;
+      readonly channels: ChannelPersistence;
+      /**
+       * Catálogo durable de sesiones de un Agent (migración v5: `agent_sessions` +
+       * `agent_session_selection`, T3 del ODD `agent-session-workspace`).
+       *
+       * Misma fachada estrecha que `channels`: quien lo consume no ve SQL ni el
+       * driver, y todas las invariantes del catálogo (identidad por Agent, unicidad
+       * de key, idempotencia de la entrada legacy, selección por superficie) viven
+       * en `sessions/catalogue.ts`. El `SqliteDb` crudo sigue sin salir de
+       * `storage/`.
+       */
+      readonly sessions: AgentSessionCatalogue;
   /** Ruta completa del fichero `.db` (los ficheros WAL/SHM viven a su lado). */
   readonly file: string;
   close(): void;
@@ -75,6 +90,7 @@ export async function openManagerStore(dataDir: string): Promise<ManagerStore> {
     return {
       agenda: new AgendaRepository(db),
       channels: openChannelPersistence(db),
+      sessions: openAgentSessionCatalogue(db),
       file,
       close: () => db.close(),
     };

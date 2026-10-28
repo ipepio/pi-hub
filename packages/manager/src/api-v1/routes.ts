@@ -52,6 +52,8 @@ import {
   CSRF_COOKIE,
 } from "./auth.js";
 import { registerAutonomyRoutes, type AutonomyRouteDeps } from "./autonomy.js";
+import { registerSessionRoutes } from "../sessions/routes.js";
+import type { AgentSessionCatalogue } from "../sessions/catalogue.js";
 import type { AutonomyProjection } from "../agenda/autonomy-projection.js";
 import type { AutonomyControl } from "../agenda/autonomy-control.js";
 import {
@@ -69,7 +71,6 @@ import {
 import { diffPackages } from "./package-sync.js";
 import {
   createAgentV1Schema,
-  createSessionV1Schema,
   createTurnV1Schema,
   customProviderV1Schema,
   managedProviderProjectionV1Schema,
@@ -169,6 +170,21 @@ export function correlationIdOf(c: {
        * behave as before this fix (nothing to drain).
        */
       outbox?: ChannelOutboxTeardown;
+      /**
+       * Catálogo durable de sesiones (T3 del ODD `agent-session-workspace`).
+       *
+       * Vive en este objeto por la misma razón que `exchanges`/`outbox`: el
+       * router no puede construirlo (necesita el driver SQLite que
+       * `ManagerStore` esconde) y `api.ts` ya reenvía ESTA misma bolsa de
+       * dependencias de runtime al router, así que añadir un parámetro nuevo a
+       * `createApiV1Router` dejaría el composition root sin forma de inyectarlo.
+       * Lectura por request, nunca copia al construir.
+       *
+       * Ausente = ningún almacén durable compuesto: las rutas de sesión
+       * responden 503 en vez de inventar un catálogo en memoria que mentiría
+       * sobre su persistencia.
+       */
+      sessions?: AgentSessionCatalogue;
     }
 
 /**
@@ -725,6 +741,36 @@ export function createApiV1Router(
             c.get("correlationId"),
             error,
           );
+        }
+        // The session catalogue is the rest of the Agent's state that `deleteAgent`
+        // cannot reach: the directory goes away with a recursive delete, the rows
+        // do not. Without this purge, re-creating an Agent with the same name
+        // inherits the previous conversations AND their per-surface selection —
+        // the identity bug this unit closes.
+        //
+        // NOT best-effort, unlike the channel teardown above: an unreachable queue
+        // is not reversible, but a catalogue that cannot be purged is a reason NOT
+        // to finish the delete. Answering 500 with the Agent intact keeps "a
+        // deleted Agent has no catalogue" true and makes the retry meaningful;
+        // purging after `deleteAgent` would answer 500 on an Agent that no longer
+        // exists, and leaving the rows silently would restore the bug.
+        const catalogue = channels?.sessions;
+        if (catalogue) {
+          try {
+            const purged = catalogue.deleteForAgent(name);
+            if (purged) {
+              console.log(
+                `[api-v1] SESSION_CATALOGUE_PURGED agent=${name} sessions=${purged}`,
+              );
+            }
+          } catch (error) {
+            console.error(
+              "[api-v1] fallo purgando el catálogo de sesiones del Agent:",
+              c.get("correlationId"),
+              error,
+            );
+            return fail(c, "INTERNAL_ERROR", "Could not delete the agent");
+          }
         }
         await deleteAgent(env, name);
         return c.body(null, 204);
@@ -1613,30 +1659,24 @@ export function createApiV1Router(
     });
   }
 
-  // --- §4.4 Sesiones ---
-
-  app.post("/agents/:name/sessions", async (c) => {
-    const name = c.req.param("name");
-    const config = await readAgent(env.dataDir, name).catch(() => undefined);
-    // El 404 va ANTES de validar el body: un agente inexistente no debe
-    // revelar si el payload era válido.
-    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
-
-    const parsed = createSessionV1Schema.safeParse(
-      await c.req.json().catch(() => ({})),
-    );
-    if (!parsed.success)
-      return fail(c, "BAD_REQUEST", "Invalid session payload");
-
-    return c.json(
-      {
-        key: parsed.data.sessionKey,
-        channel: parsed.data.channel,
-        agent: name,
-        createdAt: new Date().toISOString(),
-      },
-      201,
-    );
+  // --- §4.4 Sesiones (T3: catálogo durable + selección por superficie) ---
+  //
+  // `POST /agents/:name/sessions` conserva el contrato legacy documentado en
+  // `docs/manager-api-v1.md` §8 (`{key, channel, agent, createdAt}`), pero ahora la
+  // sesión es una FILA durable del catálogo del Agent en vez de un eco: el stub
+  // anterior inventaba la identidad en cada llamada y no la guardaba en ninguna
+  // parte. GET y `POST …/select` son aditivos y viven en el mismo catálogo.
+  //
+  // La autoridad sigue siendo la del router: este registro ocurre DESPUÉS del
+  // guard dual Bearer/cookie + CSRF de `/api/v1`, así que las tres rutas heredan
+  // la misma protección sin añadir una puerta nueva.
+  registerSessionRoutes(app, {
+    agentExists: async (name) =>
+      (await readAgent(env.dataDir, name).catch(() => undefined)) !== undefined,
+    // Lector, no copia: el store se compone en `createApp` y en algunos arranques
+    // de test no existe; leerlo al servir evita el `undefined` congelado.
+    catalogue: () => channels?.sessions,
+    now: () => Date.now(),
   });
 
   // --- Panel/operator extensions: transcribe ---

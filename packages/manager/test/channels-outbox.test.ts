@@ -107,11 +107,10 @@ const BASE = {
 };
 
 describe("migration v4 — channel_outbox", () => {
-  it("SCHEMA_VERSION is 4 and v4 creates the outbox table", async () => {
-    assert.equal(SCHEMA_VERSION, 4);
-    assert.equal(MIGRATIONS.at(-1)?.version, 4);
+  it("the latest schema retains the outbox table introduced in v4", async () => {
+    assert.equal(MIGRATIONS.at(-1)?.version, SCHEMA_VERSION);
     const db = await migratedDb();
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), SCHEMA_VERSION);
     assert.equal(tableNames(db).has("channel_outbox"), true);
   });
 
@@ -173,7 +172,7 @@ describe("migration v4 — channel_outbox", () => {
     assert.equal(userVersion(db), 3);
 
     runMigrations(db);
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), SCHEMA_VERSION);
     assert.equal(tableNames(db).has("channel_outbox"), true);
     const row = db.prepare("SELECT id FROM initiatives WHERE id = 'i1'").get() as
       | { id: string }
@@ -181,10 +180,10 @@ describe("migration v4 — channel_outbox", () => {
     assert.equal(row?.id, "i1", "v3 data survived the additive migration");
   });
 
-  it("re-running migrations on a v4 database is a no-op", async () => {
+  it("re-running migrations on the current schema is a no-op", async () => {
     const db = await migratedDb();
     runMigrations(db);
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), SCHEMA_VERSION);
   });
 });
 

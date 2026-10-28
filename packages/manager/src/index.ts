@@ -197,8 +197,11 @@ const runtime = await runStartup(
       // Aquí solo se rellena lo que ya existe: `exchanges` es el MISMO objeto que
       // escribe el delivery-router (la puerta estrecha del store, una instancia por
       // base abierta) — sin él la ruta projection-in no tendría filas que servir.
+      // `sessions` es el catálogo durable de sesiones (T3): una instancia por base
+      // abierta, cerrada con el store, NUNCA un handle por request.
       Object.assign(channelRouteDeps, {
         exchanges: store.channels.exchanges,
+        sessions: store.sessions,
       });
       return createApi(
         env,

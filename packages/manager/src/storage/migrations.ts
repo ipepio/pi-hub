@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export interface Migration {
     version: number;
@@ -328,7 +328,53 @@ CREATE INDEX channel_exchanges_agent
   ON channel_exchanges(agent_name, id);
 `;
 
-export const MIGRATIONS: readonly Migration[] = [
+    // Schema v5 (T3, agent-session-workspace): catálogo durable de sesiones de un
+    // Agent y la selección de UNA sesión por superficie.
+    //
+    // Por qué SQLite y no un fichero por Agent: el catálogo es un hecho del Manager
+    // (como `triggers`/`initiatives`) y tiene que sobrevivir al reinicio junto al
+    // resto del estado durable; un fichero suelto sería un segundo almacén con su
+    // propia atomicidad.
+    //
+    // Invariantes que el esquema sostiene (no la convención del llamador):
+    // - La clave de identidad es `(agent_name, session_id)`: una sesión NUNCA es
+    //   global. `session_key` es única POR Agent (`UNIQUE (agent_name, session_key)`),
+    //   que es lo que hace que la adopción del `agent:<nombre>:main` y la creación
+    //   idempotente de una key legacy no puedan duplicar filas.
+    // - `legacy` marca la entrada adoptada del runtime pre-catálogo. Es un hecho
+    //   declarado, no inferido: la UI puede decir la verdad sobre su contexto.
+    // - La selección es por `(agent_name, channel)`: web y Telegram eligen de forma
+    //   independiente sobre el MISMO catálogo (S3). La FK compuesta garantiza que
+    //   ninguna superficie pueda quedar seleccionando una sesión de otro Agent.
+    //
+    // Migración aditiva: dos tablas nuevas, ningún CHECK anterior cambia y ninguna
+    // fila existente se toca, así que no hace falta `disableForeignKeys`.
+    const V5_AGENT_SESSIONS = `
+    CREATE TABLE agent_sessions (
+      agent_name TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_key TEXT NOT NULL,
+      channel TEXT NOT NULL CHECK (channel IN ('web', 'telegram')),
+      name TEXT,
+      legacy INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1)),
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_name, session_id),
+      UNIQUE (agent_name, session_key)
+    );
+    CREATE INDEX agent_sessions_by_agent
+      ON agent_sessions (agent_name, created_at, session_id);
+    CREATE TABLE agent_session_selection (
+      agent_name TEXT NOT NULL,
+      channel TEXT NOT NULL CHECK (channel IN ('web', 'telegram')),
+      session_id TEXT NOT NULL,
+      selected_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_name, channel),
+      FOREIGN KEY (agent_name, session_id)
+        REFERENCES agent_sessions (agent_name, session_id) ON DELETE CASCADE
+    );
+    `;
+    
+    export const MIGRATIONS: readonly Migration[] = [
     { version: 1, up: (db) => db.exec(V1_DDL) },
     {
         version: 2,
@@ -354,6 +400,12 @@ export const MIGRATIONS: readonly Migration[] = [
         version: 4,
         up: (db) => {
             db.exec(V4_CHANNEL_TABLES);
+        },
+    },
+    {
+        version: 5,
+        up: (db) => {
+            db.exec(V5_AGENT_SESSIONS);
         },
     },
 ];

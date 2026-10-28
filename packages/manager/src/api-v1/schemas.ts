@@ -21,11 +21,49 @@ export const createAgentV1Schema = z.object({
   packages: z.array(z.string()).optional(),
 });
 
-/** Spec §4.4. */
+/**
+ * Spec §4.4 (T3 del ODD `agent-session-workspace`).
+ *
+ * El payload LEGACY `{channel, sessionKey}` sigue valiendo y hace lo mismo que
+ * antes —crear la sesión declarada—, pero ahora la fila es durable e idempotente
+ * por `(agent, sessionKey)`. Los dos campos pasan a ser opcionales para que el
+ * Manager pueda generar una identidad persistente propia (`name` es la etiqueta
+ * humana opcional).
+ *
+ * La `sessionKey` se convierte en la clave con la que el Runner abre su directorio
+ * de sesión, así que el catálogo rechaza lo que no puede ser una clave estable y
+ * segura: vacío, demasiado larga, espacios, caracteres de control, separadores de
+ * ruta, segmentos de traversal y el namespace `agent:<otro>:…` de otro Agent. Esa
+ * regla vive SOLO en `sessions/catalogue.ts` (`normaliseKey`); aquí se valida el
+ * tipo y nada más, para que el HTTP y el catálogo no tengan dos verdades que
+ * diverjan. `channel` es la superficie de ORIGEN de la sesión; no limita desde
+ * dónde se selecciona (el catálogo es uno solo y la selección es por superficie).
+ */
 export const createSessionV1Schema = z.object({
-  channel: z.enum(["web", "telegram"]),
-  sessionKey: z.string().min(1),
+  channel: z.enum(["web", "telegram"]).optional(),
+  sessionKey: z.string().optional(),
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(120)
+    .refine((value) => !/[\u0000-\u001f\u007f]/.test(value), {
+      message: "name cannot contain control characters",
+    })
+    .optional(),
 });
+
+/**
+ * Spec §4.4, `POST /agents/:name/sessions/:sessionId/select` (T3).
+ *
+ * La superficie es OBLIGATORIA: elegir sesión sin decir desde dónde la elige
+ * escribiría la selección de web y de Telegram a la vez, que es exactamente lo que
+ * S3 prohíbe. Estricto: un campo de más sería un caller creyendo que cambia otra
+ * cosa.
+ */
+export const selectSessionV1Schema = z
+  .object({ channel: z.enum(["web", "telegram"]) })
+  .strict();
 
 /**
  * Spec §4.5 y §5: `turnId`, `idempotencyKey` y `correlationId` son

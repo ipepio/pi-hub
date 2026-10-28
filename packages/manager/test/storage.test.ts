@@ -402,6 +402,10 @@ describe("almacén SQLite del Manager", () => {
       "human_request_deliveries",
       "runtime_admission",
       "channel_outbox",
+      // v5 (T3, agent-session-workspace): catálogo durable de sesiones y la
+      // selección de una sesión por superficie.
+      "agent_sessions",
+      "agent_session_selection",
     ]) {
       assert.ok(
         tables.some((t) => t.name === name),
@@ -427,6 +431,7 @@ describe("almacén SQLite del Manager", () => {
       "human_request_deliveries_by_initiative",
       "channel_outbox_due",
       "channel_outbox_agent",
+      "agent_sessions_by_agent",
     ];
     for (const name of expected) {
       assert.ok(
@@ -497,7 +502,60 @@ describe("almacén SQLite del Manager", () => {
     assert.strictEqual(rows.length, 1);
   });
 
-  it("aborta el arranque si la versión en disco supera la soportada", async () => {
+      it("migración v4 → v5 añade el catálogo de sesiones sin tocar filas existentes", () => {
+        // La v5 es aditiva (dos tablas nuevas, ningún CHECK anterior cambia). Este
+        // test fija la promesa de S7: una instalación que YA tiene Agenda y canales
+        // no pierde nada al ganar el catálogo.
+        const db = new DatabaseSync(":memory:");
+        try {
+          runMigrations(
+            db,
+            MIGRATIONS.filter((migration) => migration.version <= 4),
+            4,
+          );
+          assert.strictEqual(userVersion(db), 4);
+          assert.strictEqual(tableExists(db, "agent_sessions"), false);
+
+          insertTrigger(db, { id: "trg-v4" });
+          db.prepare(
+            "INSERT INTO channel_outbox (id, agent_name, kind, target, payload, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+          ).run("pending:v4", "alice", "telegram", "chat-1", "hola", 1000, 1000);
+          db.prepare(
+            "INSERT INTO channel_exchanges (agent_name, turn_id, origin, chat_id, user_text, reply_text, created_at) VALUES (?,?,?,?,?,?,?)",
+          ).run("alice", "turn-v4", "telegram", "chat-1", "hola", "qué tal", 1000);
+
+          runMigrations(db);
+
+          assert.strictEqual(userVersion(db), SCHEMA_VERSION);
+          assert.ok(tableExists(db, "agent_sessions"), "tabla agent_sessions presente");
+          assert.ok(
+            tableExists(db, "agent_session_selection"),
+            "tabla agent_session_selection presente",
+          );
+
+          const count = (sql: string, ...params: unknown[]): number =>
+            Number((db.prepare(sql).get(...params) as { n: number }).n);
+          assert.strictEqual(
+            count("SELECT COUNT(*) AS n FROM triggers WHERE id = ?", "trg-v4"),
+            1,
+            "los Triggers sobreviven a la v5",
+          );
+          assert.strictEqual(
+            count("SELECT COUNT(*) AS n FROM channel_outbox WHERE id = ?", "pending:v4"),
+            1,
+            "la cola de canales sobrevive a la v5",
+          );
+          assert.strictEqual(
+            count("SELECT COUNT(*) AS n FROM channel_exchanges WHERE turn_id = ?", "turn-v4"),
+            1,
+            "el espejo de intercambios sobrevive a la v5",
+          );
+        } finally {
+          db.close();
+        }
+      });
+
+      it("aborta el arranque si la versión en disco supera la soportada", async () => {
     const dataDir = await tmpDataDir();
     const dir = path.join(dataDir, "manager");
     await fs.mkdir(dir, { recursive: true });
@@ -573,8 +631,8 @@ describe("almacén SQLite del Manager", () => {
   describe("migración v1 → v3", () => {
     it("una instalación nueva termina en el último schema con forma, índices y constraints", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.strictEqual(SCHEMA_VERSION, 4);
-      assert.strictEqual(userVersion(db), 4);
+      assert.strictEqual(SCHEMA_VERSION, 5);
+      assert.strictEqual(userVersion(db), 5);
 
       const triggersCols = tableColumns(db, "triggers").map((c) => c.name);
       for (const col of ["create_idempotency_key", "create_command_hash"]) {
@@ -1026,7 +1084,7 @@ describe("almacén SQLite del Manager", () => {
     it("reabrir un volumen ya migrado al último schema no re-aplica la migración", async () => {
       const dataDir = await tmpDataDir();
       const first = await openRaw(dataDir);
-      assert.strictEqual(userVersion(first), 4);
+      assert.strictEqual(userVersion(first), SCHEMA_VERSION);
       insertTrigger(first, { id: "trg-keep" });
       first
         .prepare("UPDATE triggers SET create_idempotency_key = ? WHERE id = ?")
@@ -1035,7 +1093,7 @@ describe("almacén SQLite del Manager", () => {
       openRawDbs.splice(openRawDbs.indexOf(first), 1);
 
       const second = await openRaw(dataDir);
-      assert.strictEqual(userVersion(second), 4);
+      assert.strictEqual(userVersion(second), SCHEMA_VERSION);
       assert.ok(tableExists(second, "runtime_admission"));
       assert.ok(tableExists(second, "human_request_deliveries"));
       const kept = second
