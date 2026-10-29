@@ -5,6 +5,7 @@ import type { TurnExecution, TurnHandle } from "../agenda/turn-execution.ts";
 import { PairingError, type PairingMachine } from "./pairing.ts";
 import { readChannelRecords } from "./store.ts";
 import { systemLabel } from "./labels.ts";
+import type { AgentSessionCatalogue, SessionSurface } from "../sessions/catalogue.ts";
 
 /**
  * Inbound handler (design §1.4, tasks c-I6) — the consumer of the `onInbound`
@@ -53,12 +54,264 @@ import { systemLabel } from "./labels.ts";
  * not re-queued for a surprise later run either: it is dropped with a system
  * notice through the outbox (copy in `labels.ts`), and every rejection of the
  * drain (resolver, queue, outbox) is logged so the rest of the queue survives.
+ *
+ * Commands (T6a): a message from the BOUND chat that starts with `/` is a command
+ * (`/new`, `/sessions`, `/session`, `/stop`), resolved BEFORE the turn path and
+ * AFTER the binding check — an unbound chat gets the pairing flow and never a
+ * command. A command never reaches `startTurn` and never enters the FIFO: its
+ * answer is a system message through the same outbox, so creating, listing,
+ * selecting and aborting work while the Agent is busy. The catalogue operations
+ * come in through the narrow `sessionCommands` port (production wires
+ * `catalogueSessionCommands` over the durable catalogue): without that port a
+ * `/…` message keeps following the historical text path.
  */
 
 /** Messages waiting behind a live turn, per `(agent, kind)`. */
 export const INBOUND_QUEUE_DEPTH = 10;
 
-/** Outbound delivery of a transport-level message (pairing code): the outbox. */
+    /**
+     * Cuántas sesiones caben en la respuesta de `/sessions`: la lista está ACOTADA.
+     * Un catálogo puede crecer sin límite y un chat no es un dashboard; el recuento
+     * (`10 de N`) dice al humano que hay más sin volcar cientos de líneas a Telegram.
+     */
+    export const SESSION_LIST_LIMIT = 10;
+
+    /** Una sesión tal y como se nombra en el chat: id opaco + etiqueta humana opcional. */
+    export interface ChannelSessionView {
+      readonly id: string;
+      readonly name: string | null;
+    }
+
+    /**
+     * Operaciones de catálogo que un comando de texto necesita (T6a).
+     *
+     * Es un objeto ESTRECHO, no la clase `AgentSessionCatalogue`: el inbound no conoce
+     * SQL ni transacciones, y qué superficie gobierna cada `ChannelKind` lo decide quien
+     * compone (el mismo mapa que ya resuelve `sessionKeyFor`). Inyectarlo es opcional a
+     * propósito: sin él, un mensaje que empieza por `/` sigue el camino histórico
+     * (texto normal), así que una composición sin catálogo no cambia de comportamiento
+     * por esta unidad.
+     *
+     * Todo lo que se lance desde aquí lo convierte el handler en una respuesta de
+     * sistema: un comando siempre contesta, y un catálogo caído no puede dejar al humano
+     * sin respuesta ni abrir un turno por accidente.
+     */
+    export interface ChannelSessionCommands {
+      /** Crea una sesión del Agent y la SELECCIONA en la superficie de este canal. */
+      newSession(input: {
+        agentName: string;
+        kind: ChannelKind;
+        name?: string;
+      }): ChannelSessionView;
+      /** Catálogo del Agent + la sesión seleccionada en la superficie de este canal. */
+      listSessions(input: { agentName: string; kind: ChannelKind }): {
+        sessions: ChannelSessionView[];
+        selectedId: string | null;
+      };
+      /** Selecciona una sesión por id en la superficie de este canal. Lanza si no existe. */
+      selectSession(input: {
+        agentName: string;
+        kind: ChannelKind;
+        sessionId: string;
+      }): ChannelSessionView;
+      /** ¿El Agent tiene un turno vivo AHORA? (consultar no cuesta el turno). */
+      isBusy(input: { agentName: string }): boolean;
+      /** Aborta el turno vivo del Agent; `false` = no había ninguno que abortar. */
+      abortIfLive(input: { agentName: string }): boolean;
+    }
+
+    /**
+     * Puerta del catálogo que el adaptador de comandos necesita: crear, listar y
+     * seleccionar. `Pick` y no la clase entera, para que el adaptador no pueda tocar
+     * nada más (borrar un Agent, por ejemplo).
+     */
+    export interface CatalogueSessionCommandDeps {
+      sessions: Pick<AgentSessionCatalogue, "create" | "list" | "select">;
+      /** Qué superficie gobierna cada tipo de canal: el mismo mapa que `sessionKeyFor`. */
+      surfaceOf: (kind: ChannelKind) => SessionSurface;
+      now: () => number;
+      /** ¿Hay un turno vivo del Agent? (`TurnExecution.hasLiveTurnForAgent` en producción). */
+      isBusy: (agentName: string) => boolean;
+      /** Aborta el turno vivo del Agent y dice si había alguno. */
+      abortIfLive: (agentName: string) => boolean;
+    }
+
+    /**
+     * Adaptador REAL de los comandos sobre el catálogo durable (T6a).
+     *
+     * Vive junto al contrato que implementa para que la composición solo aporte el
+     * catálogo y las dos preguntas sobre el turno vivo: ninguna regla de catálogo se
+     * re-implementa aquí (crear es `create`, seleccionar es `select`, listar es `list`),
+     * así que la identidad por Agent, la transacción y la selección por superficie
+     * siguen teniendo un solo dueño. La superficie sale del mapa que ya existe en la
+     * composición, no de una copia de ese mapa en este fichero.
+     */
+    export function catalogueSessionCommands(
+      deps: CatalogueSessionCommandDeps,
+    ): ChannelSessionCommands {
+      return {
+        newSession: ({ agentName, kind, name }) => {
+          const channel = deps.surfaceOf(kind);
+          const created = deps.sessions.create({ agentName, channel, name, now: deps.now() });
+          // Crear y seleccionar es UNA operación para el humano: `/new` significa «este
+          // chat pasa a hablar de la conversación nueva». Dos llamadas al catálogo, no
+          // una transacción nueva: cada una es la operación que ya existe.
+          const selected = deps.sessions.select({
+            agentName,
+            channel,
+            sessionId: created.id,
+            now: deps.now(),
+          });
+          return { id: selected.id, name: selected.name };
+        },
+        listSessions: ({ agentName, kind }) => {
+          const snapshot = deps.sessions.list(agentName, deps.now());
+          return {
+            sessions: snapshot.sessions.map((session) => ({
+              id: session.id,
+              name: session.name,
+            })),
+            selectedId: snapshot.selection[deps.surfaceOf(kind)],
+          };
+        },
+        selectSession: ({ agentName, kind, sessionId }) => {
+          const selected = deps.sessions.select({
+            agentName,
+            channel: deps.surfaceOf(kind),
+            sessionId,
+            now: deps.now(),
+          });
+          return { id: selected.id, name: selected.name };
+        },
+        isBusy: ({ agentName }) => deps.isBusy(agentName),
+        abortIfLive: ({ agentName }) => deps.abortIfLive(agentName),
+      };
+    }
+
+    /** Un comando de texto (`/new`, `/sessions`, `/session x`, `/stop`), ya parseado. */
+    interface ChannelCommand {
+      /** Nombre SIN la barra y en minúsculas. */
+      readonly name: string;
+      /** Resto del mensaje recortado; `""` si el comando vino solo. */
+      readonly argument: string;
+    }
+
+    /**
+     * `" /new Sesión de prueba"` → `{ name: "new", argument: "Sesión de prueba" }`.
+     *
+     * Tres decisiones, y las tres se prueban:
+     * - Solo es comando si el mensaje EMPIEZA por `/` (ya recortado): «mira /new» es
+     *   texto normal, porque un mensaje del humano no deja de serlo por llevar una barra.
+     * - Telegram añade `@bot` al comando en grupos (`/new@mi_bot`): ese sufijo es la
+     *   identidad del bot y no parte del comando.
+     * - El nombre se compara en minúsculas: `/NEW` y `/new` son el mismo comando.
+     */
+    function parseChannelCommand(text: string): ChannelCommand | undefined {
+      const trimmed = text.trim();
+      if (!trimmed.startsWith("/")) return undefined;
+      const cut = trimmed.search(/\s/);
+      const head = cut === -1 ? trimmed : trimmed.slice(0, cut);
+      const argument = cut === -1 ? "" : trimmed.slice(cut).trim();
+      const withoutSlash = head.slice(1);
+      const at = withoutSlash.indexOf("@");
+      const name = (at === -1 ? withoutSlash : withoutSlash.slice(0, at)).toLowerCase();
+      if (name === "") return undefined;
+      return { name, argument };
+    }
+
+    /**
+     * Cómo se nombra una sesión en el chat: `nombre (id)`, o el id solo si aún no tiene
+     * nombre humano. El id viaja siempre porque es lo único que el humano puede dictar
+     * sin ambigüedad cuando dos sesiones se llaman igual.
+     */
+    function sessionRef(session: ChannelSessionView): string {
+      return systemLabel("sessionRef", {
+        name: session.name ?? systemLabel("sessionUnnamed"),
+        id: session.id,
+      });
+    }
+
+    /**
+     * Resolución del argumento de `/session`: primero el **id** (opaco y sin ambigüedad),
+     * después el **nombre exacto**. Un nombre inexistente —o repetido— no selecciona
+     * nada: elegir «la primera» sería adivinar cuál quería el humano.
+     */
+    function findSession(
+      sessions: readonly ChannelSessionView[],
+      target: string,
+    ): ChannelSessionView | undefined {
+      const byId = sessions.find((session) => session.id === target);
+      if (byId) return byId;
+      const byName = sessions.filter((session) => session.name === target);
+      return byName.length === 1 ? byName[0] : undefined;
+    }
+
+    /**
+     * El texto de respuesta de un comando, ya renderizado desde el catálogo de labels.
+     *
+     * Vive fuera de la clase porque es una traducción «comando → copy», no estado: la
+     * clase solo se encarga de enrutar la respuesta al outbox y de convertir un fallo
+     * del catálogo en un mensaje de sistema.
+     */
+    function commandText(
+      commands: ChannelSessionCommands,
+      agentName: string,
+      kind: ChannelKind,
+      command: ChannelCommand,
+    ): string {
+      switch (command.name) {
+        case "new": {
+          const created = commands.newSession({
+            agentName,
+            kind,
+            ...(command.argument === "" ? {} : { name: command.argument }),
+          });
+          return systemLabel("sessionCreated", { session: sessionRef(created) });
+        }
+        case "sessions": {
+          const { sessions, selectedId } = commands.listSessions({ agentName, kind });
+          const shown = sessions.slice(0, SESSION_LIST_LIMIT);
+          const lines = shown.map((session) =>
+            session.id === selectedId
+              ? `- ${sessionRef(session)} ${systemLabel("sessionSelectedMark")}`
+              : `- ${sessionRef(session)}`,
+          );
+          return systemLabel("sessionList", {
+            count: String(shown.length),
+            total: String(sessions.length),
+            lines: lines.join("\n"),
+          });
+        }
+        case "session": {
+          if (command.argument === "") {
+            const { sessions, selectedId } = commands.listSessions({ agentName, kind });
+            const current = sessions.find((session) => session.id === selectedId);
+            const status = systemLabel(
+              commands.isBusy({ agentName }) ? "agentBusy" : "agentIdle",
+            );
+            if (!current) return systemLabel("sessionNone", { status });
+            return systemLabel("sessionCurrent", { session: sessionRef(current), status });
+          }
+          const { sessions } = commands.listSessions({ agentName, kind });
+          const target = findSession(sessions, command.argument);
+          if (!target) {
+            return systemLabel("sessionUnknownTarget", { target: command.argument });
+          }
+          const selected = commands.selectSession({ agentName, kind, sessionId: target.id });
+          return systemLabel("sessionSwitched", { session: sessionRef(selected) });
+        }
+        case "stop":
+          // El binding ya está comprobado: solo el chat enlazado llega aquí, así que
+          // `/stop` no necesita (ni debe) otra condición de propiedad.
+          return systemLabel(
+            commands.abortIfLive({ agentName }) ? "stopRequested" : "stopNothing",
+          );
+        default:
+          return systemLabel("unknownCommand", { command: command.name });
+      }
+    }
+
+    /** Outbound delivery of a transport-level message (pairing code): the outbox. */
 export interface InboundEnqueueInput {
   agentName: string;
   kind: ChannelKind;
@@ -117,8 +370,18 @@ export interface ChannelInboundDeps {
        * un import de vuelta sería un ciclo. Sin inyección se conserva la main histórica
        * (`agent:<nombre>:main`), que es lo que usan los tests anteriores a esta unidad.
        */
-      sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
-  newTurnId?: () => string;
+          sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
+      /**
+       * Operaciones de catálogo para los comandos de texto (`/new`, `/sessions`,
+       * `/session`, `/stop`). Se inyecta en la composición, que es quien sabe qué
+       * superficie gobierna cada canal y cómo llegar al abort del turno vivo.
+       *
+       * Ausente = los mensajes que empiezan por `/` siguen el camino histórico (texto
+       * normal). Es una dependencia de los tests anteriores a esta unidad y no lo que
+       * arranca la producción.
+       */
+      sessionCommands?: ChannelSessionCommands;
+      newTurnId?: () => string;
   log?: (line: string) => void;
 }
 
@@ -135,6 +398,7 @@ export class ChannelInboundHandler {
   private readonly resolveRunner: (agentName: string) => Promise<{ port: number } | undefined>;
   private readonly enqueue: EnqueueFn;
   private readonly sessionKeyFor: (agentName: string, kind: ChannelKind, chatId: string) => string;
+  private readonly sessionCommands: ChannelSessionCommands | undefined;
   private readonly newTurnId: () => string;
   private readonly log: (line: string) => void;
   private readonly queues = new Map<string, QueuedInbound[]>();
@@ -148,6 +412,7 @@ export class ChannelInboundHandler {
     this.enqueue = deps.enqueue;
     this.sessionKeyFor =
       deps.sessionKeyFor ?? ((agentName) => mainSessionKeyOf(agentName));
+    this.sessionCommands = deps.sessionCommands;
     this.newTurnId = deps.newTurnId ?? randomUUID;
     this.log = deps.log ?? ((line) => console.error(`[channels] ${line}`));
   }
@@ -191,6 +456,15 @@ export class ChannelInboundHandler {
         );
         return;
       }
+      // T6a: los comandos se resuelven ANTES del camino de turnos (no gastan el
+      // turno del Agent) y DESPUÉS del binding — un chat sin enlazar recibe el
+      // flujo de emparejamiento y nunca un comando.
+      const command =
+        this.sessionCommands === undefined ? undefined : parseChannelCommand(message.text);
+      if (command !== undefined && this.sessionCommands !== undefined) {
+        await this.replyCommand(agentName, kind, chatId, this.sessionCommands, command);
+        return;
+      }
       this.queue(agentName, kind, chatId, message);
       return;
     }
@@ -227,8 +501,38 @@ export class ChannelInboundHandler {
     }
   }
 
-  /** Messages waiting behind a live turn for one `(agent, kind)`. */
-  queueDepth(agentName: string, kind: ChannelKind): number {
+      // --- commands (T6a) --------------------------------------------------------
+
+      /**
+       * Contesta un comando por el outbox. Los comandos NO entran en la cola FIFO: crear,
+       * listar, seleccionar y abortar no necesitan el turno del Agent, así que responden
+       * también con un turno vivo — que es justo cuando el humano los necesita.
+       *
+       * El texto sale siempre del catálogo de labels (`labels.ts`): el handler no tiene
+       * copy propio. Un fallo del catálogo de sesiones se convierte en «no he podido»
+       * (y en una línea de log) en vez de en un turno o en un silencio.
+       */
+      private async replyCommand(
+        agentName: string,
+        kind: ChannelKind,
+        chatId: string,
+        commands: ChannelSessionCommands,
+        command: ChannelCommand,
+      ): Promise<void> {
+        let text: string;
+        try {
+          text = commandText(commands, agentName, kind, command);
+        } catch (error) {
+          this.log(
+            `command failed agent=${agentName} kind=${kind} command=/${command.name}: ${String(error)}`,
+          );
+          text = systemLabel("commandFailed", { command: command.name });
+        }
+        await this.enqueue({ agentName, kind, chatId, text });
+      }
+
+      /** Messages waiting behind a live turn for one `(agent, kind)`. */
+      queueDepth(agentName: string, kind: ChannelKind): number {
     return this.queues.get(queueKey(agentName, kind))?.length ?? 0;
   }
 

@@ -292,10 +292,23 @@ export class TurnExecution {
     return hasLiveTurnForAgent(this.turnosVivos.keys(), agentName);
   }
 
-  /** ¿Hay algún turno vivo, de cualquier Agent? (rechaza recargas globales). */
-  hasAnyLiveTurn(): boolean {
-    return this.turnosVivos.size > 0;
-  }
+      /** ¿Hay algún turno vivo, de cualquier Agent? (rechaza recargas globales). */
+      hasAnyLiveTurn(): boolean {
+        return this.turnosVivos.size > 0;
+      }
+
+      /**
+       * Id del turno vivo del Agent (T6a: la fuente de `/stop`). `undefined` si no
+       * hay. La clave del registro es `agentName:turnId` y el nombre de Agent no
+       * contiene `:` (validación `^[a-z0-9][a-z0-9-]*$`), así que el sufijo es el id.
+       */
+      liveTurnIdForAgent(agentName: string): string | undefined {
+        const prefix = `${agentName}:`;
+        for (const key of this.turnosVivos.keys()) {
+          if (key.startsWith(prefix)) return key.slice(prefix.length);
+        }
+        return undefined;
+      }
 
   /**
    * Abre el WS contra el Runner, registra el turno como vivo y traduce los

@@ -2,10 +2,10 @@
 
 Esta nota describe el **catálogo durable de sesiones** que el Manager estrena en la
 unidad T3 del ODD `odd/tasks/agent-session-workspace.md` (specs S2 y S7), la
-**admisión de un único turno por Agent** de la unidad T4a y la **política de
-persistencia del transcript** de la unidad T5a. Los comandos de sesión de Telegram
-(T6) y la migración/UI del dashboard (T5b) siguen pendientes, y este documento no
-los promete.
+**admisión de un único turno por Agent** de la unidad T4a, la **política de
+persistencia del transcript** de la unidad T5a y los **comandos de texto de Telegram**
+de la unidad T6a (`/new`, `/sessions`, `/session`, `/stop`). La migración/UI de
+sesiones del dashboard (T5b restante) sigue pendiente, y este documento no la promete.
 
 La política de transcript tiene su propia sección (`## Transcript persistence
 policy (T5a)`): léela antes de tocar `channel_exchanges` o de prometer «historial
@@ -261,7 +261,57 @@ que no es el puerto. La semántica de `disconnect()` **sí** está hecha (pide a
 y no libera, ver arriba) y el arranque del Supervisor ya está fenced contra un
 puerto ocupado (ver la sección siguiente).
 
-## Defensa del Runner: una ejecución por proceso (T4c, parcial)
+    ## Comandos de texto de Telegram (T6a)
+
+    Un mensaje del **chat enlazado** que empieza por `/` es un **comando**, no un
+    prompt. Los comandos viven en `channels/inbound.ts` y su copy en el catálogo de
+    labels (`channels/labels.ts`): ni una sola frase visible está escrita en el
+    handler.
+
+    | Comando | Qué hace |
+    | --- | --- |
+    | `/new [nombre]` | Crea una sesión del Agent y la **selecciona** en la superficie del canal. |
+    | `/sessions` | Lista las sesiones (máximo **10**, con `id` y marca de la seleccionada). |
+    | `/session` | Dice la sesión que este chat está usando y si el Agent está ocupado. |
+    | `/session <nombre o id>` | Selecciona esa sesión **para este chat**. |
+    | `/stop` | Pide abortar el turno vivo del Agent; sin turno vivo contesta que no hay nada en marcha. |
+    | cualquier otra cosa | «No conozco el comando» con la lista de comandos disponibles. |
+
+    Reglas que sostiene la unidad, y por qué:
+
+    1. **Después del binding, antes del turno.** Un chat **no enlazado** recibe el flujo
+       de emparejamiento de siempre (código o auto-pair) y **nunca** un comando: el
+       catálogo no se toca desde un chat que aún no es del Agent.
+    2. **Un comando no gasta el turno del Agent.** No entra en la cola FIFO ni llama a
+       `startTurn`; contesta como mensaje de **sistema** por el outbox. Consecuencia
+       deliberada: crear, listar, seleccionar y abortar funcionan **con el Agent
+       ocupado**, que es exactamente cuando el humano los necesita.
+    3. **La selección es la misma del catálogo y de una sola superficie.** `/new` y
+       `/session` mueven la selección de `telegram` y **no** la de `web` (S3). El
+       mensaje siguiente corre en la sesión recién elegida porque el inbound la lee al
+       **aceptar** el mensaje, no al despachar el turno.
+    4. **Resolución del argumento de `/session`:** primero el `id` (opaco, sin
+       ambigüedad), después el **nombre exacto**. Un nombre inexistente —o repetido— no
+       selecciona nada: adivinar «la primera» sería elegir por el humano.
+    5. **La lista está acotada a 10** con el recuento `10 de N`: un catálogo puede
+       crecer sin límite y un chat no es un dashboard.
+    6. **Un catálogo caído no deja al humano sin respuesta:** el fallo se registra y se
+       contesta «no he podido ejecutar», nunca se abre un turno por accidente.
+    7. **Sin comandos inyectados, `/` es texto normal.** La composición inyecta
+       `sessionCommands` (el adaptador real es `catalogueSessionCommands`, en
+       `channels/inbound.ts`); una composición que no lo inyecte conserva el camino
+       histórico, y por eso los tests anteriores a esta unidad no cambian.
+
+    `/stop` aborta el turno **vivo del Agent** (de cualquier origen), y solo puede
+    llegar aquí el chat enlazado: la comprobación de propiedad ya ocurrió. La costura es
+    `abortIfLive(agentName)`, inyectada por la composición sobre
+    `TurnExecution.liveTurnIdForAgent` + `abort` — la misma autoridad de admisión que
+    rechaza un segundo turno.
+
+    Los comandos (`channels/inbound.ts`), su adaptador y la inyección en la composición
+    (`channels/composition.ts`) son de esta unidad y van en el mismo commit.
+
+    ## Defensa del Runner: una ejecución por proceso (T4c, parcial)
 
 La admisión del Manager es en memoria: si el Manager se reinicia, o si su propio
 proceso pierde la conexión, el Manager puede creer que el Agent está libre
@@ -462,7 +512,11 @@ En el Manager eso significa, literalmente:
 - No trae el lado del dashboard: el cliente interno todavía no declara `sessionKey` en
   su tipo de fila ni lo usa para pintar historial por sesión, y no hay DB, ruta propia
   ni UI de sesiones en D. Esas unidades siguen pendientes (T5b restante).
-- No expone comandos `/new`, `/sessions`, `/session` en Telegram (T6).
+    - No expone la **UI ni la migración** de sesiones del dashboard (T5b restante). Los
+      comandos de texto de Telegram (`/new`, `/sessions`, `/session`, `/stop`) sí están
+      aquí (T6a), y `/stop` no puede abortar todavía un turno **web** porque
+      `TurnExecution` no publica el `turnId` vivo por Agent: la costura `abortIfLive`
+      espera esa pieza.
 - No reanuda el contexto del Runner tras un reinicio por sí mismo: la continuidad
   del `sessionKey` es del Runner, que ya guarda su directorio por clave. Este
   catálogo solo garantiza que la identidad y la selección sobrevivan.

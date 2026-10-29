@@ -6,7 +6,10 @@ import type {
 import type { HumanRequestChannel } from "../primary-channel/human-request-delivery.ts";
 import type { AgentSessionCatalogue, SessionSurface } from "../sessions/catalogue.ts";
 import { ChannelDeliveryRouter } from "./delivery-router.ts";
-import { ChannelInboundHandler } from "./inbound.ts";
+import {
+  catalogueSessionCommands,
+  ChannelInboundHandler,
+} from "./inbound.ts";
 import type { ChannelExchangeLog } from "./exchange-log.ts";
 import type { ChannelOutbox, ChannelOutboxOptions } from "./outbox.ts";
 import { ChannelOutboxWorker } from "./outbox-worker.ts";
@@ -81,7 +84,10 @@ export interface ChannelCompositionDeps {
   registry: ChannelTransportLike;
   pairing: PairingMachine;
       /** The shared `TurnExecution`: a channel inbound becomes a real turn. */
-      turns: Pick<TurnExecution, "startTurn">;
+          turns: Pick<
+            TurnExecution,
+            "startTurn" | "abort" | "liveTurnIdForAgent" | "hasLiveTurnForAgent"
+          >;
       /**
        * Catálogo durable de sesiones (T5b/2). El composition root de producción SIEMPRE
        * pasa `store.sessions`: un mensaje entrante corre en la sesión seleccionada de SU
@@ -89,7 +95,10 @@ export interface ChannelCompositionDeps {
        * histórico `agent:<nombre>:main`, que es una dependencia de los tests anteriores a
        * esta unidad y no lo que arranca la producción.
        */
-      sessions?: Pick<AgentSessionCatalogue, "getSelectedSession">;
+          sessions?: Pick<
+            AgentSessionCatalogue,
+            "getSelectedSession" | "create" | "list" | "select"
+          >;
   /** Runner port resolver — never a restart, never a port in the wire. */
   resolveRunner: (agentName: string) => Promise<{ port: number } | undefined>;
   now?: () => number;
@@ -172,14 +181,29 @@ export function composeChannels(deps: ChannelCompositionDeps): ChannelCompositio
     // callback se resuelve al ACEPTAR el mensaje (no al despacharlo), y un error del
     // catálogo lo trata el inbound como fail-closed. Sin catálogo inyectado la costura
     // queda sin definir y el handler usa la main histórica.
-    sessionKeyFor: deps.sessions
-      ? (agentName: string, kind: ChannelKind) =>
-          deps.sessions!.getSelectedSession({
-            agentName,
-            channel: SURFACE_BY_CHANNEL[kind],
-            now: now(),
-          }).key
-      : undefined,
+        sessionKeyFor: deps.sessions
+          ? (agentName: string, kind: ChannelKind) =>
+              deps.sessions!.getSelectedSession({
+                agentName,
+                channel: SURFACE_BY_CHANNEL[kind],
+                now: now(),
+              }).key
+          : undefined,
+        // T6a: comandos de texto de sesión (/new, /sessions, /session, /stop) sobre el
+        // catálogo durable. Sin catálogo la costura queda sin definir y el handler
+        // trata "/…" como texto (comportamiento histórico de los tests previos).
+        sessionCommands: deps.sessions
+          ? catalogueSessionCommands({
+              sessions: deps.sessions,
+              surfaceOf: (kind) => SURFACE_BY_CHANNEL[kind],
+              now,
+              isBusy: (agentName) => deps.turns.hasLiveTurnForAgent(agentName),
+              abortIfLive: (agentName) => {
+                const turnId = deps.turns.liveTurnIdForAgent(agentName);
+                return turnId !== undefined ? deps.turns.abort(agentName, turnId) : false;
+              },
+            })
+          : undefined,
     // System replies (a pairing code) are outbox rows too: the transport is
     // never touched directly, so one owner keeps the retry policy.
     enqueue: async (input) => {

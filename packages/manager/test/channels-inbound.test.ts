@@ -4,7 +4,6 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  agentPaths,
   scaffoldAgentDirs,
   scaffoldGlobalDirs,
   writeAgent,
@@ -12,6 +11,7 @@ import {
 import type { InboundMessage } from "@pihub/channels";
 import { PairingMachine } from "../src/channels/pairing.ts";
 import { writeChannelRecords, type ChannelRecord } from "../src/channels/store.ts";
+import { openManagerStore } from "../src/storage/sqlite.ts";
 import { systemLabel } from "../src/channels/labels.ts";
 import { DomainError } from "../src/agenda/errors.ts";
 import {
@@ -19,6 +19,7 @@ import {
   INBOUND_QUEUE_DEPTH,
   mainSessionKeyOf,
   pairingCodeReplyText,
+  catalogueSessionCommands,
   type EnqueueFn,
 } from "../src/channels/inbound.ts";
 // `handle` es fire-and-forget (el adapter nunca se espera); los tests llaman a
@@ -598,3 +599,380 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
     assert.ok(logs.some((line) => line.includes("no channel")));
   });
 });
+
+    // T6a — comandos de texto del chat enlazado.
+    //
+    // El seam es el handler completo (`handleAsync`), igual que en el resto de esta
+    // suite: lo observable es «¿se ejecuta un turno del Agent?» y «¿qué contesta el
+    // Manager?» (una fila del outbox). El adaptador de comandos se inyecta como objeto
+    // de mentira en el primer bloque porque lo que aquí se fija es el CONTRATO entre el
+    // inbound y el catálogo (qué método se llama, con qué argumento y qué se responde),
+    // no el SQL del catálogo; el adaptador REAL (`catalogueSessionCommands`) tiene su
+    // propio bloque al final, contra el catálogo durable de producción.
+
+    describe("ChannelInboundHandler — comandos de texto (T6a)", () => {
+      interface FakeState {
+        busy: boolean;
+        abort: boolean;
+        selected: string;
+      }
+
+      /** Adaptador de comandos de mentira: registra las llamadas y muta su estado. */
+      function fakeCommands(
+        state: FakeState,
+        initial?: Array<{ id: string; name: string | null }>,
+      ) {
+        const sessions = [...(initial ?? [
+          { id: "main", name: null },
+          { id: "s2", name: "trabajo" },
+        ])];
+        const calls: string[] = [];
+        const commands = {
+          newSession: (input: { name?: string }) => {
+            calls.push(`new:${input.name ?? ""}`);
+            const created = { id: `s${sessions.length + 1}`, name: input.name ?? null };
+            sessions.push(created);
+            state.selected = created.id;
+            return created;
+          },
+          listSessions: () => {
+            calls.push("list");
+            return { sessions: [...sessions], selectedId: state.selected };
+          },
+          selectSession: (input: { sessionId: string }) => {
+            calls.push(`select:${input.sessionId}`);
+            state.selected = input.sessionId;
+            return sessions.find((session) => session.id === input.sessionId) ??
+              { id: input.sessionId, name: null };
+          },
+          isBusy: () => state.busy,
+          abortIfLive: () => {
+            calls.push("abort");
+            return state.abort;
+          },
+        };
+        return { commands, calls, sessions };
+      }
+
+      async function bound(
+        options: {
+          busy?: boolean;
+          abort?: boolean;
+          /** `false` = ventana cerrada: el chat NO está enlazado. */
+          pair?: boolean;
+          selected?: string;
+          initial?: Array<{ id: string; name: string | null }>;
+        } = {},
+      ) {
+        const dataDir = await setup();
+        await writeChannelRecords(dataDir, "agent", [
+          record(options.pair === false ? null : "2099-01-01T00:00:00.000Z"),
+        ]);
+        const pairing = new PairingMachine({ dataDir, newCode: () => "ABCD2345" });
+        if (options.pair !== false) await pairing.requestPairing("agent", "telegram", "12345");
+        const state: FakeState = {
+          busy: options.busy ?? false,
+          abort: options.abort ?? false,
+          selected: options.selected ?? "main",
+        };
+        const fake = fakeCommands(state, options.initial);
+        const sink = fakeTurns();
+        const enqueued: Array<{ chatId: string; text: string }> = [];
+        const handler = new ChannelInboundHandler({
+          dataDir,
+          pairing,
+          turns: sink.turns,
+          resolveRunner: async () => ({ port: 4100 }),
+          enqueue: ((input) => {
+            enqueued.push({ chatId: input.chatId, text: input.text });
+          }) satisfies EnqueueFn,
+          sessionCommands: fake.commands,
+        });
+        return { handler, sink, enqueued, state, fake, pairing };
+      }
+
+      it("/new crea y selecciona una sesión y contesta con su nombre, sin turno del Agent", async () => {
+        const { handler, sink, enqueued, state, fake } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("/new trabajo", "1"));
+        await tick();
+
+        assert.equal(sink.commands.length, 0, "un comando NO es un turno del modelo");
+        assert.deepEqual(fake.calls, ["new:trabajo"]);
+        assert.equal(state.selected, "s3", "la sesión creada queda seleccionada en este chat");
+        assert.deepEqual(enqueued, [
+          {
+            chatId: "12345",
+            text: systemLabel("sessionCreated", {
+              session: systemLabel("sessionRef", { name: "trabajo", id: "s3" }),
+            }),
+          },
+        ]);
+      });
+
+      it("/sessions lista como mucho diez sesiones y marca la seleccionada", async () => {
+        const doce = Array.from({ length: 12 }, (_, index) => ({
+          id: `s${index + 1}`,
+          name: index === 11 ? "doce" : null,
+        }));
+        const { handler, enqueued } = await bound({ initial: doce, selected: "s12" });
+
+        await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+        await tick();
+
+        assert.equal(enqueued.length, 1, "una sola respuesta de sistema");
+        const texto = enqueued[0]!.text;
+        const lineas = texto.split("\n");
+        assert.equal(lineas.length, 1 + 10, "cabecera + diez sesiones: la lista está acotada");
+        assert.match(lineas[0]!, /\b10 de 12\b/, `cabecera con el recuento: ${lineas[0]}`);
+        assert.equal(
+          lineas.filter((linea) => linea.includes(systemLabel("sessionSelectedMark"))).length,
+          0,
+          "la seleccionada (s12) queda fuera de las diez primeras: sin marca visible",
+        );
+        assert.ok(lineas.some((linea) => linea.includes("s1)")), `el id viaja en el listado: ${texto}`);
+      });
+
+      it("/session sin argumento dice la sesión actual y si el agente está ocupado", async () => {
+        const { handler, enqueued, state, fake, sink } = await bound({ busy: true });
+
+        await handler.handleAsync("agent", "telegram", inbound("/session", "1"));
+        await tick();
+
+        assert.deepEqual(enqueued, [
+          {
+            chatId: "12345",
+            text: systemLabel("sessionCurrent", {
+              session: systemLabel("sessionRef", {
+                name: systemLabel("sessionUnnamed"),
+                id: "main",
+              }),
+              status: systemLabel("agentBusy"),
+            }),
+          },
+        ]);
+        assert.equal(state.selected, "main", "consultar no cambia la selección");
+        assert.equal(sink.commands.length, 0, "consultar no abre turno");
+        assert.ok(!fake.calls.includes("abort"), "consultar no aborta nada");
+      });
+
+      it("/session <nombre> y /session <id> seleccionan esa sesión para este chat", async () => {
+        const { handler, enqueued, state } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("/session trabajo", "1"));
+        await tick();
+        assert.equal(state.selected, "s2", "selección por nombre exacto");
+        assert.equal(
+          enqueued[0]!.text,
+          systemLabel("sessionSwitched", {
+            session: systemLabel("sessionRef", { name: "trabajo", id: "s2" }),
+          }),
+        );
+
+        await handler.handleAsync("agent", "telegram", inbound("/session main", "2"));
+        await tick();
+        assert.equal(state.selected, "main", "selección por id");
+        assert.equal(enqueued.length, 2);
+      });
+
+      it("/session con un nombre inexistente no cambia la selección y contesta con la lista", async () => {
+        const { handler, enqueued, state } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("/session fantasma", "1"));
+        await tick();
+
+        assert.equal(state.selected, "main", "nada cambia");
+        assert.deepEqual(enqueued, [
+          { chatId: "12345", text: systemLabel("sessionUnknownTarget", { target: "fantasma" }) },
+        ]);
+      });
+
+      it("/stop sin turno vivo contesta que no hay nada en marcha", async () => {
+        const { handler, enqueued, fake, sink } = await bound({ abort: false });
+
+        await handler.handleAsync("agent", "telegram", inbound("/stop", "1"));
+        await tick();
+
+        assert.deepEqual(fake.calls, ["abort"], "el hook de abort se consulta una vez");
+        assert.deepEqual(enqueued, [{ chatId: "12345", text: systemLabel("stopNothing") }]);
+        assert.equal(sink.commands.length, 0);
+      });
+
+      it("/stop con un turno vivo pide el abort del turno del Agent", async () => {
+        const { handler, enqueued, fake } = await bound({ abort: true });
+
+        await handler.handleAsync("agent", "telegram", inbound("/stop", "1"));
+        await tick();
+
+        assert.deepEqual(fake.calls, ["abort"]);
+        assert.deepEqual(enqueued, [{ chatId: "12345", text: systemLabel("stopRequested") }]);
+      });
+
+      it("un comando desconocido contesta con la lista de comandos y no abre turno", async () => {
+        const { handler, enqueued, sink } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("/borrar", "1"));
+        await tick();
+
+        assert.equal(sink.commands.length, 0);
+        assert.deepEqual(enqueued, [
+          { chatId: "12345", text: systemLabel("unknownCommand", { command: "borrar" }) },
+        ]);
+      });
+
+      it("el comando es insensible a mayúsculas y tolera el sufijo @bot de Telegram", async () => {
+        const { handler, state, fake } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("/NEW@pi_hub_bot trabajo", "1"));
+        await tick();
+
+        assert.deepEqual(fake.calls, ["new:trabajo"]);
+        assert.equal(state.selected, "s3");
+      });
+
+      it("un chat NO enlazado recibe el flujo de emparejamiento y ningún comando", async () => {
+        const { handler, enqueued, state, fake, sink } = await bound({ pair: false });
+
+        await handler.handleAsync("agent", "telegram", inbound("/new trabajo", "1"));
+        await tick();
+
+        assert.deepEqual(
+          enqueued.map((reply) => reply.text),
+          [pairingCodeReplyText("ABCD2345")],
+          "el código de emparejamiento, no un comando",
+        );
+        assert.deepEqual(fake.calls, [], "el catálogo no se toca desde un chat sin enlazar");
+        assert.equal(state.selected, "main");
+        assert.equal(sink.commands.length, 0, "y el comando no se ejecuta como prompt");
+      });
+
+      it("PRESERVE: el texto normal sigue siendo un turno aunque los comandos estén inyectados", async () => {
+        const { handler, sink, enqueued } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("hola", "1"));
+        await tick();
+
+        assert.equal(sink.commands.length, 1, "nada del camino de turnos cambia");
+        assert.equal(sink.commands[0]!.message, "hola");
+        assert.deepEqual(enqueued, [], "un turno no contesta por el outbox: lo hace su completion");
+      });
+
+      it("PRESERVE: una barra dentro del texto no convierte el mensaje en comando", async () => {
+        const { handler, sink, enqueued } = await bound();
+
+        await handler.handleAsync("agent", "telegram", inbound("mira /new x y /stop", "1"));
+        await tick();
+
+        assert.equal(sink.commands.length, 1);
+        assert.equal(sink.commands[0]!.message, "mira /new x y /stop");
+        assert.deepEqual(enqueued, []);
+      });
+    });
+
+    // T6a, segundo bloque — el adaptador REAL (`catalogueSessionCommands`) contra el
+    // catálogo durable de producción (`openManagerStore`).
+    //
+    // El primer bloque fija el contrato con el adaptador; este fija lo que solo se ve
+    // con el catálogo de verdad: `/new` y `/session` mueven la selección de la
+    // superficie del canal y **no** la de la web (S3), y el mensaje siguiente corre en
+    // la sesión recién seleccionada, porque el inbound la lee al ACEPTAR el mensaje.
+
+    describe("ChannelInboundHandler — comandos contra el catálogo real (T6a)", () => {
+      const NOW = 1_790_000_000_000;
+      const stores: Array<Awaited<ReturnType<typeof openManagerStore>>> = [];
+
+      afterEach(() => {
+        for (const store of stores.splice(0)) store.close();
+      });
+
+      async function boundWithCatalogue() {
+        const dataDir = await setup();
+        await writeChannelRecords(dataDir, "agent", [record("2099-01-01T00:00:00.000Z")]);
+        const pairing = new PairingMachine({ dataDir });
+        await pairing.requestPairing("agent", "telegram", "12345");
+        const store = await openManagerStore(dataDir);
+        stores.push(store);
+        const sink = fakeTurns();
+        const enqueued: string[] = [];
+        const handler = new ChannelInboundHandler({
+          dataDir,
+          pairing,
+          turns: sink.turns,
+          resolveRunner: async () => ({ port: 4100 }),
+          enqueue: ((input) => {
+            enqueued.push(input.text);
+          }) satisfies EnqueueFn,
+          // Mismo callback que cablea la composición: la selección de la superficie
+          // del canal, leída al aceptar el mensaje.
+          sessionKeyFor: (agentName) =>
+            store.sessions.getSelectedSession({
+              agentName,
+              channel: "telegram",
+              now: NOW,
+            }).key,
+          sessionCommands: catalogueSessionCommands({
+            sessions: store.sessions,
+            surfaceOf: () => "telegram",
+            now: () => NOW,
+            isBusy: () => false,
+            abortIfLive: () => false,
+          }),
+        });
+        return { handler, sink, enqueued, store };
+      }
+
+      it("/new crea y selecciona en Telegram sin mover la selección de la web", async () => {
+        const { handler, sink, enqueued, store } = await boundWithCatalogue();
+        const web = store.sessions.create({ agentName: "agent", channel: "web", name: "web-fija", now: NOW });
+        store.sessions.select({ agentName: "agent", channel: "web", sessionId: web.id, now: NOW });
+
+        await handler.handleAsync("agent", "telegram", inbound("/new trabajo", "1"));
+        await tick();
+
+        const snapshot = store.sessions.list("agent", NOW);
+        const telegramId = snapshot.selection.telegram;
+        assert.ok(telegramId !== null, "telegram tiene selección");
+        const created = snapshot.sessions.find((session) => session.id === telegramId);
+        assert.equal(created?.name, "trabajo", "la sesión creada lleva el nombre del comando");
+        assert.notEqual(telegramId, "main", "y es una sesión NUEVA, no la legacy");
+        assert.equal(snapshot.selection.web, web.id, "la selección de la web no se mueve");
+        assert.deepEqual(enqueued, [
+          systemLabel("sessionCreated", {
+            session: systemLabel("sessionRef", { name: "trabajo", id: String(telegramId) }),
+          }),
+        ]);
+        assert.equal(sink.commands.length, 0, "crear una sesión no ejecuta un turno");
+
+        // El mensaje siguiente corre en la sesión recién seleccionada: el comando
+        // cambia la atribución de verdad, no solo una fila.
+        await handler.handleAsync("agent", "telegram", inbound("hola", "2"));
+        await tick();
+        assert.equal(sink.commands.length, 1);
+        assert.equal(sink.commands[0]!.sessionKey, created!.key);
+        sink.started[0]!();
+        await handler.idle();
+      });
+
+      it("/sessions marca la selección de Telegram y deja la web intacta", async () => {
+        const { handler, store, enqueued } = await boundWithCatalogue();
+        const web = store.sessions.create({ agentName: "agent", channel: "web", name: "web-fija", now: NOW });
+        store.sessions.select({ agentName: "agent", channel: "web", sessionId: web.id, now: NOW });
+        const telegram = store.sessions.create({ agentName: "agent", channel: "telegram", name: "chat", now: NOW });
+        store.sessions.select({ agentName: "agent", channel: "telegram", sessionId: telegram.id, now: NOW });
+
+        await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+        await tick();
+
+        assert.equal(enqueued.length, 1);
+        const lineas = enqueued[0]!.split("\n");
+        assert.equal(lineas.length, 1 + 3, "cabecera + las tres sesiones del Agent");
+        const marcada = lineas.filter((linea) => linea.includes(systemLabel("sessionSelectedMark")));
+        assert.equal(marcada.length, 1, "una sola marcada: la de ESTA superficie");
+        assert.ok(marcada[0]!.includes(telegram.id), `la marcada es la de Telegram: ${marcada[0]}`);
+        assert.equal(
+          store.sessions.list("agent", NOW).selection.web,
+          web.id,
+          "listar no mueve ninguna selección",
+        );
+      });
+    });
