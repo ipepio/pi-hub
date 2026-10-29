@@ -2180,6 +2180,9 @@ function scheduleGlobalReload(supervisor: Supervisor): void {
             turnId: row.turnId,
             origin: row.origin,
             chatId: row.chatId,
+            // T5b/2: identidad del turno. `null` = desconocida (fila anterior a v7,
+            // o entrega sin turno detrás): el feed no adivina la sesión principal.
+            sessionKey: row.sessionKey,
             userText: row.userText,
             replyText: row.replyText,
             userFullText: row.userFullText,

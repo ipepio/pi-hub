@@ -30,11 +30,19 @@ import { systemLabel } from "./labels.ts";
  *   B: no turn, no code, no rebinding. Rebinding is `unbind` (the owner's click).
  *
  * Session model: the projected D→P channel contract deliberately carries no
- * `sessionKey` (slice (c) decision, `api-v1/schemas.ts`), so the Manager maps
- * the chat to the Agent's MAIN session — one conversation, two surfaces. This
- * is the unified-session reading of design §1.2 and it wins over ADR 0099's
+ * `sessionKey` (slice (c) decision, `api-v1/schemas.ts`), so the Manager decides
+ * the session of a chat turn — one conversation, two surfaces. This is the
+ * unified-session reading of design §1.2 and it wins over ADR 0099's
  * per-channel session: a key that contained the chat id would split the Agent's
  * context per transport.
+ *
+ * Which session that is (T5b/2): the one SELECTED on the surface the message
+ * arrived on, resolved through `sessionKeyFor` when the message is ACCEPTED into
+ * the queue. Production wires the durable catalogue (`sessions/catalogue.ts`); a
+ * composition that does not inject it keeps the historical `agent:<nombre>:main`,
+ * which is a test dependency and not what the composition root does. A selector
+ * that throws is fail-closed: the message is dropped with a log line instead of
+ * running in a session nobody selected.
  *
  * Queueing: one bounded FIFO per `(agent, kind)` of depth 10, drained
  * sequentially (the Runner serves one live turn per Agent, and the
@@ -100,8 +108,16 @@ export interface ChannelInboundDeps {
   resolveRunner: (agentName: string) => Promise<{ port: number } | undefined>;
   /** The outbox face: system replies (pairing code) go through it, never direct. */
   enqueue: EnqueueFn;
-  /** Injectable for tests / a future projected session key. */
-  sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
+      /**
+       * `sessionKey` con la que se abre el turno de un mensaje entrante.
+       *
+       * Producción inyecta el catálogo durable por esta costura (T5b/2): la selección
+       * de la superficie del canal, leída por un CALLBACK y no importando la clase —
+       * `sessions/catalogue.ts` ya importa `mainSessionKeyOf` de este fichero, así que
+       * un import de vuelta sería un ciclo. Sin inyección se conserva la main histórica
+       * (`agent:<nombre>:main`), que es lo que usan los tests anteriores a esta unidad.
+       */
+      sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
   newTurnId?: () => string;
   log?: (line: string) => void;
 }
@@ -239,10 +255,21 @@ export class ChannelInboundHandler {
       );
       return;
     }
-    queue.push({
-      message,
-      sessionKey: this.sessionKeyFor(agentName, kind, chatId),
-    });
+    // T5b/2: la sesión se captura AHORA — cuando el mensaje se ACEPTA — y no
+    // cuando le toque el turno. Leer la selección al despachar atribuiría el
+    // mensaje a la sesión que esté elegida más tarde, no a la que el humano tenía
+    // delante cuando escribió. Si la resolución falla, el mensaje NO se ejecuta con
+    // la main por defecto: se descarta con una línea de log (fail-closed).
+    let sessionKey: string;
+    try {
+      sessionKey = this.sessionKeyFor(agentName, kind, chatId);
+    } catch (error) {
+      this.log(
+        `inbound dropped agent=${agentName} kind=${kind}: could not resolve the selected session (${String(error)})`,
+      );
+      return;
+    }
+    queue.push({ message, sessionKey });
     this.queues.set(key, queue);
     this.drain(key, agentName, kind, chatId);
   }

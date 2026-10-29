@@ -631,7 +631,7 @@ describe("almacén SQLite del Manager", () => {
   describe("migración v1 → v3", () => {
     it("una instalación nueva termina en el último schema con forma, índices y constraints", async () => {
       const db = await openRaw(await tmpDataDir());
-      assert.strictEqual(SCHEMA_VERSION, 6);
+      assert.strictEqual(SCHEMA_VERSION, 7);
       assert.strictEqual(userVersion(db), SCHEMA_VERSION);
 
       const triggersCols = tableColumns(db, "triggers").map((c) => c.name);

@@ -137,7 +137,7 @@ test("v6 añade las dos columnas full, NULLables y sin backfill", async () => {
   const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;
   assert.equal(version, SCHEMA_VERSION, "una base nueva termina en el schema simbólico");
-  assert.equal(MIGRATIONS.at(-1)?.version, SCHEMA_VERSION, "v6 es el último peldaño");
+  assert.equal(MIGRATIONS.at(-1)?.version, SCHEMA_VERSION, "v7 es el último peldaño");
 
   const columns = (
     db.prepare("PRAGMA table_info(channel_exchanges)").all() as Array<{
@@ -347,11 +347,12 @@ test("el feed devuelve las mitades completas y hasFull para una fila nueva", asy
       "replyFullText",
       "replyText",
       "seq",
+      "sessionKey",
       "turnId",
       "userFullText",
       "userText",
     ],
-    "la fila del feed es la de siempre MÁS el full text y su señal",
+    "la fila del feed es la de siempre MÁS el full text, su señal y la identidad del turno",
   );
   assert.equal(row.hasFull, true);
   assert.equal(row.userFullText, LONG_USER_TEXT);
@@ -361,8 +362,10 @@ test("el feed devuelve las mitades completas y hasFull para una fila nueva", asy
 test("una fila legacy sigue siendo preview-only por el feed, con sus claves de siempre", async () => {
   const dataDir = await dataDirOf();
   // La fila se crea en v5 y se migra: es la única forma de tener una fila REAL
-  // anterior a v6 (el `append` de hoy siempre escribe las columnas full).
-  const db = memoryDbAt(MIGRATIONS.at(-1)!.version - 1);
+  // anterior a v6 (el `append` de hoy siempre escribe las columnas full). El peldaño
+  // es LITERAL a propósito (T5b/2 movió el techo simbólico a v7): este caso prueba el
+  // camino histórico v5→v6, no «el penúltimo peldaño», que dejaría de probarlo.
+  const db = memoryDbAt(5);
   insertLegacyRow(db, "turn-legacy-feed");
   runMigrations(db);
   const log = new ChannelExchangeLog(db);

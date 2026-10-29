@@ -358,7 +358,7 @@ en tres reglas, y las tres se pueden comprobar en código.
 
 ### 2. Qué guarda el espejo `channel_exchanges`
 
-Migración v6 (aditiva, `packages/manager/src/storage/migrations.ts`):
+Migraciones v6 y v7 (aditivas, `packages/manager/src/storage/migrations.ts`):
 
 | columna           | desde | contenido                                                        |
 |-------------------|-------|------------------------------------------------------------------|
@@ -366,6 +366,7 @@ Migración v6 (aditiva, `packages/manager/src/storage/migrations.ts`):
 | `reply_text`      | v4    | mitad del Agent, **semántica intacta**                            |
 | `user_full_text`  | v6    | mitad del humano acotada al techo documentado; NULL si es legacy  |
 | `reply_full_text` | v6    | mitad del Agent acotada al techo documentado; NULL si es legacy   |
+| `session_key`     | v7    | key de la sesión en la que corrió el turno; NULL si es legacy     |
 
 Reglas del escritor (`channels/exchange-log.ts`):
 
@@ -407,15 +408,60 @@ En el Manager eso significa, literalmente:
   transcripción completa: el único escritor es `append` y su `INSERT OR IGNORE` no
   toca una fila existente.
 
-La contrapartida, que es la mitad útil de la decisión: las **sesiones nuevas** sí son
-reanudables, y su historial completo está disponible en las dos superficies a través
-del mismo feed.
+    La contrapartida, que es la mitad útil de la decisión: las **sesiones nuevas** sí son
+    reanudables, y su historial completo está disponible en las dos superficies a través
+    del mismo feed.
+
+    ### 4. Identidad de la sesión de cada intercambio (T5b/2)
+
+    Hasta la v7 el espejo respondía «qué se dijo» pero no «en qué sesión». La migración
+    **v7** es aditiva y sin backfill: `channel_exchanges.session_key TEXT` NULLable. El
+    Dashboard ya podía mostrar historial y distinguir completo/preview; ahora puede
+    **atribuir** cada intercambio a una sesión de su Agent.
+
+    - **El valor es el del turno, no el de la selección de ahora.** `CompletedTurn` lleva
+      `sessionKey` — la MISMA key con la que `startTurn` abrió el contexto del Runner — y
+      `channels/delivery-router.ts` la escribe tal cual. Ningún punto de la entrega
+      consulta el catálogo: leer la selección al entregar atribuiría el pasado con el
+      puntero de hoy, que es exactamente lo que esta unidad evita.
+    - **Un mensaje entrante captura su sesión al ACEPTARSE.** `channels/inbound.ts` resuelve
+      `sessionKeyFor` cuando el mensaje entra en la cola (antes de cualquier `await` del
+      drenado), así que cambiar la selección de Telegram con el turno anterior en vuelo
+      no reatribuye ni ese turno ni los mensajes ya encolados; el siguiente mensaje sí usa
+      la selección nueva. Una `A` capturada se despacha y se refleja como `A` aunque el
+      humano elija `B` a mitad de turno.
+    - **La selección es por Agent y por superficie.** `AgentSessionCatalogue.getSelectedSession`
+      es la lectura estrecha de T5b/2: síncrona, en UNA transacción, reutilizando
+      `ensureAgentCatalogue` (adopción legacy + siembra por defecto). Web y Telegram tienen
+      punteros independientes y la selección de un Agent no influye en la de otro.
+    - **Fail-closed.** Si la selección de la superficie apuntara a una sesión que no existe,
+      el inbound **descarta** el mensaje con una línea de log: nunca cae a
+      `agent:<nombre>:main`. La main solo se usa cuando el catálogo la adoptó de verdad
+      (primera lectura del Agent, `legacy: true`), que es el comportamiento histórico.
+    - **NULL es «desconocido», no `main`.** Toda fila anterior a v7 queda con
+      `session_key NULL`, y el feed la publica como `sessionKey: null`: el consumidor debe
+      agruparla como «sin atribuir» en vez de adivinar. Lo mismo para una entrega que no
+      viene de un turno (tarjeta `waiting_human`, proactive interno): ahí no hay identidad
+      que atribuir.
+    - **La key viaja verbatim, aunque no esté en el catálogo.** Un turno de Initiative con
+      `agent:<nombre>:initiative:<id>` se refleja con esa key y el catálogo **no** adopta
+      una fila nueva por ello: el espejo informa lo que ocurrió, no inventa identidad.
+    - **Compatibilidad.** `CompletedTurn.sessionKey` es OPCIONAL en el tipo para no romper
+      fixtures/helpers anteriores; `TurnExecution` la adjunta siempre. `AppendExchangeInput`
+      acepta la key opcional y la escribe como `null` cuando no la tiene: el techo de
+      32.768, `hasFull` y `INSERT OR IGNORE` no cambian (un replay no reescribe la
+      atribución de la fila original).
 
 ## Lo que esta unidad NO hace
 
 - No persiste ni sirve el transcript completo de una fila **legacy**: T5a entrega el
   historial completo solo para filas nuevas; lo anterior es preview-only por decisión
   del usuario (ADR 0107). Tampoco trae la migración/API/UI del dashboard (T5b).
+- No atribuye el pasado: las filas anteriores a v7 quedan `sessionKey: null` para
+  siempre. T5b/2 publica la identidad de aquí en adelante, no reescribe historia.
+- No trae el lado del dashboard: el cliente interno todavía no declara `sessionKey` en
+  su tipo de fila ni lo usa para pintar historial por sesión, y no hay DB, ruta propia
+  ni UI de sesiones en D. Esas unidades siguen pendientes (T5b restante).
 - No expone comandos `/new`, `/sessions`, `/session` en Telegram (T6).
 - No reanuda el contexto del Runner tras un reinicio por sí mismo: la continuidad
   del `sessionKey` es del Runner, que ya guarda su directorio por clave. Este

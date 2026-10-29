@@ -110,14 +110,27 @@ interface MensajeRunner {
      * `turn-error`): el hook no decide nada, solo informa. `replyText` está vacío
      * cuando el turno no produjo texto, y `userText` es el prompt que se envió.
      */
-    export interface CompletedTurn {
-      readonly agentName: string;
-      readonly turnId: string;
-      readonly origin: TurnOrigin;
-      readonly userText: string;
-      readonly replyText: string;
-      readonly finalEvent: TurnSseEvent["event"];
-    }
+        export interface CompletedTurn {
+          readonly agentName: string;
+          readonly turnId: string;
+          readonly origin: TurnOrigin;
+          readonly userText: string;
+          readonly replyText: string;
+          readonly finalEvent: TurnSseEvent["event"];
+          /**
+           * `sessionKey` con la que se DESPACHÓ este turno: la misma del
+           * `StartTurnCommand`, copiada tal cual.
+           *
+           * Es la identidad del hecho, no una consulta: quien entrega el turno
+           * (design §1.4) atribuye el intercambio a la sesión en la que REALMENTE
+           * corrió, sin volver a leer la selección actual — leerla más tarde
+           * atribuiría el pasado con el puntero de ahora (T5b/2).
+           *
+           * Opcional SOLO por compatibilidad de tipos con fixtures/helpers
+           * anteriores a esta unidad; este fichero la adjunta siempre.
+           */
+          readonly sessionKey?: string;
+        }
 
 /** Comando de `startTurn`: todo lo que el puente necesita para abrir el turno. */
 export interface StartTurnCommand {
@@ -461,6 +474,9 @@ export class TurnExecution {
               userText: message,
               replyText,
               finalEvent: terminal.event,
+              // T5b/2: la identidad del turno es la key con la que se abrió el
+              // contexto en el Runner, no la selección que haya ahora.
+              sessionKey,
             });
           } catch (error) {
             console.error(`[pihub] TURN_COMPLETED_CALLBACK_FAILED ${clave}:`, error);

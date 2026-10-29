@@ -4,6 +4,7 @@ import type {
   TurnExecution,
 } from "../agenda/turn-execution.ts";
 import type { HumanRequestChannel } from "../primary-channel/human-request-delivery.ts";
+import type { AgentSessionCatalogue, SessionSurface } from "../sessions/catalogue.ts";
 import { ChannelDeliveryRouter } from "./delivery-router.ts";
 import { ChannelInboundHandler } from "./inbound.ts";
 import type { ChannelExchangeLog } from "./exchange-log.ts";
@@ -39,11 +40,26 @@ import type { PairingMachine } from "./pairing.ts";
  *   drain loop. The composition root (`startup.ts` + `index.ts`) decides when
  *   the heartbeat begins and when it stops, because that order is a shutdown
  *   contract, not a channel one.
- * - **The transport is the registry.** The outbox's `send` goes through
- *   `ChannelRuntimeRegistry.send`, i.e. through the LIVE adapter of that Agent +
- *   kind. No adapter is a retryable `unavailable` (the channel may come back),
- *   and this file never sees a token.
- */
+     * - **The transport is the registry.** The outbox's `send` goes through
+     *   `ChannelRuntimeRegistry.send`, i.e. through the LIVE adapter of that Agent +
+     *   kind. No adapter is a retryable `unavailable` (the channel may come back),
+     *   and this file never sees a token.
+     * - **The session of an inbound turn is a SELECTION, not a constant** (T5b/2). The
+     *   only thing this file knows about the durable catalogue is the narrow
+     *   `getSelectedSession` face it passes to the inbound handler, which calls it when
+     *   the message is accepted. Which surface a `ChannelKind` selects on is a wiring
+     *   fact and lives here, in one exhaustive map.
+     */
+
+    /**
+     * La superficie cuya selección gobierna cada tipo de canal (S3).
+     *
+     * `Record<ChannelKind, …>` a propósito: si `CHANNEL_KINDS` gana un elemento, este
+     * mapa deja de compilar en vez de mandar un canal nuevo a la sesión de otro.
+     */
+    const SURFACE_BY_CHANNEL: Record<ChannelKind, SessionSurface> = {
+      telegram: "telegram",
+    };
 
 /** Registry face the composition needs: the transport door and the inbound slot. */
 export interface ChannelTransportLike {
@@ -64,8 +80,16 @@ export interface ChannelCompositionDeps {
   persistence: ChannelPersistence;
   registry: ChannelTransportLike;
   pairing: PairingMachine;
-  /** The shared `TurnExecution`: a channel inbound becomes a real turn. */
-  turns: Pick<TurnExecution, "startTurn">;
+      /** The shared `TurnExecution`: a channel inbound becomes a real turn. */
+      turns: Pick<TurnExecution, "startTurn">;
+      /**
+       * Catálogo durable de sesiones (T5b/2). El composition root de producción SIEMPRE
+       * pasa `store.sessions`: un mensaje entrante corre en la sesión seleccionada de SU
+       * superficie, capturada al aceptarlo. Omitirlo conserva el comportamiento
+       * histórico `agent:<nombre>:main`, que es una dependencia de los tests anteriores a
+       * esta unidad y no lo que arranca la producción.
+       */
+      sessions?: Pick<AgentSessionCatalogue, "getSelectedSession">;
   /** Runner port resolver — never a restart, never a port in the wire. */
   resolveRunner: (agentName: string) => Promise<{ port: number } | undefined>;
   now?: () => number;
@@ -144,6 +168,18 @@ export function composeChannels(deps: ChannelCompositionDeps): ChannelCompositio
     turns: deps.turns,
     resolveRunner: deps.resolveRunner,
     log,
+    // T5b/2: la sesión del turno es la seleccionada en la superficie del canal. El
+    // callback se resuelve al ACEPTAR el mensaje (no al despacharlo), y un error del
+    // catálogo lo trata el inbound como fail-closed. Sin catálogo inyectado la costura
+    // queda sin definir y el handler usa la main histórica.
+    sessionKeyFor: deps.sessions
+      ? (agentName: string, kind: ChannelKind) =>
+          deps.sessions!.getSelectedSession({
+            agentName,
+            channel: SURFACE_BY_CHANNEL[kind],
+            now: now(),
+          }).key
+      : undefined,
     // System replies (a pairing code) are outbox rows too: the transport is
     // never touched directly, so one owner keeps the retry policy.
     enqueue: async (input) => {

@@ -163,6 +163,7 @@ test("`after` es exclusivo y las filas vienen ascendentes por `seq`", async () =
       "replyFullText",
       "replyText",
       "seq",
+      "sessionKey",
       "turnId",
       "userFullText",
       "userText",

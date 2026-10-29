@@ -118,6 +118,14 @@ export interface SelectSessionInput {
   now: number;
 }
 
+/** Pregunta «qué sesión está seleccionada en ESTA superficie» (T5b/2). */
+export interface SelectedSessionInput {
+  agentName: string;
+  /** Superficie del turno que se va a abrir (no restringe las demás). */
+  channel: SessionSurface;
+  now: number;
+}
+
 /** Catálogo cerrado de lo que este módulo lanza; las rutas lo mapean a HTTP tal cual. */
 export type SessionCatalogueErrorCode = "BAD_REQUEST" | "SESSION_NOT_FOUND";
 
@@ -192,6 +200,12 @@ const SQL_DEFAULT_SELECTION = `
 
 const SQL_LIST_SELECTION =
   "SELECT channel, session_id FROM agent_session_selection WHERE agent_name = ?";
+
+const SQL_SELECTION_BY_SURFACE = `
+  SELECT channel, session_id
+  FROM agent_session_selection
+  WHERE agent_name = ? AND channel = ?
+`;
 
 const SQL_DELETE_SELECTION_FOR_AGENT =
   "DELETE FROM agent_session_selection WHERE agent_name = ?";
@@ -431,9 +445,52 @@ export class AgentSessionCatalogue {
     });
   }
 
-  /**
-   * Punto único de "este Agent ya tiene catálogo": adopta la entrada legacy y
-   * siembra la selección por defecto de las dos superficies.
+      /**
+       * Lee la sesión seleccionada de UNA superficie, lista para abrir un contexto
+       * (T5b/2).
+       *
+       * Contrato, y por qué tiene esta forma:
+       * - **Síncrona.** Su caller de producción es el inbound de un canal
+       *   (`channels/inbound.ts`), que captura la selección en el instante en que
+       *   ACEPTA el mensaje y antes de cualquier `await` de la cola: así un cambio de
+       *   selección con el turno siguiente en vuelo no puede reatribuir el pasado.
+       * - **Reutiliza los helpers del módulo.** `ensureAgentCatalogue` (adopción legacy
+       *   + siembra de la selección por defecto) y `transaction` (una sola
+       *   `BEGIN IMMEDIATE`), sin transacciones anidadas ni SQL duplicado: la primera
+       *   lectura de un Agent es la misma operación idempotente de siempre.
+       * - **Falla CERRADO.** Si la superficie tuviera una selección cuyo id no resuelve
+       *   (catálogo corrupto), se lanza `SESSION_NOT_FOUND` en vez de devolver la main:
+       *   un puntero roto no puede convertirse en «la conversación de siempre» sin que
+       *   nadie se entere.
+       */
+      getSelectedSession(input: SelectedSessionInput): AgentSession {
+        assertAgentName(input.agentName);
+        assertSurface(input.channel);
+
+        return this.transaction(() => {
+          this.ensureAgentCatalogue(input.agentName, input.now);
+
+          const selection = this.db
+            .prepare(SQL_SELECTION_BY_SURFACE)
+            .get(input.agentName, input.channel) as RawSelection | undefined;
+          const raw = selection
+            ? (this.db
+                .prepare(SQL_BY_ID)
+                .get(input.agentName, selection.session_id) as RawSession | undefined)
+            : undefined;
+          if (!raw) {
+            throw new SessionCatalogueError(
+              "SESSION_NOT_FOUND",
+              "The session selected on this surface does not exist",
+            );
+          }
+          return toSession(raw);
+        });
+      }
+
+      /**
+       * Punto único de "este Agent ya tiene catálogo": adopta la entrada legacy y
+       * siembra la selección por defecto de las dos superficies.
    *
    * Es el helper que TODOS los caminos (create/list/select) reutilizan para que la
    * clave durable, la transaccionalidad y la propiedad por Agent se sostengan en un

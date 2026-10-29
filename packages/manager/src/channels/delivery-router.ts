@@ -26,6 +26,11 @@ import { readChannelRecords } from "./store.ts";
  * 2. **Every channel delivery is an outbox row.** Nothing here calls a transport,
  *    so retry/backoff/idempotency keeps one owner (`channels/outbox.ts`) and a
  *    teardown can mark rows `dead` without this router noticing.
+ * 3. **The attribution is the turn's, not the current selection's** (T5b/2). The
+ *    mirrored row carries `turn.sessionKey` — the key the turn actually ran
+ *    in — and `null` when a delivery has no turn behind it. Re-reading the
+ *    Agent's selected session here would attribute the past with today's
+ *    pointer, which is exactly the mistake the feed must not allow.
  *
  * `initiative` without a bound channel is deliberately NOT mirrored: the mirror
  * exists so the Dashboard can show exchanges that happened *on a channel*. An
@@ -124,6 +129,7 @@ export class ChannelDeliveryRouter {
         mirror: {
           origin: "telegram",
           turnId: turn.turnId,
+          sessionKey: turn.sessionKey ?? null,
           userText: turn.userText,
           replyText: turn.replyText,
         },
@@ -142,6 +148,7 @@ export class ChannelDeliveryRouter {
       mirror: {
         origin: "proactive",
         turnId: turn.turnId,
+        sessionKey: turn.sessionKey ?? null,
         userText: turn.userText,
         replyText: turn.replyText,
       },
@@ -171,8 +178,10 @@ export class ChannelDeliveryRouter {
       mirror: {
         origin: "proactive",
         // El cursor del mirror es el turno; sin uno real se usa el id de la
-        // entrega, que es estable para esta llamada.
+        // entrega, que es estable para esta llamada. Sin turno tampoco hay
+        // sesión que atribuir: `null`, nunca una adivinada.
         turnId: input.turnId ?? `proactive:${input.agentName}:${kind}:${target}`,
+        sessionKey: null,
         userText: "",
         replyText: text,
       },
@@ -185,15 +194,21 @@ export class ChannelDeliveryRouter {
   private async deliver(input: {
     agentName: string;
     kind: ChannelKind;
-    target: string;
-    text: string;
-    mirror: {
-      origin: "telegram" | "proactive";
-      turnId: string;
-      userText: string;
-      replyText: string;
-    };
-  }): Promise<void> {
+        target: string;
+        text: string;
+        mirror: {
+          origin: "telegram" | "proactive";
+          turnId: string;
+          /**
+           * `sessionKey` del turno REAL que produjo el intercambio, o `null`
+           * cuando la entrega no viene de un turno (aviso HITL, proactive
+           * interno): ahí no hay identidad que atribuir y el espejo no la inventa.
+           */
+          sessionKey: string | null;
+          userText: string;
+          replyText: string;
+        };
+      }): Promise<void> {
     // El espejo se escribe ANTES de encolar: si el enqueue falla, el intercambio
     // no ocurrió (y el outbox es el único que reintenta). La fila es idempotente
     // por `turn_id`, así que un reenvío del mismo turno no duplica nada.
@@ -202,6 +217,7 @@ export class ChannelDeliveryRouter {
       turnId: input.mirror.turnId,
       origin: input.mirror.origin,
       chatId: input.target,
+      sessionKey: input.mirror.sessionKey,
       userText: input.mirror.userText,
       replyText: input.mirror.replyText,
       now: this.now(),

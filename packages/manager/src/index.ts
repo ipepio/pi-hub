@@ -237,6 +237,12 @@ const runtime = await runStartup(
       const composition = composeChannels({
         dataDir: env.dataDir,
         persistence: store.channels,
+        // T5b/2: la sesión de un mensaje entrante es la SELECCIONADA en la
+        // superficie del canal, y el catálogo durable es el dueño de ese puntero.
+        // Es la misma instancia por base abierta que sirven las rutas `/sessions`:
+        // el composition root SIEMPRE lo pasa (omitirlo es la dependencia histórica
+        // de los tests, no un modo de producción).
+        sessions: store.sessions,
         // El registry de las rutas y del `stopAll()` del apagado: uno solo.
         registry: channelRegistry,
         pairing: channelPairing,

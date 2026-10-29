@@ -25,6 +25,13 @@ import type { SqliteDb } from "../storage/sqlite.ts";
  * `id` (INTEGER AUTOINCREMENT) IS the feed cursor D stores as
  * `channels.transcriptSeq`: monotonic per Agent, never reused, and `listAfter`
  * is exclusive so a drained row is never drained twice.
+ *
+ * `session_key` (schema v7, T5b/2) is the identity of the turn that produced the
+ * exchange. It is written from `CompletedTurn.sessionKey` — the key the turn was
+ * actually dispatched with — and it is NULL for every row that predates v7 (the
+ * additive migration does not backfill). A reader must treat NULL as «unknown»:
+ * guessing `agent:<name>:main` would attribute an old exchange to a session
+ * nothing can prove it ran in.
  */
 
 /** Retention window of the mirror (design §2.2/§6.2 — the invariant is "bounded"). */
@@ -64,8 +71,14 @@ export interface ChannelExchange {
   agentName: string;
   turnId: string;
   origin: ChannelExchangeOrigin;
-  /** Bound external chat id; `null` for a proactive message with no chat context. */
-  chatId: string | null;
+      /** Bound external chat id; `null` for a proactive message with no chat context. */
+      chatId: string | null;
+      /**
+       * Key of the session the turn actually ran in (schema v7). `null` for every row
+       * that predates v7 (no backfill) and for a delivery with no turn behind it: the
+       * feed never fabricates an identity.
+       */
+      sessionKey: string | null;
   /** Complete human half as the mirror always stored it (v4 semantics, untouched). */
   userText: string;
   /** Complete Agent half as the mirror always stored it (v4 semantics, untouched). */
@@ -87,15 +100,21 @@ export interface ChannelExchange {
   createdAt: number;
 }
 
-export interface AppendExchangeInput {
-  agentName: string;
-  turnId: string;
-  origin: ChannelExchangeOrigin;
-  chatId?: string | null;
-  userText: string;
-  replyText: string;
-  now: number;
-}
+    export interface AppendExchangeInput {
+      agentName: string;
+      turnId: string;
+      origin: ChannelExchangeOrigin;
+      chatId?: string | null;
+      /**
+       * Identidad del turno (`CompletedTurn.sessionKey`). Opcional para no romper los
+       * callers que no tienen un turno detrás; ausente = `null` honesto, nunca la
+       * sesión seleccionada ahora.
+       */
+      sessionKey?: string | null;
+      userText: string;
+      replyText: string;
+      now: number;
+    }
 
 interface RawExchange {
   id: number;
@@ -103,6 +122,7 @@ interface RawExchange {
   turn_id: string;
   origin: string;
   chat_id: string | null;
+  session_key: string | null;
   user_text: string;
   reply_text: string;
   user_full_text: string | null;
@@ -112,9 +132,9 @@ interface RawExchange {
 
 const SQL_APPEND = `
   INSERT OR IGNORE INTO channel_exchanges
-    (agent_name, turn_id, origin, chat_id, user_text, reply_text,
+    (agent_name, turn_id, origin, chat_id, session_key, user_text, reply_text,
      user_full_text, reply_full_text, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
 const SQL_BY_TURN = "SELECT * FROM channel_exchanges WHERE turn_id = ?";
@@ -153,6 +173,7 @@ function toExchange(raw: RawExchange): ChannelExchange {
     turnId: raw.turn_id,
     origin: raw.origin as ChannelExchangeOrigin,
     chatId: raw.chat_id,
+    sessionKey: raw.session_key ?? null,
     userText: raw.user_text,
     replyText: raw.reply_text,
     userFullText,
@@ -184,6 +205,10 @@ export class ChannelExchangeLog {
    * always were (complete, unbounded) — this method changed WHERE the durable signal
    * lives, not what an exchange means.
    *
+   * T5b/2: a new row also carries `session_key`, the identity of the turn (`null`
+   * when the caller has none). Its column is nullable and additive precisely
+   * because the past cannot be attributed retroactively.
+   *
    * A ROW THAT ALREADY EXISTS is never touched: `INSERT OR IGNORE` keeps the legacy
    * row exactly as the user decided it must stay (READ-ONLY honest history), which is
    * why its full columns remain NULL for ever instead of being backfilled on retry.
@@ -204,6 +229,7 @@ export class ChannelExchangeLog {
         input.turnId,
         input.origin,
         input.chatId ?? null,
+        input.sessionKey ?? null,
         input.userText,
         input.replyText,
         boundedHalf(input.userText),

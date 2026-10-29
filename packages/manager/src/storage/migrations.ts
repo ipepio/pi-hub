@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export interface Migration {
     version: number;
@@ -397,6 +397,24 @@ CREATE INDEX channel_exchanges_agent
     ALTER TABLE channel_exchanges ADD COLUMN reply_full_text TEXT;
     `;
 
+    // Schema v7 (T5b/2, agent-session-workspace): la IDENTIDAD del turno que
+    // produjo el intercambio, para que el Dashboard pueda atribuir una fila a una de
+    // las sesiones de su Agent (el prerrequisito explícito de §6 de
+    // `docs/agent-session-integration.md` de D).
+    //
+    // Por qué una columna NULLable y aditiva:
+    // - Una fila escrita antes de v7 NO tiene identidad conocida. Cualquier valor por
+    //   defecto sería una invención (rellenarla con `agent:<nombre>:main` atribuiría
+    //   historia a una sesión que no se puede probar), así que el valor honesto para
+    //   el pasado es NULL y la migración NO hace backfill. Es la misma decisión que
+    //   la v6: la historia anterior es READ-ONLY.
+    // - Qué valor tiene NO es una regla de forma: lo escribe el escritor con la key
+    //   del turno REAL (`channels/exchange-log.ts` ← `CompletedTurn.sessionKey`), de
+    //   modo que el feed nunca re-deriva la identidad de la selección actual.
+    const V7_CHANNEL_SESSION_KEY = `
+    ALTER TABLE channel_exchanges ADD COLUMN session_key TEXT;
+    `;
+
     export const MIGRATIONS: readonly Migration[] = [
     { version: 1, up: (db) => db.exec(V1_DDL) },
     {
@@ -435,6 +453,12 @@ CREATE INDEX channel_exchanges_agent
         version: 6,
         up: (db) => {
             db.exec(V6_CHANNEL_FULL_TEXT);
+        },
+    },
+    {
+        version: 7,
+        up: (db) => {
+            db.exec(V7_CHANNEL_SESSION_KEY);
         },
     },
 ];
