@@ -523,3 +523,32 @@ En el Manager eso significa, literalmente:
 - No toca los ficheros del Runner ni reescribe la identidad del transcript: adoptar
   el legacy es nombrar lo que ya estaba en disco, y los UUID históricos del
   dashboard siguen sin adoptarse (T5).
+
+## Estado final de la feature (T9, 2026-10-29)
+
+Lo entregado en esta rama (`feat/agent-session-workspace`, commits locales):
+
+- T3 `568963c` — catálogo durable, selección por superficie, adopción legacy, API `/api/v1`.
+- T4 (acotado) `cd90c6c` — un turno por Agent: 409 `TURN_IN_PROGRESS` antes del SSE,
+  política por origen (Telegram avisa vía outbox, Autonomía queda `queued`), gate de
+  ejecución en el Runner, `disconnect()` no termina el turno, fence de arranque del
+  Supervisor. No entregado a propósito: recuperación de huérfanos post-restart y 409
+  durable (el registro de turnos vivos sigue en memoria; fallback: reinicio del Agent
+  o del runtime completo).
+- T5a `34cdc87` / T5b/2 `232dcfd` — transcript completo en filas nuevas (v6) e
+  identidad de sesión del turno al espejo (v7). Legacy: READ-ONLY para siempre.
+- T6a `f66426f` — comandos Telegram `/new` `/sessions` `/session` `/stop`, copy vía
+  `channels/labels.ts`, nunca gastan el slot de admisión. T6b (botones inline
+  `callback_query`) sigue pendiente.
+- T7/3 `abc7af3` — el panel del Manager adopta el catálogo como única fuente de la
+  identidad de sesión del turno: crea, lista y selecciona sesiones; adopta la key de
+  la sesión seleccionada en web; sin catálogo o sin selección el turno se bloquea
+  fail-closed (nunca inventa una key local). La key no se muestra en la UI.
+- T8 `17391a5` — `docs/pi-mcp-adapter-compatibility.md`: veredicto NO instalar
+  pi-mcp-adapter por defecto con el SDK 0.80.3 (peer range incompatible + política
+  invertida + herencia de env). Camino condicional documentado allí.
+
+Verificación T9: suite raíz completa **1025/1025** (0 fail, 0 cancelados), typecheck
+de todos los workspaces exit 0. El par dashboard (goguest-ai-dashboard-new) refleja
+el estado completo en `docs/agent-session-integration.md` §10 y en el tracker ODD
+`odd/tasks/agent-session-workspace.md`.
