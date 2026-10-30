@@ -1913,19 +1913,36 @@ export function createApiV1Router(
    * conoce por ser suyo, es la única forma real. Documentado en la spec
    * como deprecado.
    */
-  app.post("/agents/:name/turns/:turnId/abort", async (c) => {
-    const name = c.req.param("name");
-    const turnId = c.req.param("turnId");
-    const config = await readAgent(env.dataDir, name).catch(() => undefined);
-    if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
+      app.post("/agents/:name/turns/:turnId/abort", async (c) => {
+        const name = c.req.param("name");
+        const turnId = c.req.param("turnId");
+        const config = await readAgent(env.dataDir, name).catch(() => undefined);
+        if (!config) return fail(c, "AGENT_NOT_FOUND", "Agent not found");
 
-    // El abort vive en `TurnExecution` (Fase 3.1), contra el registro
-    // compartido de turnos vivos.
-    if (!turns.abort(name, turnId)) {
-      return fail(c, "TURN_NOT_FOUND", "Turn not found or already finished");
-    }
-    return c.body(null, 202);
-  });
+        // El abort vive en `TurnExecution` (Fase 3.1), contra el registro
+        // compartido de turnos vivos.
+        //
+        // T4-D/2: un turno que sobrevivió a un reinicio del Manager ocupa el slot pero
+        // su socket no existe en este proceso. `TurnExecution.abort` se niega a fingir
+        // que entrega el `abort` al Runner (`TURN_UNREACHABLE`) y sin este mapeo el
+        // `DomainError` saldría como 500: es un 409 —el Agent sigue ocupado— con su
+        // propio mensaje, igual que `TURN_IN_PROGRESS`.
+        try {
+          if (!turns.abort(name, turnId)) {
+            return fail(c, "TURN_NOT_FOUND", "Turn not found or already finished");
+          }
+        } catch (error) {
+          if (error instanceof DomainError && error.code === "TURN_UNREACHABLE") {
+            return fail(
+              c,
+              "TURN_UNREACHABLE",
+              "Turn survived a Manager restart and cannot be aborted from this process",
+            );
+          }
+          throw error;
+        }
+        return c.body(null, 202);
+      });
 
   return app;
 }

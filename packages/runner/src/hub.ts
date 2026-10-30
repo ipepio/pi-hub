@@ -332,6 +332,21 @@ export class SessionHubRegistry {
     return this.gate.busy || [...this.hubs.values()].some((hub) => hub.isStreaming);
   }
 
+  /**
+   * Estado de la gate COMPARTIDA, tal y como lo publica `GET /api/status` (T4-D/2).
+   *
+   * Existe porque el Manager necesita reconciliar al arrancar las reservas de
+   * admisión durables (`agent_live_turns`): para saber si el Runner sigue ejecutando
+   * ESE turno tiene que ver desde fuera si hay una ejecución en curso y de quién es.
+   * El `holder` es el `label` de la hub que tomó la gate — la `sessionKey` con la que
+   * el Manager abrió el turno (`default` cuando no mandó ninguna) —, es decir, la
+   * MISMA identidad que el Manager guarda en la fila durable. `isStreaming` no sirve
+   * para esto: incluye el hub por defecto y no dice quién ejecuta.
+   */
+  get execution(): { busy: boolean; holder: string | null } {
+    return { busy: this.gate.busy, holder: this.gate.currentHolder ?? null };
+  }
+
   reset(): void {
     for (const hub of this.hubs.values()) hub.reset();
     this.hubs.clear();

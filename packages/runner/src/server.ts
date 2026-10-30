@@ -68,6 +68,12 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
       model: hub.modelId,
       streaming: hub.isStreaming,
       sessionId: hub.sessionId,
+      // T4-D/2: estado de la gate COMPARTIDA (no del hub por defecto). El Manager
+      // lo lee al arrancar para reconciliar las reservas de admisión durables que
+      // sobrevivieron al proceso anterior: `busy` dice si este Runner sigue
+      // ejecutando algo y `holder` de quién es (la `sessionKey` con la que el
+      // Manager abrió el turno, o `default`). Aditivo: `streaming` se conserva.
+      execution: sessions.execution,
       // Cutover slice (c) part 3b: el bot lo posee el Manager. El Runner ya no
       // lee ningún token; la única señal de canal es la que inyecta
       // `runnerEnvFor` (`PIHUB_CHANNEL_KINDS`) al spawn.

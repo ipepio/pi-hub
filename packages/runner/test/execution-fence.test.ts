@@ -438,3 +438,91 @@ test(
     );
   },
 );
+
+// T4-D/2 — `/api/status` publica el estado de la gate COMPARTIDA.
+//
+// El Manager tiene que reconciliar al arrancar las reservas de admisión durables
+// (`agent_live_turns`) que sobrevivieron al proceso anterior: para saber si el
+// Runner sigue ejecutando ESE turno necesita ver, desde fuera, si hay una ejecución
+// en curso y de quién es. `streaming` no sirve: es del hub por defecto y una
+// ejecución keyed (la que abre el Manager con `?sessionKey=…`) no lo levanta nunca.
+// El titular que se publica es el mismo `label` con el que `ChatHub.prompt` toma la
+// gate — la sessionKey de la hub —, que es la identidad del registro durable.
+test(
+  "/api/status publica el estado de la gate compartida y su titular (la sessionKey que ejecuta)",
+  { timeout: TEST_TIMEOUT_MS },
+  async () => {
+    await withRunner(async ({ runtime, connect, port }) => {
+      interface StatusBody {
+        agent?: string;
+        model?: string;
+        streaming?: boolean;
+        sessionId?: string | null;
+        execution?: { busy: boolean; holder: string | null };
+      }
+      const status = async (): Promise<StatusBody> => {
+        const response = await fetch(`http://127.0.0.1:${port}/api/status`);
+        assert.equal(response.status, 200, "el status del Runner responde");
+        return (await response.json()) as StatusBody;
+      };
+
+      const reposo = await status();
+      assert.deepEqual(
+        reposo.execution,
+        { busy: false, holder: null },
+        "un Runner en reposo no tiene ninguna ejecución en curso",
+      );
+      // Aditivo: los campos que ya estaban siguen ahí.
+      assert.equal(reposo.agent, "agent");
+      assert.equal(reposo.model, MODEL);
+      assert.equal(reposo.streaming, false);
+
+      // La ejecución que abre el Manager: hub keyed con la sessionKey del turno.
+      const activo = await connect("telegram");
+      activo.send({ type: "prompt", text: "hola" });
+      await until(() => runtime.sessions.length === 1, "el prompt llegue al SDK");
+
+      assert.deepEqual(
+        (await status()).execution,
+        { busy: true, holder: "telegram" },
+        "el titular es la sessionKey de la hub que ejecuta: la identidad que guarda `agent_live_turns`",
+      );
+
+      // Un rechazo de admisión no cambia el titular: la ejecución sigue siendo la misma.
+      const otro = await connect();
+      otro.send({ type: "prompt", text: "otra cosa" });
+      await otro.waitFor((message) => message.type === "error", "el rechazo del ocupado");
+      assert.deepEqual(
+        (await status()).execution,
+        { busy: true, holder: "telegram" },
+        "el rechazo de un segundo prompt no falsea el titular",
+      );
+
+      // Solo el asentamiento real del SDK libera la gate.
+      runtime.sessions[0].finish();
+      await until(() => activo.byType("agent_end").length === 1, "el terminal del turno real");
+      let execution = (await status()).execution;
+      for (let attempt = 0; attempt < 500 && execution?.busy !== false; attempt += 1) {
+        await settle();
+        execution = (await status()).execution;
+      }
+      assert.deepEqual(
+        execution,
+        { busy: false, holder: null },
+        "con el SDK asentado la gate queda libre",
+      );
+
+      // La hub por defecto se identifica como `default` — la misma etiqueta que usa
+      // `SessionHubRegistry.forKey` cuando no hay sessionKey.
+      otro.send({ type: "prompt", text: "ahora sí" });
+      await until(() => runtime.sessions.length === 2, "el turno siguiente se acepta");
+      assert.deepEqual(
+        (await status()).execution,
+        { busy: true, holder: "default" },
+        "la hub por defecto se identifica como default",
+      );
+      runtime.sessions[1].finish();
+      await until(() => otro.byType("agent_end").length === 1, "el terminal del segundo turno");
+    });
+  },
+);

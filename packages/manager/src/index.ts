@@ -13,6 +13,7 @@ import { openManagerStore } from "./storage/sqlite.js";
 import { runStartup, shutdownRuntime } from "./startup.js";
 import { AgendaLoop } from "./agenda/loop.js";
 import { TurnExecution, type CompletedTurn } from "./agenda/turn-execution.js";
+import { reconcileLiveTurns } from "./startup-reconcile.js";
 import type { EffectiveTriggerAuthority } from "./agenda/triggers.js";
 import { AutonomyControl } from "./agenda/autonomy-control.js";
 import { HumanRequestDelivery } from "./primary-channel/human-request-delivery.js";
@@ -197,11 +198,31 @@ const runtime = await runStartup(
         // Se ve en el journal, no en silencio.
         console.error("[pihub] LIVE_TURNS_LOAD_FAILED:", error);
       }
-      return turns;
-    },
-    createOAuth: (providers) => new OAuthService(providers),
-    createApp: ({ supervisor, oauth, providers, turns, store }) => {
-      // P2.3: construir el AutonomyControl real con el store y turns compartidos.
+          return turns;
+        },
+        // T4-D/2: reconciliación de las reservas de admisión durables. `createTurns` acaba
+        // de cargarlas como «no verificadas» y `startAll` ya levantó los Runners, así que
+        // aquí se pregunta a la gate COMPARTIDA de cada Runner (`GET /api/status`) si
+        // sigue ejecutando ese turno: confirmado = se conserva (el Agent sigue bloqueado),
+        // huérfano = se libera la fila y el turno se cierra `failed`/`turn_orphaned`.
+        // NUNCA lanza; lo que no se puede probar se queda como está (fail-closed) y el
+        // siguiente arranque lo reconcilia. El endpoint es loopback y va con el token de
+        // servicio del Manager (`/api/*` del Runner exige `Bearer` cuando hay API_TOKEN).
+        reconcileLiveTurns: ({ store, supervisor, turns }) =>
+          reconcileLiveTurns({
+            liveTurns: store.liveTurns,
+            supervisor: {
+              state: (name) => supervisor.state(name),
+              runnerPortOf: (name) => supervisor.runnerPortOf(name),
+            },
+            turns,
+            apiToken: env.apiToken,
+            now: () => Date.now(),
+            log: logLine,
+          }),
+        createOAuth: (providers) => new OAuthService(providers),
+        createApp: ({ supervisor, oauth, providers, turns, store }) => {
+          // P2.3: construir el AutonomyControl real con el store y turns compartidos.
       // La autoridad efectiva se deriva una vez del modo (§2.1 del plan P2).
       const autonomyControl = new AutonomyControl({
         agenda: store.agenda,

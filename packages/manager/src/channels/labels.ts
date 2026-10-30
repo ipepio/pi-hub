@@ -55,9 +55,18 @@ export const SYSTEM_LABELS = {
       commandFailed:
         "No he podido ejecutar «/{command}»: el catálogo de sesiones ha fallado. " +
         "Inténtalo de nuevo.",
-      stopRequested: "He pedido al agente que aborte el turno en curso.",
-      stopNothing: "No hay ningún turno en curso que abortar.",
-    } as const;
+          stopRequested: "He pedido al agente que aborte el turno en curso.",
+          stopNothing: "No hay ningún turno en curso que abortar.",
+          /**
+           * `/stop` sobre un turno que sobrevivió a un reinicio del Manager (T4-D/2).
+           * No se puede abortar desde aquí — su socket murió con el proceso anterior —
+           * y reintentar no ayuda, así que NO se reutiliza `turnBusy` (que invita a
+           * reenviar el mensaje) ni `commandFailed` (que culpa al catálogo).
+           */
+          turnUnreachable:
+            "El agente conserva un turno de un arranque anterior y no puedo abortarlo " +
+            "desde aquí: se cerrará solo o se reconciliará en el próximo arranque.",
+        } as const;
 
 export type SystemLabelKey = keyof typeof SYSTEM_LABELS;
 

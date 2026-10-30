@@ -300,12 +300,25 @@ export const INBOUND_QUEUE_DEPTH = 10;
           const selected = commands.selectSession({ agentName, kind, sessionId: target.id });
           return systemLabel("sessionSwitched", { session: sessionRef(selected) });
         }
-        case "stop":
-          // El binding ya está comprobado: solo el chat enlazado llega aquí, así que
-          // `/stop` no necesita (ni debe) otra condición de propiedad.
-          return systemLabel(
-            commands.abortIfLive({ agentName }) ? "stopRequested" : "stopNothing",
-          );
+            case "stop":
+              // El binding ya está comprobado: solo el chat enlazado llega aquí, así que
+              // `/stop` no necesita (ni debe) otra condición de propiedad.
+              //
+              // T4-D/2: el turno vivo puede ser una reserva que sobrevivió al reinicio del
+              // Manager (`loadUnverified`). Existe —ocupa el slot— pero su socket no vive
+              // en este proceso, así que `abort` lo rechaza con `TURN_UNREACHABLE` en vez
+              // de fingir: el humano recibe un label que lo dice (y no el genérico
+              // `commandFailed`, que culpa al catálogo y sugiere reintentar en vano).
+              try {
+                return systemLabel(
+                  commands.abortIfLive({ agentName }) ? "stopRequested" : "stopNothing",
+                );
+              } catch (error) {
+                if (error instanceof DomainError && error.code === "TURN_UNREACHABLE") {
+                  return systemLabel("turnUnreachable");
+                }
+                throw error;
+              }
         default:
           return systemLabel("unknownCommand", { command: command.name });
       }

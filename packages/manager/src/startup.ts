@@ -27,6 +27,7 @@
 
 import type { StartupRecoveryResult } from "./agenda/recovery.ts";
 import type { EffectiveTriggerAuthority } from "./agenda/triggers.ts";
+import type { LiveTurnReconcileOutcome } from "./startup-reconcile.ts";
 
 /** Superficie mínima de Providers que la composición toca (`initialize`). */
 export interface ProviderLike {
@@ -109,10 +110,24 @@ export interface StartupDeps<
        * del mismo bot.
        */
       assertNoDoubleTelegramBot?: () => Promise<void>;
-  /** Construye el Supervisor (`new Supervisor(env)`). */
-  createSupervisor: () => Sup;
-  /** Construye el `TurnExecution` compartido antes de `createApp` (D2); `store.agenda` queda disponible. */
-  createTurns: (deps: { store: S }) => T;
+      /** Construye el Supervisor (`new Supervisor(env)`). */
+      createSupervisor: () => Sup;
+          /** Construye el `TurnExecution` compartido antes de `createApp` (D2); `store.agenda` queda disponible. */
+          createTurns: (deps: { store: S }) => T;
+          /**
+           * T4-D/2: reconcilia las reservas de admisión DURABLES que sobrevivieron al
+           * proceso anterior. Corre justo DESPUÉS de `createTurns` — que es quien las
+           * carga como «no verificadas» (`loadUnverified`) — y ANTES de `createApp`, para
+           * que ninguna petición HTTP despache contra un Agent cuyo slot quedó huérfano.
+           *
+           * Es OPCIONAL por la misma razón que `createOutboxWorker`: un arranque de
+           * test sin Runners no tiene nada que verificar. La implementación real
+           * (`startup-reconcile.ts`) NUNCA lanza: cada turno sin evidencia queda como
+           * estaba (fail-closed) y se ve en el log.
+           */
+          reconcileLiveTurns?: (deps: { store: S; supervisor: Sup; turns: T }) => Promise<
+            LiveTurnReconcileOutcome | void
+          >;
   /** Construye el OAuthService con los providers. */
   createOAuth: (providers: P) => O;
   /** Construye la app HTTP (`createApi`); recibe el `TurnExecution` compartido (D8) y el store para autonomía (P2.3). */
@@ -202,6 +217,17 @@ function logRecovery(result: StartupRecoveryResult): void {
   );
 }
 
+/** Log estructurado del resultado de la reconciliación de turnos vivos (T4-D/2). */
+function logLiveTurnsReconciled(result: LiveTurnReconcileOutcome): void {
+  if (result.confirmed + result.orphaned + result.unresolved + result.deferred === 0) {
+    console.log("[pihub] LIVE_TURNS_RECONCILE_CLEAN rows=0");
+    return;
+  }
+  console.log(
+    `[pihub] LIVE_TURNS_RECONCILED confirmed=${result.confirmed} orphaned=${result.orphaned} unresolved=${result.unresolved} deferred=${result.deferred}`,
+  );
+}
+
 /**
  * Ejecuta la secuencia de arranque completa en el orden del §7.1 + P1.4 §5.3.
  * No importa ni ejecuta `index.ts`: los tests pasan fakes por la misma interfaz
@@ -261,6 +287,18 @@ export async function runStartup<
   // 8. TurnExecution compartido (Fase 3.5, D2): ANTES de createApp para que la
   //    ruta HTTP y el Loop consuman la misma instancia (D8, §6.3).
   const turns = deps.createTurns({ store });
+
+  // 8b. T4-D/2: reconciliación de las reservas de admisión durables. `createTurns`
+  //     las cargó como «no verificadas» (fail-closed: el Agent bloqueado porque el
+  //     Runner puede seguir ejecutando ese turno); aquí se pregunta a cada Runner
+  //     vivo y se resuelven las huérfanas. Va DESPUÉS de `startAll` (los Runners
+  //     existen y su gate es observable) y ANTES de `createApp`: ninguna petición
+  //     HTTP puede despachar antes de que el estado durable sea coherente. NUNCA
+  //     lanza: lo que no se puede probar se queda como está y el siguiente arranque
+  //     lo reconcilia.
+  const reconciled = await deps.reconcileLiveTurns?.({ store, supervisor, turns });
+  if (reconciled) logLiveTurnsReconciled(reconciled);
+
   const oauth = deps.createOAuth(deps.providers); // 9. OAuthService
   const app = deps.createApp({ providers: deps.providers, supervisor, oauth, turns, store }); // 10. createApi + autonomía (P2.3)
   const server = deps.serve(app); //               11. serve — HTTP público

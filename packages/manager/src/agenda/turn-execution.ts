@@ -343,6 +343,15 @@ export class TurnExecution {
    * Nunca se pisa un turno vivo de ESTE proceso: la memoria manda y la fila
    * durable de un Agent ya admitido aquí no puede reemplazar su entrada.
    *
+   * **LÍMITE CONOCIDO (T4-D/2, por diseño — no se arregla aquí)**: una entrada
+   * confirmada por la reconciliación del arranque puede seguir ejecutándose en el
+   * Runner, pero su terminal real llega por el socket del Manager ANTERIOR, que
+   * murió con el proceso. Este Manager nunca lo verá: la entrada —y su fila
+   * durable— se queda ocupando el slot hasta que un arranque posterior la
+   * reconcilie. No se re-engancha el SSE ni se adopta el WS del proceso viejo
+   * (adoptar un turno ajeno mentiría sobre la propiedad del terminal); es
+   * fail-closed a propósito.
+   *
    * Devuelve cuántas entradas se cargaron (observabilidad del arranque).
    */
   loadUnverified(
@@ -367,21 +376,109 @@ export class TurnExecution {
     return cargados;
   }
 
-  /**
-   * Libera la reserva durable del turno. Un fallo de almacenamiento se LOGUEA y
-   * NO se propaga: el terminal (o la pausa durable) ya ocurrió y no puede
-   * convertirse en un crash. La fila que sobrevive es el estado fail-closed
-   * correcto — el siguiente arranque la carga como «no verificada» y bloquea la
-   * admisión hasta que alguien reconcilie ese turno.
-   */
-  private releaseDurable(clave: string, agentName: string, turnId: string): void {
-    if (!this.liveTurns) return;
-    try {
-      this.liveTurns.releaseLiveTurn(agentName, turnId);
-    } catch (error) {
-      console.error(`[pihub] LIVE_TURN_RELEASE_FAILED ${clave}:`, error);
-    }
-  }
+      /**
+       * Libera la reserva durable del turno. Un fallo de almacenamiento se LOGUEA y
+       * NO se propaga: el terminal (o la pausa durable) ya ocurrió y no puede
+       * convertirse en un crash. La fila que sobrevive es el estado fail-closed
+       * correcto — el siguiente arranque la carga como «no verificada» y bloquea la
+       * admisión hasta que alguien reconcilie ese turno.
+       */
+      private releaseDurable(clave: string, agentName: string, turnId: string): void {
+        if (!this.liveTurns) return;
+        try {
+          this.liveTurns.releaseLiveTurn(agentName, turnId);
+        } catch (error) {
+          console.error(`[pihub] LIVE_TURN_RELEASE_FAILED ${clave}:`, error);
+        }
+      }
+
+      /**
+       * Escribe el terminal `failed` de un turno huérfano con su causa (T4-D/2).
+       *
+       * Devuelve si el estado durable admite liberar la admisión. `TURN_NOT_FOUND`
+       * (la fila de `turns` nunca se reservó) y `TURN_ALREADY_TERMINAL` (otro camino
+       * ya la cerró) son el MISMO desenlace que el terminal repetido de
+       * `escribirTerminalDurable`: no son fallos, el turno ya está resuelto. Cualquier
+       * otro error NO se tolera porque la liberación de la admisión no puede ocurrir
+       * sin el cierre durable: se loguea y el turno se queda como está (fail-closed).
+       */
+      private escribirTerminalHuerfano(agentName: string, turnId: string): boolean {
+        if (!this.repository) return true;
+        try {
+          this.repository.complete(agentName, turnId, "failed", null, this.now(), "turn_orphaned");
+          return true;
+        } catch (error) {
+          if (
+            error instanceof DomainError &&
+            (error.code === "TURN_NOT_FOUND" || error.code === "TURN_ALREADY_TERMINAL")
+          ) {
+            return true;
+          }
+          console.error(`[pihub] TURN_ORPHAN_WRITE_FAILED ${agentName}:${turnId}:`, error);
+          return false;
+        }
+      }
+
+      /**
+       * Aplica la reconciliación del arranque (T4-D/2) sobre las entradas cargadas
+       * por `loadUnverified`. SÍNCRONA a propósito: quien decide es quien puede
+       * preguntar al Runner (asíncrono, HTTP) y esta clase solo aplica la decisión ya
+       * tomada — así el registro nunca queda a medias entre dos awaits.
+       *
+       * - `confirmed`: el Runner sigue ejecutando ESE turno. Se conserva la entrada (y
+       *   su fila durable) tal cual: el Agent sigue bloqueado. **LÍMITE CONOCIDO**: su
+       *   terminal real llegará por el socket del Manager anterior, así que este
+       *   proceso no lo verá nunca; la entrada se libera en un arranque posterior (ver
+       *   `loadUnverified`). No se adopta el turno.
+       * - `orphaned`: el turno ya no se ejecuta (Runner parado o gate libre). Se cierra
+       *   durablemente como `failed` con causa `turn_orphaned`, se libera la fila de
+       *   `agent_live_turns` y se borra la entrada: el Agent vuelve a admitir turnos.
+       *   Si el terminal durable no se puede escribir, NO se libera nada y se cuenta
+       *   como `deferred`.
+       *
+       * Una entrada de este proceso que NO sea «no verificada» (un turno vivo real) no
+       * se toca nunca: la memoria manda y borrarla liberaría la admisión de un Runner
+       * que está trabajando. Se cuenta como `deferred` y se loguea.
+       */
+      reconcileUnverified(
+        resolutions: ReadonlyArray<{
+          readonly agentName: string;
+          readonly turnId: string;
+          readonly outcome: "confirmed" | "orphaned";
+        }>,
+      ): { confirmed: number; orphaned: number; deferred: number } {
+        const aplicado = { confirmed: 0, orphaned: 0, deferred: 0 };
+        for (const resolution of resolutions) {
+          const { agentName, turnId, outcome } = resolution;
+          const clave = `${agentName}:${turnId}`;
+
+          if (outcome === "confirmed") {
+            aplicado.confirmed += 1;
+            continue;
+          }
+
+          const entrada = this.turnosVivos.get(clave);
+          if (entrada !== undefined && entrada.unverified !== true) {
+            console.error(
+              `[pihub] LIVE_TURN_RECONCILE_SKIPPED ${clave}: el turno está vivo en este proceso`,
+            );
+            aplicado.deferred += 1;
+            continue;
+          }
+
+          // Orden cerrado: terminal durable PRIMERO. Si falla de verdad, la fila y la
+          // entrada se quedan — liberar la admisión sin cierre durable dejaría al
+          // Agent libre con un turno que nadie cerró nunca.
+          if (!this.escribirTerminalHuerfano(agentName, turnId)) {
+            aplicado.deferred += 1;
+            continue;
+          }
+          this.releaseDurable(clave, agentName, turnId);
+          this.turnosVivos.delete(clave);
+          aplicado.orphaned += 1;
+        }
+        return aplicado;
+      }
 
   /**
    * Abre el WS contra el Runner, registra el turno como vivo y traduce los

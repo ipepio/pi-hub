@@ -522,6 +522,11 @@ export function autonomyErrorMessage(code: ApiErrorCode): string {
       return "Initiative state conflict";
     case "IDEMPOTENCY_CONFLICT":
       return "Idempotency key conflict";
+    // T4-D/2: cancelar una Initiative cuyo turno sobrevivió a un reinicio. Es un 409
+    // («el Agent sigue ocupado»), no el «Internal error» del default: el caller tiene
+    // que distinguir «no puedo abortarlo desde aquí» de «el Manager se rompió».
+    case "TURN_UNREACHABLE":
+      return "Turn survived a Manager restart and cannot be aborted from this process";
     case "FORBIDDEN":
       return "Operation not permitted";
     case "AUTONOMY_DISABLED":
