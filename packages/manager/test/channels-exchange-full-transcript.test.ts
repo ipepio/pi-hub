@@ -137,7 +137,7 @@ test("v6 añade las dos columnas full, NULLables y sin backfill", async () => {
   const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;
   assert.equal(version, SCHEMA_VERSION, "una base nueva termina en el schema simbólico");
-  assert.equal(MIGRATIONS.at(-1)?.version, SCHEMA_VERSION, "v7 es el último peldaño");
+  assert.equal(MIGRATIONS.at(-1)?.version, SCHEMA_VERSION, "v8 es el último peldaño");
 
   const columns = (
     db.prepare("PRAGMA table_info(channel_exchanges)").all() as Array<{
@@ -156,9 +156,10 @@ test("v6 añade las dos columnas full, NULLables y sin backfill", async () => {
 });
 
 test("migrar v5 → v6 conserva las filas y las deja preview-only (sin backfill)", () => {
-  const beforeV6 = MIGRATIONS.slice(0, -1);
-  const previousVersion = beforeV6.at(-1)!.version;
-  const db = memoryDbAt(previousVersion);
+  // El peldaño es LITERAL a propósito (T4-D/1 movió el techo simbólico a v8):
+  // este caso prueba el camino histórico v5→v6, no «el penúltimo peldaño», que
+  // dejaría de probarlo en cuanto se añada la siguiente migración.
+  const db = memoryDbAt(5);
   insertLegacyRow(db, "turn-v5");
 
   runMigrations(db);

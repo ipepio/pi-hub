@@ -158,10 +158,13 @@ const runtime = await runStartup(
           })
         : undefined;
 
-      return new TurnExecution({
+      const turns = new TurnExecution({
         apiToken: env.apiToken,
         repository: store.agenda.turns,
         humanRequests: store.agenda.humanRequests,
+        // T4-D/1: la reserva de admisión es durable. La misma instancia que
+        // sirve la ruta y el Loop escribe en `agent_live_turns`.
+        liveTurns: store.liveTurns,
         now: () => Date.now(),
         requestId: () => randomUUID(),
         expiryMs: env.waitingHumanExpiryMs,
@@ -180,6 +183,21 @@ const runtime = await runStartup(
           channelDelivery?.(turn);
         },
       });
+
+      // T4-D/1: la admisión «un turno por Agent» sobrevive al reinicio. Las filas
+      // durables de la vida anterior del Manager entran al registro como «no
+      // verificadas»: ocupan el slot (un turno nuevo se rechaza con 409) porque el
+      // Runner puede seguir ejecutando ese turno y ningún proceso sabe si terminó.
+      try {
+        const cargados = turns.loadUnverified(store.liveTurns.listLiveTurns());
+        if (cargados > 0) logLine(`LIVE_TURNS_RECOVERED count=${cargados}`);
+      } catch (error) {
+        // Un fallo de lectura no impide arrancar: las filas siguen en disco y el
+        // claim durable de cada `startTurn` las vuelve a bloquear (fail-closed).
+        // Se ve en el journal, no en silencio.
+        console.error("[pihub] LIVE_TURNS_LOAD_FAILED:", error);
+      }
+      return turns;
     },
     createOAuth: (providers) => new OAuthService(providers),
     createApp: ({ supervisor, oauth, providers, turns, store }) => {

@@ -11,6 +11,7 @@ import {
   openAgentSessionCatalogue,
 } from "../sessions/persistence.ts";
 import type { AgentSessionCatalogue } from "../sessions/catalogue.ts";
+import { openLiveTurnStore, type LiveTurnStore } from "./live-turns.ts";
 
 // Todo el acceso a SQLite del Manager pasa por este módulo. El driver es
 // `node:sqlite`, el módulo integrado de Node: pihub se instala como servicio
@@ -52,7 +53,19 @@ export interface ManagerStore {
        * en `sessions/catalogue.ts`. El `SqliteDb` crudo sigue sin salir de
        * `storage/`.
        */
-      readonly sessions: AgentSessionCatalogue;
+          readonly sessions: AgentSessionCatalogue;
+      /**
+       * Registro durable del turno vivo por Agent (migración v8:
+       * `agent_live_turns`, T4-D/1 del seguimiento del ODD
+       * `agent-session-workspace`).
+       *
+       * Misma fachada estrecha que `channels`/`sessions`: el arranque y
+       * `TurnExecution` ven operaciones (`claimLiveTurn`/`releaseLiveTurn`/
+       * `listLiveTurns`), nunca SQL. La invariante «un turno vivo por Agent» la
+       * sostiene la PK `agent_name`, y el `SqliteDb` crudo sigue sin salir de
+       * `storage/`.
+       */
+      readonly liveTurns: LiveTurnStore;
   /** Ruta completa del fichero `.db` (los ficheros WAL/SHM viven a su lado). */
   readonly file: string;
   close(): void;
@@ -91,6 +104,7 @@ export async function openManagerStore(dataDir: string): Promise<ManagerStore> {
       agenda: new AgendaRepository(db),
       channels: openChannelPersistence(db),
       sessions: openAgentSessionCatalogue(db),
+      liveTurns: openLiveTurnStore(db),
       file,
       close: () => db.close(),
     };

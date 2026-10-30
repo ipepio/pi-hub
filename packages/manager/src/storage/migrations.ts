@@ -1,6 +1,6 @@
 import type { SqliteDb } from "./sqlite.ts";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export interface Migration {
     version: number;
@@ -415,6 +415,35 @@ CREATE INDEX channel_exchanges_agent
     ALTER TABLE channel_exchanges ADD COLUMN session_key TEXT;
     `;
 
+    // Schema v8 (T4-D/1, seguimiento de agent-session-workspace): el registro
+    // DURABLE del turno vivo por Agent, para que la admisión «un turno por Agent»
+    // (S2) sobreviva a un reinicio del Manager.
+    //
+    // Por qué una tabla propia y no `turns`: `turns` guarda el turno con su
+    // idempotencia y su terminal, y `final_state IS NULL` no distingue «ejecutando
+    // ahora» de «el proceso que lo ejecutaba murió» (pendiente 4 de §13 del plan de
+    // Fase 2). Esta tabla es la RESERVA: existe mientras el Manager cree que el Agent
+    // tiene un turno abierto y desaparece en el terminal.
+    //
+    // `agent_name` como PRIMARY KEY es la invariante durable, no una convención: la
+    // base misma impide dos turnos vivos del mismo Agent, también entre procesos, y
+    // su conflicto se traduce al MISMO `TURN_IN_PROGRESS` que la memoria. `session_key`
+    // es NULLable porque la sesión no es la identidad del turno (hay turnos sin
+    // catálogo de sesiones) y `started_at` es el reloj del Manager que lo reclamó.
+    //
+    // Aditiva y sin backfill: una tabla NUEVA, ningún CHECK anterior cambia y ninguna
+    // fila existente se toca. No hay historia que rellenar — antes de v8 la admisión
+    // era solo en memoria, así que una fila inventada afirmaría un turno que nadie
+    // puede probar. Sin rebuild ⇒ no hace falta `disableForeignKeys`.
+    const V8_AGENT_LIVE_TURNS = `
+    CREATE TABLE agent_live_turns (
+      agent_name TEXT NOT NULL PRIMARY KEY,
+      turn_id TEXT NOT NULL,
+      session_key TEXT,
+      started_at INTEGER NOT NULL
+    );
+    `;
+
     export const MIGRATIONS: readonly Migration[] = [
     { version: 1, up: (db) => db.exec(V1_DDL) },
     {
@@ -459,6 +488,12 @@ CREATE INDEX channel_exchanges_agent
         version: 7,
         up: (db) => {
             db.exec(V7_CHANNEL_SESSION_KEY);
+        },
+    },
+    {
+        version: 8,
+        up: (db) => {
+            db.exec(V8_AGENT_LIVE_TURNS);
         },
     },
 ];

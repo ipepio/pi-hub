@@ -6,6 +6,12 @@ export type ApiErrorCode =
   | "SESSION_EXPIRED"
   | "TURN_NOT_FOUND"
   | "TURN_IN_PROGRESS"
+  /**
+   * El turno vive en el registro durable pero este proceso no puede alcanzarlo
+   * (sobrevivió a un reinicio). Es un 409 como `TURN_IN_PROGRESS`: el Agent sigue
+   * ocupado, no es un turno inexistente.
+   */
+  | "TURN_UNREACHABLE"
   | "MODEL_FORBIDDEN"
   | "RESOURCE_UNAVAILABLE"
   | "VOICE_PROVIDER_ERROR"
@@ -53,6 +59,7 @@ export const HTTP_STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   TURN_NOT_FOUND: 404,
   AGENT_ALREADY_EXISTS: 409,
   TURN_IN_PROGRESS: 409,
+  TURN_UNREACHABLE: 409,
   RESOURCE_UNAVAILABLE: 503,
   VOICE_PROVIDER_ERROR: 502,
   INTERNAL_ERROR: 500,

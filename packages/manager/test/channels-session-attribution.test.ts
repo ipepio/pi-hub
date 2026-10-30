@@ -422,8 +422,8 @@ describe("T5b/2 — la identidad de sesión viaja del turno al espejo", () => {
 
     runMigrations(db);
 
-    assert.equal(SCHEMA_VERSION, 7);
-    assert.equal(MIGRATIONS.at(-1)?.version, 7, "v7 es el último peldaño");
+    assert.equal(SCHEMA_VERSION, 8);
+    assert.equal(MIGRATIONS.at(-1)?.version, 8, "v8 es el último peldaño");
     assert.ok(
       MIGRATIONS.some((migration) => migration.version === 6),
       "el peldaño histórico v5→v6 sigue explícito",
