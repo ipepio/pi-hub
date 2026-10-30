@@ -48,6 +48,14 @@ export type DomainErrorCode =
  | "CALLBACK_ALREADY_PENDING"
  | "IDEMPOTENCY_DUPLICATE"
  | "TURN_NOT_FOUND"
+ | "TURN_IN_PROGRESS"
+ /**
+  * El turno existe en el registro (sobrevivió a un reinicio del Manager) pero
+  * este proceso no tiene su socket: abortarlo sería fingir que se entrega el
+  * `abort` al Runner. `TurnExecution.abort` lo lanza en vez de mentir, y el slot
+  * queda ocupado (fail-closed). HTTP 409, igual que `TURN_IN_PROGRESS`.
+  */
+ | "TURN_UNREACHABLE"
  | "TURN_ALREADY_TERMINAL"
  | "TURN_ID_CONFLICT"
  | "STARTUP_RECOVERY_FAILED"
@@ -106,6 +114,8 @@ const API_CODE_BY_DOMAIN: Readonly<Record<DomainErrorCode, ApiErrorCode>> = {
  CALLBACK_ALREADY_PENDING: "BAD_REQUEST",
  IDEMPOTENCY_DUPLICATE: "INTERNAL_ERROR",
  TURN_NOT_FOUND: "TURN_NOT_FOUND",
+ TURN_IN_PROGRESS: "TURN_IN_PROGRESS",
+ TURN_UNREACHABLE: "TURN_UNREACHABLE",
  TURN_ALREADY_TERMINAL: "BAD_REQUEST",
  TURN_ID_CONFLICT: "BAD_REQUEST",
  STARTUP_RECOVERY_FAILED: "INTERNAL_ERROR",

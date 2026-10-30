@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createWriteStream } from "node:fs";
+import { createServer } from "node:net";
 import {
   agentPaths,
   dataPaths,
@@ -15,6 +16,7 @@ import {
 } from "@pihub/shared";
 import path from "node:path";
 import { runnerEntry } from "./paths.js";
+import { readChannelRecords } from "./channels/store.js";
 
 /**
  * Env de memoria que se inyecta al runner. El dir de Shared Memory solo existe
@@ -38,12 +40,20 @@ export function memoryEnvFor(
   return memoryEnv;
 }
 
-/** Compone el entorno final del Runner a partir del entorno ya filtrado. */
+/** Compone el entorno final del Runner a partir del entorno ya filtrado.
+ *
+ * `channelKinds` (cutover, slice (c) part 3b): es la ÚNICA señal de canales que
+ * recibe el Runner. No hay ningún secreto aquí: el bot lo posee el Manager y el
+ * Runner solo necesita saber si hay un canal para su propio prompt de plataforma
+ * y para el booleano de `/api/status`. Se deja fuera cuando está vacío para que
+ * un arranque sin canales produzca un entorno idéntico al de antes.
+ */
 export function runnerEnvFor(
   storeEnv: NodeJS.ProcessEnv,
   env: PihubEnv,
   config: AgentConfig,
   callbackToken: string,
+  channelKinds: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const paths = agentPaths(env.dataDir, config.name);
   const globalDir = dataPaths(env.dataDir).globalDir;
@@ -54,7 +64,14 @@ export function runnerEnvFor(
     PI_CODING_AGENT_DIR: globalDir,
     PI_CODING_AGENT_SESSION_DIR: paths.sessionsDir,
     ...memoryEnvFor(env, config),
+    // Antes del cutover este era también el camino por el que el Runner filtraba
+    // a qué usuarios respondía su propio bot. El allowlist dejó de tener efecto
+    // en el Runner; se conserva porque es la config de plataforma que el Agent
+    // puede inspeccionar, no porque la consuma nadie.
     PIHUB_TELEGRAM_ALLOWED_USERS: env.telegramAllowedUsers.join(","),
+    ...(channelKinds.length > 0
+      ? { PIHUB_CHANNEL_KINDS: channelKinds.join(",") }
+      : {}),
     PIHUB_RUNNER_CALLBACK_TOKEN: callbackToken,
     PIHUB_MANAGER_PORT: String(env.managerPort),
     // The Runner needs the service credential in its own env to (a) authorize
@@ -90,7 +107,73 @@ const MAX_RESTARTS = 5;
 const RESTART_WINDOW_MS = 60_000;
 const CALLBACK_TOKEN_RE = /^[0-9a-fA-F]{64}$/;
 
+/**
+ * Dirección que el sondeo de puerto intenta atar. Es la MISMA que usa el Runner
+ * (`packages/runner/src/server.ts`, `hostname: "0.0.0.0"`): en Darwin un socket que
+ * escucha en `127.0.0.1:P` no impide atar `0.0.0.0:P` ni al revés, así que sondear
+ * otra dirección produciría falsos «libre».
+ */
+const RUNNER_BIND_HOST = "0.0.0.0";
+/** Cota del sondeo: un `listen` que no responde no puede colgar el arranque. */
+const PORT_PROBE_TIMEOUT_MS = 5_000;
+
 type CallbackTokenSource = () => string;
+
+/**
+ * Fence fail-closed del arranque (T4c). Comprueba que el puerto del Runner se puede
+ * atar en exclusiva ANTES de abrir el log o spawnear, para que un spawn condenado a
+ * `EADDRINUSE` no quede registrado como «en marcha» detrás de un ocupante vivo.
+ *
+ * No adopta, no interroga y no mata al ocupante, y NO prueba propiedad del puerto:
+ * entre cerrar el sondeo y el bind del Runner sigue existiendo una ventana (TOCTOU)
+ * que solo cerraría un protocolo de traspaso que aquí no existe.
+ */
+async function assertRunnerPortAvailable(
+  agentName: string,
+  port: number,
+): Promise<void> {
+  // Puerto efímero (`0`): el Runner lo resolverá al atar y no hay nada que sondear.
+  if (!Number.isInteger(port) || port <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const probe = createServer();
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    timer = setTimeout(() => {
+      probe.close();
+      settle(
+        new Error(
+          `[supervisor] el sondeo del puerto ${port} de ${agentName} no respondió en ${PORT_PROBE_TIMEOUT_MS}ms; no se arranca`,
+        ),
+      );
+    }, PORT_PROBE_TIMEOUT_MS);
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE") {
+        const busy = new Error(
+          `[supervisor] el puerto ${port} del Runner de ${agentName} ya está ocupado: no se arranca (el ocupante no se adopta ni se mata)`,
+        );
+        busy.name = "RunnerPortBusyError";
+        settle(busy);
+        return;
+      }
+      settle(
+        new Error(
+          `[supervisor] no se pudo comprobar que el puerto ${port} de ${agentName} esté libre (${error.code ?? error.message}); no se arranca`,
+        ),
+      );
+    });
+    // El sondeo se cierra ANTES de resolver: el Runner necesita el puerto ya.
+    probe.listen({ host: RUNNER_BIND_HOST, port, exclusive: true }, () => {
+      probe.close(() => settle());
+    });
+  });
+}
 
 function randomCallbackToken(): string {
   return randomBytes(32).toString("hex");
@@ -134,6 +217,9 @@ export class Supervisor {
 
   private async spawnRunner(config: AgentConfig): Promise<void> {
     const paths = agentPaths(this.env.dataDir, config.name);
+    await assertRunnerPortAvailable(config.name, config.port);
+    // Fence fail-closed: se llama aquí (y no en `start`) para que el auto-reinicio
+    // quede fenced igual. Si el puerto está ocupado no se abre el log ni se spawnea.
     const log = createWriteStream(path.join(paths.root, "runner.log"), {
       flags: "a",
     });
@@ -145,8 +231,18 @@ export class Supervisor {
       config.name,
       process.env,
     );
-    const callbackToken = this.callbackTokenSource();
-    const runnerEnv = runnerEnvFor(storeEnv, this.env, config, callbackToken);
+        const callbackToken = this.callbackTokenSource();
+        // Cutover (R3): el Runner no lee canales ni tokens — se lo dice este env.
+        const channelKinds = [
+          ...new Set((await readChannelRecords(this.env.dataDir, config.name)).map((record) => record.kind)),
+        ].sort();
+        const runnerEnv = runnerEnvFor(
+          storeEnv,
+          this.env,
+          config,
+          callbackToken,
+          channelKinds,
+        );
     const proc = spawn(process.execPath, [runnerEntry], {
       env: runnerEnv,
       cwd: paths.workspaceDir,
@@ -187,13 +283,24 @@ export class Supervisor {
       console.warn(
         `[supervisor] ${config.name} terminó (código ${code}); reinicio en ${delay}ms`,
       );
-      setTimeout(() => {
-        void readAgent(this.env.dataDir, config.name).then((fresh) => {
-          if (fresh?.enabled) void this.spawnRunner(fresh);
+          setTimeout(() => {
+            readAgent(this.env.dataDir, config.name)
+              .then((fresh) =>
+                fresh?.enabled ? this.spawnRunner(fresh) : undefined,
+              )
+              .catch((error: unknown) => {
+                // El fence también puede rechazar en un auto-reinicio. Sin este
+                // consumidor, `void this.spawnRunner(...)` sería un
+                // `unhandledRejection` que tumba el Manager entero; el Agent queda
+                // `stopped` (nunca «en marcha») y el motivo se registra.
+                console.error(
+                  `[supervisor] no se pudo reiniciar ${config.name}:`,
+                  error,
+                );
+              });
+          }, delay);
         });
-      }, delay);
-    });
-  }
+      }
 
   private withinWindow(name: string): boolean {
     const managed = this.processes.get(name);
@@ -314,8 +421,20 @@ export class Supervisor {
   async statusOf(config: AgentConfig): Promise<AgentStatus> {
     const { state, pid } = this.state(config.name);
     // El token de Telegram nunca sale por la API: solo el boolean `telegram`.
+    // La redacción se QUEDA aunque el campo sea legado: un `agent.json` escrito
+    // antes del cutover, o editado a mano, no puede convertir `GET /agents` en un
+    // chorreo de credenciales.
     const { telegramToken: _telegramToken, ...safe } = config;
-    return { ...safe, state, pid, telegram: Boolean(config.telegramToken) };
+    // Cutover (part 3b): `telegram` pasa a ser OBSERVADO desde el canal, no desde
+    // el config del Runner. Un residuo legado en disco ya no pinta el chip del
+    // panel; lo que lo pinta es que exista un registro de canal proyectado.
+    const channelRecords = await readChannelRecords(this.env.dataDir, config.name);
+    return {
+      ...safe,
+      state,
+      pid,
+      telegram: channelRecords.some((record) => record.kind === "telegram"),
+    };
   }
 
   async stopAll(): Promise<void> {

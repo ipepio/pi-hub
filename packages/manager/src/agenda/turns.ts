@@ -43,10 +43,19 @@ export type TurnFinalState = "succeeded" | "failed" | "cancelled" | "paused_for_
  * - `runner_unavailable`: cierre del Runner sin terminal, error de conexión
  *   o timeout de despacho.
  * - `dispatch_failed`: el Manager falló al despachar tras el claim.
+ * - `turn_orphaned` (T4-D/2): la reserva de admisión sobrevivió al proceso que la
+ *   abrió y la reconciliación del arranque demostró que ya no se ejecuta (Runner
+ *   parado, o Runner en marcha con la gate libre). El turno se cierra `failed` —
+ *   `final_state` no gana valores nuevos — y la causa dice la verdad: nadie emitió
+ *   un terminal, el turno quedó huérfano.
  * `agent_errored` se escribe **antes** del claim (transición `queued→failed`),
  * no vía T6, y por eso no pertenece a este catálogo (§5.2).
  */
-export type FailureCause = "turn_failed" | "runner_unavailable" | "dispatch_failed";
+export type FailureCause =
+  | "turn_failed"
+  | "runner_unavailable"
+  | "dispatch_failed"
+  | "turn_orphaned";
 
 /** Resultado de reservar idempotencia (§8.2): con `duplicate: true`, `turnId` es el original. */
 export interface ReserveResult {

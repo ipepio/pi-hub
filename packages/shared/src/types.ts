@@ -27,7 +27,15 @@ export interface AgentConfig {
  /** "provider/id", p.ej. "anthropic/claude-sonnet-5" */
  model?: string;
  thinkingLevel?: ThinkingLevel;
- telegramToken?: string;
+  /**
+   * CAMPO LEGADO (cutover channels-and-mcp, slice (c) part 3b). Nada lo escribe
+   * ya: `agents.ts` lo limpia en cada escritura y el Runner no lo lee — el bot de
+   * Telegram vive en el Manager (`channels/registry.ts`) y su credencial nunca es
+   * config del Agent. Solo puede quedar un valor suelto en un `agent.json`
+   * anterior al corte; `channels/cutover.ts` aborta el arranque si ese residuo
+   * convive con un canal proyectado (R3, doble bot).
+   */
+  telegramToken?: string;
  /** Voz TTS propia del agente; si falta se usa la global (PIHUB_TTS_VOICE) */
  ttsVoice?: string;
  /** Configuración de memoria del agente (solo acceso, nunca contenido) */

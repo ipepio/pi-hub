@@ -21,9 +21,9 @@ import {
   type RunnerCapability,
   type ServerWsMessage,
 } from "@pihub/shared";
-import { SessionHubRegistry, type ChatHub } from "./hub.js";
+import { SessionHubRegistry, type ChatHub } from "./hub.ts";
 import type { SessionFactory } from "./session.js";
-import { sttEnabled, transcribe, ttsEnabled } from "./speech.js";
+import { sttEnabled, transcribe, ttsEnabled } from "./speech.ts";
 
 const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -68,7 +68,16 @@ export function startServer(env: PihubEnv, config: AgentConfig, hub: ChatHub, fa
       model: hub.modelId,
       streaming: hub.isStreaming,
       sessionId: hub.sessionId,
-      telegram: Boolean(config.telegramToken),
+      // T4-D/2: estado de la gate COMPARTIDA (no del hub por defecto). El Manager
+      // lo lee al arrancar para reconciliar las reservas de admisión durables que
+      // sobrevivieron al proceso anterior: `busy` dice si este Runner sigue
+      // ejecutando algo y `holder` de quién es (la `sessionKey` con la que el
+      // Manager abrió el turno, o `default`). Aditivo: `streaming` se conserva.
+      execution: sessions.execution,
+      // Cutover slice (c) part 3b: el bot lo posee el Manager. El Runner ya no
+      // lee ningún token; la única señal de canal es la que inyecta
+      // `runnerEnvFor` (`PIHUB_CHANNEL_KINDS`) al spawn.
+      telegram: env.channelKinds.includes("telegram"),
       memory: env.memoryEnabled,
       stt: sttEnabled(env),
       tts: ttsEnabled(env),
@@ -254,6 +263,14 @@ function attachWebSocket(
     const send = (message: ServerWsMessage) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
     };
+    // Una operación que el Runner RECHAZA (admisión ocupada, sesión nueva o
+    // cambio de modelo con un turno en curso) es de ESTE solicitante: el error
+    // va solo a su socket y nunca al hub, donde se leería como un terminal
+    // falso del turno activo. Y una promesa rechazada sin consumidor tumbaría
+    // el proceso del Runner, que es quien tiene la sesión del agente.
+    const fail = (error: unknown) => {
+      send({ type: "error", message: error instanceof Error ? error.message : String(error) });
+    };
     const unsubscribe = hub.subscribe(send);
 
     const capabilities: RunnerCapability[] = ["prompt_context_v1", "ask_human_v1"];
@@ -275,16 +292,19 @@ function attachWebSocket(
         return;
       }
       if (message.type === "prompt" && message.text?.trim()) {
-        void hub.prompt(message.text, message.context);
+        // Rechazo de admisión (Runner ocupado o el prompt no arrancó) → solo
+        // aquí. El fallo de una generación ya admitida no pasa por esta
+        // promesa: lo difunde el hub a sus propios suscriptores.
+        hub.prompt(message.text, message.context).catch(fail);
       } else if (message.type === "abort") {
-        void hub.abort();
+        // El abort es una intención: si el SDK rechaza, se avisa a quien lo
+        // pidió y la admisión sigue en manos del turno hasta su asentamiento.
+        hub.abort().catch(fail);
       } else if (message.type === "new_session") {
-        void hub.newSession();
+        hub.newSession().catch(fail);
       } else if (message.type === "set_model" && message.model?.trim()) {
         // Éxito → broadcast model_changed a todos; error → solo a este cliente.
-        hub.setModel(message.model.trim()).catch((error: unknown) => {
-          send({ type: "error", message: error instanceof Error ? error.message : String(error) });
-        });
+        hub.setModel(message.model.trim()).catch(fail);
       }
     });
 

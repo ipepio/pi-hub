@@ -191,13 +191,24 @@ class FakeTurnExecution implements LoopTurnExecution {
     };
   }
 
-  abort(agentName: string, turnId: string): boolean {
-    const pending = this.pending.find((p) => !p.resolved && p.command.agentName === agentName && p.command.turnId === turnId);
-    if (!pending) return false;
-    pending.aborted = true;
-    this.aborted.push({ agentName, turnId });
-    return true;
-  }
+    abort(agentName: string, turnId: string): boolean {
+      const pending = this.pending.find((p) => !p.resolved && p.command.agentName === agentName && p.command.turnId === turnId);
+      if (!pending) return false;
+      pending.aborted = true;
+      this.aborted.push({ agentName, turnId });
+      return true;
+    }
+
+    /**
+     * Admisión (T4b): un fake no tiene Runner, pero sí sabe qué turnos despachó y
+     * siguen sin terminal. Derivarlo de `pending` mantiene el fixture honesto: un
+     * `false` constante haría que el Loop pareciera correcto por construcción. Los
+     * tests de admisión usan, de todos modos, `TurnExecution` real (ver
+     * `runnerSockets`).
+     */
+    hasLiveTurnForAgent(agentName: string): boolean {
+      return this.pending.some((p) => !p.resolved && p.command.agentName === agentName);
+    }
 
   resolve(pending: PendingTurn, terminal: TurnSseEvent, cause?: FailureCause): void {
     if (pending.resolved) return;
@@ -274,6 +285,53 @@ function humanCommand(agentName: string, turnId: string): StartTurnCommand {
     eventProfile: "basic",
     origin: { kind: "human" },
   };
+}
+
+/**
+ * WS fake del Runner para los tests de admisión (T4b): el borde de red externo es
+ * lo único que se sustituye. Abre, hace el handshake `ready` y entrega el prompt al
+ * test, que decide cuándo llega el terminal (`agent_end`). La admisión, el registro
+ * de turnos vivos y el rechazo `TURN_IN_PROGRESS` son los REALES de `TurnExecution`.
+ */
+function runnerSockets(): {
+  createWebSocket: (url: string) => WebSocket;
+  sockets: Array<{ readonly prompts: string[]; end: () => void }>;
+} {
+  const sockets: Array<{ prompts: string[]; end: () => void }> = [];
+  const createWebSocket = (_url: string): WebSocket => {
+    const listeners = new Map<string, Array<(raw: unknown) => void>>();
+    const emit = (event: string, raw: unknown): void => {
+      listeners.get(event)?.forEach((listener) => listener(raw));
+    };
+    const socket = {
+      prompts: [] as string[],
+      end: (): void => {
+        emit("message", JSON.stringify({ type: "agent_end" }));
+      },
+    };
+    sockets.push(socket);
+    const ws = {
+      on(event: string, listener: (raw: unknown) => void) {
+        (listeners.get(event) ?? listeners.set(event, []).get(event)!).push(listener);
+        if (event === "open") {
+          queueMicrotask(() => {
+            emit("open", undefined);
+            emit("message", JSON.stringify({ type: "ready", capabilities: ["ask_human_v1"] }));
+          });
+        }
+        return ws;
+      },
+      send(data: string) {
+        const message = JSON.parse(data) as { type?: string; text?: string };
+        if (message.type !== "prompt") return;
+        socket.prompts.push(String(message.text ?? ""));
+        emit("message", JSON.stringify({ type: "agent_start" }));
+      },
+      close() {},
+    };
+    return ws as never;
+  };
+  return { createWebSocket, sockets };
 }
 
 interface InsertInit {
@@ -668,24 +726,103 @@ describe("loop.ts — AgendaLoop, el dispatcher central (Fase 3.5, §7.2)", () =
     assert.equal(repo.initiatives.get("A2").state, "queued");
   });
 
-  it("humano paralelo: un turno humano de A no reduce capacidad; la Initiative de A puede empezar", () => {
-    const db = openMemoryDb();
-    const repo = new AgendaRepository(db);
-    const clock = new ManualClock();
-    const { loop, fake, supervisor } = makeLoop(repo, clock);
-    insertInitiative(db, { id: "A1", agent_name: "alice" });
-    supervisor.set("alice", "running", 4100);
+      it("admisión T4b: un turno humano vivo de A deja su Initiative queued sin claim ni failed, y B arranca sin hambre", async () => {
+        const db = openMemoryDb();
+        const repo = new AgendaRepository(db);
+        const clock = new ManualClock();
+        const supervisor = new FakeSupervisor();
+        insertInitiative(db, { id: "A1", agent_name: "alice", available_at: 0 });
+        insertInitiative(db, { id: "B1", agent_name: "bob", available_at: 1 });
+        supervisor.set("alice", "running", 4100);
+        supervisor.set("bob", "running", 4101);
 
-    // Turno humano de alice ya en curso (la ruta HTTP lo abrió en la misma
-    // instancia compartida): el dial solo cuenta Initiatives (`listRunning`).
-    fake.startTurn(humanCommand("alice", "turn-human"));
+        const runner = runnerSockets();
+        const turns = new TurnExecution({
+          apiToken: "service-token",
+          repository: repo.turns,
+          now: clock.now,
+          schedule: clock.schedule,
+          cancel: clock.cancel,
+          createWebSocket: (url) => runner.createWebSocket(url),
+        });
+        const loop = new AgendaLoop(repo, supervisor, turns, {
+          now: clock.now,
+          schedule: clock.schedule,
+          cancel: clock.cancel,
+          tickIntervalMs: 1000,
+        });
 
-    loop.start();
-    clock.advance(1000);
+        // Un turno HUMANO de alice ya está vivo: la ruta HTTP lo abrió en la MISMA
+        // instancia compartida de `TurnExecution` (S2: un turno por Agent).
+        turns.startTurn(humanCommand("alice", "turn-human"));
+        assert.equal(turns.hasLiveTurnForAgent("alice"), true, "fixture: alice ocupado");
 
-    assert.equal(fake.started.length, 2); // el humano + la Initiative
-    assert.equal(repo.initiatives.get("A1").state, "running");
-  });
+        loop.start();
+        clock.advance(1000); // tick: alice no puede, bob sí
+        await flush();
+
+        const a1 = repo.initiatives.get("A1");
+        assert.equal(a1.state, "queued", "ocupado ⇒ la Initiative sigue pendiente, no se reclama");
+        assert.equal(a1.turnId, null, "no se quema ningún turno de la Initiative");
+        assert.equal(a1.failureReason, null, "ocupado no es un fallo: no es `dispatch_failed`");
+        assert.equal(a1.finishedAt, null);
+
+        // El dial es 1: el slot que alice no puede usar lo usa otro Agent en el
+        // MISMO tick (un Agent ocupado no puede hacer pasar hambre a los demás).
+        assert.equal(repo.initiatives.get("B1").state, "running", "bob arranca sin esperar a alice");
+        assert.equal(runner.sockets.length, 2, "solo dos sockets: el humano de alice y el de bob");
+        assert.deepEqual(runner.sockets[0]!.prompts, ["pregunta del humano"]);
+        assert.deepEqual(runner.sockets[1]!.prompts, ["di hola"]);
+      });
+
+      it("admisión T4b: al terminar el turno de canal, el tick periódico despacha la Initiative que esperaba", async () => {
+        const db = openMemoryDb();
+        const repo = new AgendaRepository(db);
+        const clock = new ManualClock();
+        const supervisor = new FakeSupervisor();
+        insertInitiative(db, { id: "A1", agent_name: "alice" });
+        supervisor.set("alice", "running", 4100);
+
+        const runner = runnerSockets();
+        const turns = new TurnExecution({
+          apiToken: "service-token",
+          repository: repo.turns,
+          now: clock.now,
+          schedule: clock.schedule,
+          cancel: clock.cancel,
+          createWebSocket: (url) => runner.createWebSocket(url),
+        });
+        const loop = new AgendaLoop(repo, supervisor, turns, {
+          now: clock.now,
+          schedule: clock.schedule,
+          cancel: clock.cancel,
+          tickIntervalMs: 1000,
+        });
+
+        // Origen CANAL (Telegram) vivo: la admisión es por Agent, no por origen.
+        turns.startTurn({
+          ...humanCommand("alice", "turn-channel"),
+          origin: { kind: "channel", channelKind: "telegram", chatId: "12345" },
+        });
+
+        loop.start();
+        clock.advance(1000);
+        await flush();
+        assert.equal(repo.initiatives.get("A1").state, "queued", "el turno de canal también bloquea");
+
+        // El turno ajeno termina (agent_end del Runner) y libera la admisión.
+        runner.sockets[0]!.end();
+        await flush();
+        assert.equal(turns.hasLiveTurnForAgent("alice"), false, "terminal ⇒ admisión libre");
+        assert.equal(repo.initiatives.get("A1").state, "queued", "nadie reclama fuera del tick");
+
+        clock.advance(1000); // tick periódico: reevalúa el estado durable
+        await flush();
+        assert.equal(repo.initiatives.get("A1").state, "running", "el tick siguiente la despacha");
+        assert.notEqual(repo.initiatives.get("A1").turnId, null);
+        assert.equal(runner.sockets.length, 2, "el socket de la Initiative es el segundo");
+        assert.deepEqual(runner.sockets[1]!.prompts, ["di hola"]);
+      });
 
   it("agent stopped: la Initiative sigue queued; no hay startTurn", () => {
     const db = openMemoryDb();

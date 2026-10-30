@@ -23,7 +23,10 @@
  *   la ruta original (§4.6) desaparece;
  * - un envío del prompt que falla tras aceptar el turno → `turn-error`
  *   (causa `dispatch_failed`);
- * - `disconnect()` (el cliente se fue) → `turn-error` (`runner_unavailable`).
+ * - `disconnect()` (el cliente HTTP/SSE se fue) **no** es un terminal: pide al
+ *   Runner que aborte y el turno conserva la admisión hasta el terminal real
+ *   (`close`/`agent_end` → `turn-aborted`). El sink de ese cliente queda anulado
+ *   (ya no puede recibir nada), así que ese terminal no se entrega a nadie.
  *
  * Cuando se inyecta el repositorio durable (Fase 3.2: tests y futuro Loop),
  * el terminal se escribe además con `turns.complete` en la misma transacción
@@ -40,6 +43,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ChannelKind } from "@pihub/channels";
 import WebSocket from "ws";
 import { hasLiveTurnForAgent } from "../api-v1/restart-policy.ts";
 import {
@@ -49,15 +53,29 @@ import {
 } from "../api-v1/turns.ts";
 import { DomainError } from "./errors.ts";
 import { TurnRepository, type FailureCause, type TurnFinalState } from "./turns.ts";
+import type { LiveTurnStore } from "../storage/live-turns.ts";
 import type { HumanRequest, HumanRequestRepository } from "./human-requests.ts";
 import type { RunnerCapability } from "@pihub/shared";
 
 /** Turno vivo con WS abierto contra el Runner (clave `agentName:turnId`). */
 interface TurnoVivo {
-  ws: WebSocket;
+  /**
+   * Socket contra el Runner. `undefined` entre la reserva de admisión de
+   * `startTurn` y la creación del socket (no hay `await` en medio, así que
+   * ningún observador externo ve una reserva sin socket) y, sobre todo, en las
+   * entradas cargadas del registro durable por `loadUnverified`: ese turno se
+   * ejecuta en OTRO proceso (o en ninguno) y este no tiene cómo alcanzarlo.
+   */
+  ws: WebSocket | undefined;
   abortRequested: boolean;
   /** Latch de la tx de pausa: ningún terminal tardío puede ganarle al COMMIT. */
   pausing: boolean;
+  /**
+   * Entrada cargada del registro durable al arrancar (`loadUnverified`): el
+   * Runner puede seguir ejecutando el turno o haber muerto con el Manager
+   * anterior. Ocupa el slot (fail-closed) pero no es alcanzable desde aquí.
+   */
+  readonly unverified?: boolean;
 }
 
 /**
@@ -83,9 +101,45 @@ interface MensajeRunner {
  * metadata de despacho: no cambia el puente ni el mensaje `prompt` que el
  * Runner recibe.
  */
-export type TurnOrigin =
-  | { kind: "human" }
-  | { kind: "initiative"; initiativeId: string; cause: "trigger" | "callback" | "human" };
+    export type TurnOrigin =
+      | { kind: "human" }
+      | { kind: "initiative"; initiativeId: string; cause: "trigger" | "callback" | "human" }
+      /**
+       * Mensaje entrante de un canal (design §1.4): `channelKind` + `chatId` son
+       * lo que la entrega necesita para rutas (`delivery-router.ts`). El origen
+       * es METADATA del turno — el protocolo WS del Runner sigue sin conocerlo:
+       * un turno de canal se envía como `context: { kind: "human" }`, porque para
+       * el Runner «un mensaje que llega» ya es todo lo que significa.
+       */
+      | { kind: "channel"; channelKind: ChannelKind; chatId: string };
+
+    /**
+     * Turno terminado, tal y como lo ve el puente (design §1.4).
+     * Se emite con CUALQUIER terminal (`turn-complete`, `turn-aborted`,
+     * `turn-error`): el hook no decide nada, solo informa. `replyText` está vacío
+     * cuando el turno no produjo texto, y `userText` es el prompt que se envió.
+     */
+        export interface CompletedTurn {
+          readonly agentName: string;
+          readonly turnId: string;
+          readonly origin: TurnOrigin;
+          readonly userText: string;
+          readonly replyText: string;
+          readonly finalEvent: TurnSseEvent["event"];
+          /**
+           * `sessionKey` con la que se DESPACHÓ este turno: la misma del
+           * `StartTurnCommand`, copiada tal cual.
+           *
+           * Es la identidad del hecho, no una consulta: quien entrega el turno
+           * (design §1.4) atribuye el intercambio a la sesión en la que REALMENTE
+           * corrió, sin volver a leer la selección actual — leerla más tarde
+           * atribuiría el pasado con el puntero de ahora (T5b/2).
+           *
+           * Opcional SOLO por compatibilidad de tipos con fixtures/helpers
+           * anteriores a esta unidad; este fichero la adjunta siempre.
+           */
+          readonly sessionKey?: string;
+        }
 
 /** Comando de `startTurn`: todo lo que el puente necesita para abrir el turno. */
 export interface StartTurnCommand {
@@ -121,7 +175,11 @@ export interface TurnHandle {
    * después de confirmar durablemente `waiting_human`.
    */
   readonly waitingHuman?: Promise<{ initiativeId: string; requestId: string } | null>;
-  /** El cliente se fue (abort del stream SSE): corta el WS contra el Runner y produce terminal. */
+  /**
+   * El cliente se fue (abort del stream SSE). **No** es un terminal: se pide al
+   * Runner que aborte y el turno sigue contando para la admisión hasta que el
+   * Runner cierre de verdad. El sink de este cliente deja de recibir eventos.
+   */
   disconnect(): void;
 }
 
@@ -139,6 +197,14 @@ export interface TurnExecutionOptions {
    * terminal con `turns.complete` y su causa.
    */
   readonly repository?: Pick<TurnRepository, "complete">;
+  /**
+   * Registro DURABLE de turnos vivos (T4-D/1). Espeja cada transición del `Map`
+   * en memoria, nunca en su lugar: la memoria sigue siendo la fuente del puente
+   * y esta colaboradora es la RESERVA que sobrevive al proceso. Opcional por la
+   * misma razón que `repository`: la ruta crea un `TurnExecution` sin almacén en
+   * los tests, y ausente = comportamiento histórico (solo memoria).
+   */
+  readonly liveTurns?: Pick<LiveTurnStore, "claimLiveTurn" | "releaseLiveTurn">;
   /** Pausa durable `turn + Initiative` de P3.2. Producción la inyecta desde Agenda. */
   readonly humanRequests?: Pick<HumanRequestRepository, "pauseRunningForHuman">;
   /** Reloj compartido por terminales y pausa humana (tests sin tiempo real). */
@@ -147,8 +213,15 @@ export interface TurnExecutionOptions {
   readonly requestId?: () => string;
   /** Duración capturada en `human_expires_at` al confirmar la pausa. */
   readonly expiryMs?: number;
-  /** Entrega posterior al COMMIT; callback fire-and-forget, nunca Promise. */
-  readonly onHumanRequest?: (request: HumanRequest) => void;
+      /** Entrega posterior al COMMIT; callback fire-and-forget, nunca Promise. */
+      readonly onHumanRequest?: (request: HumanRequest) => void;
+      /**
+       * Notificación de turno terminado (design §1.4): fire-and-forget, igual que
+       * `onHumanRequest`. Se invoca dentro de `finalizar`, antes de resolver
+       * `completion`, y un throw del consumidor NUNCA rompe el terminal — la
+       * entrega por canales es observable, no un prerequisito del turno.
+       */
+      readonly onTurnCompleted?: (turn: CompletedTurn) => void;
   /**
    * Watchdog de apertura/silencio (§4.6): si no llega `agent_start` en este
    * plazo desde `startTurn`, el turno se aborta con `turn-error`
@@ -199,11 +272,15 @@ export class TurnExecution {
   private readonly turnosVivos = new Map<string, TurnoVivo>();
   private readonly apiToken: string;
   private readonly repository: Pick<TurnRepository, "complete"> | undefined;
+  private readonly liveTurns:
+    | Pick<LiveTurnStore, "claimLiveTurn" | "releaseLiveTurn">
+    | undefined;
   private readonly humanRequests: Pick<HumanRequestRepository, "pauseRunningForHuman"> | undefined;
   private readonly now: () => number;
   private readonly requestId: () => string;
   private readonly expiryMs: number;
   private readonly onHumanRequest: ((request: HumanRequest) => void) | undefined;
+  private readonly onTurnCompleted: ((turn: CompletedTurn) => void) | undefined;
   private readonly dispatchTimeoutMs: number;
   private readonly handshakeTimeoutMs: number;
   private readonly schedule: (callback: () => void, ms: number) => TimerHandle;
@@ -213,6 +290,7 @@ export class TurnExecution {
   constructor(options: TurnExecutionOptions) {
     this.apiToken = options.apiToken;
     this.repository = options.repository;
+    this.liveTurns = options.liveTurns;
     this.humanRequests = options.humanRequests;
     this.now = options.now ?? Date.now;
     this.requestId = options.requestId ?? randomUUID;
@@ -220,6 +298,7 @@ export class TurnExecution {
     // no duplicar aquí el default de configuración de `loadEnv`.
     this.expiryMs = options.expiryMs ?? 0;
     this.onHumanRequest = options.onHumanRequest;
+    this.onTurnCompleted = options.onTurnCompleted;
     this.dispatchTimeoutMs = options.dispatchTimeoutMs ?? 0;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     this.schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
@@ -234,10 +313,172 @@ export class TurnExecution {
     return hasLiveTurnForAgent(this.turnosVivos.keys(), agentName);
   }
 
-  /** ¿Hay algún turno vivo, de cualquier Agent? (rechaza recargas globales). */
-  hasAnyLiveTurn(): boolean {
-    return this.turnosVivos.size > 0;
+      /** ¿Hay algún turno vivo, de cualquier Agent? (rechaza recargas globales). */
+      hasAnyLiveTurn(): boolean {
+        return this.turnosVivos.size > 0;
+      }
+
+      /**
+       * Id del turno vivo del Agent (T6a: la fuente de `/stop`). `undefined` si no
+       * hay. La clave del registro es `agentName:turnId` y el nombre de Agent no
+       * contiene `:` (validación `^[a-z0-9][a-z0-9-]*$`), así que el sufijo es el id.
+       */
+      liveTurnIdForAgent(agentName: string): string | undefined {
+        const prefix = `${agentName}:`;
+        for (const key of this.turnosVivos.keys()) {
+          if (key.startsWith(prefix)) return key.slice(prefix.length);
+        }
+        return undefined;
+      }
+
+  /**
+   * Carga en el registro las reservas DURABLES de un proceso anterior (T4-D/1).
+   *
+   * Las filas de `agent_live_turns` son «no verificadas»: el Runner puede seguir
+   * ejecutando ese turno o haber muerto junto con el Manager que lo lanzó, y este
+   * proceso no tiene su socket para saberlo. Se cargan como entradas sin `ws` que
+   * OCUPAN el slot (fail-closed: un turno no verificable bloquea la admisión) y
+   * que `abort` rechaza con `TURN_UNREACHABLE` en vez de fingir.
+   *
+   * Nunca se pisa un turno vivo de ESTE proceso: la memoria manda y la fila
+   * durable de un Agent ya admitido aquí no puede reemplazar su entrada.
+   *
+   * **LÍMITE CONOCIDO (T4-D/2, por diseño — no se arregla aquí)**: una entrada
+   * confirmada por la reconciliación del arranque puede seguir ejecutándose en el
+   * Runner, pero su terminal real llega por el socket del Manager ANTERIOR, que
+   * murió con el proceso. Este Manager nunca lo verá: la entrada —y su fila
+   * durable— se queda ocupando el slot hasta que un arranque posterior la
+   * reconcilie. No se re-engancha el SSE ni se adopta el WS del proceso viejo
+   * (adoptar un turno ajeno mentiría sobre la propiedad del terminal); es
+   * fail-closed a propósito.
+   *
+   * Devuelve cuántas entradas se cargaron (observabilidad del arranque).
+   */
+  loadUnverified(
+    rows: ReadonlyArray<{
+      readonly agentName: string;
+      readonly turnId: string;
+      readonly sessionKey?: string | null;
+      readonly startedAt: number;
+    }>,
+  ): number {
+    let cargados = 0;
+    for (const row of rows) {
+      if (this.hasLiveTurnForAgent(row.agentName)) continue;
+      this.turnosVivos.set(`${row.agentName}:${row.turnId}`, {
+        ws: undefined,
+        abortRequested: false,
+        pausing: false,
+        unverified: true,
+      });
+      cargados += 1;
+    }
+    return cargados;
   }
+
+      /**
+       * Libera la reserva durable del turno. Un fallo de almacenamiento se LOGUEA y
+       * NO se propaga: el terminal (o la pausa durable) ya ocurrió y no puede
+       * convertirse en un crash. La fila que sobrevive es el estado fail-closed
+       * correcto — el siguiente arranque la carga como «no verificada» y bloquea la
+       * admisión hasta que alguien reconcilie ese turno.
+       */
+      private releaseDurable(clave: string, agentName: string, turnId: string): void {
+        if (!this.liveTurns) return;
+        try {
+          this.liveTurns.releaseLiveTurn(agentName, turnId);
+        } catch (error) {
+          console.error(`[pihub] LIVE_TURN_RELEASE_FAILED ${clave}:`, error);
+        }
+      }
+
+      /**
+       * Escribe el terminal `failed` de un turno huérfano con su causa (T4-D/2).
+       *
+       * Devuelve si el estado durable admite liberar la admisión. `TURN_NOT_FOUND`
+       * (la fila de `turns` nunca se reservó) y `TURN_ALREADY_TERMINAL` (otro camino
+       * ya la cerró) son el MISMO desenlace que el terminal repetido de
+       * `escribirTerminalDurable`: no son fallos, el turno ya está resuelto. Cualquier
+       * otro error NO se tolera porque la liberación de la admisión no puede ocurrir
+       * sin el cierre durable: se loguea y el turno se queda como está (fail-closed).
+       */
+      private escribirTerminalHuerfano(agentName: string, turnId: string): boolean {
+        if (!this.repository) return true;
+        try {
+          this.repository.complete(agentName, turnId, "failed", null, this.now(), "turn_orphaned");
+          return true;
+        } catch (error) {
+          if (
+            error instanceof DomainError &&
+            (error.code === "TURN_NOT_FOUND" || error.code === "TURN_ALREADY_TERMINAL")
+          ) {
+            return true;
+          }
+          console.error(`[pihub] TURN_ORPHAN_WRITE_FAILED ${agentName}:${turnId}:`, error);
+          return false;
+        }
+      }
+
+      /**
+       * Aplica la reconciliación del arranque (T4-D/2) sobre las entradas cargadas
+       * por `loadUnverified`. SÍNCRONA a propósito: quien decide es quien puede
+       * preguntar al Runner (asíncrono, HTTP) y esta clase solo aplica la decisión ya
+       * tomada — así el registro nunca queda a medias entre dos awaits.
+       *
+       * - `confirmed`: el Runner sigue ejecutando ESE turno. Se conserva la entrada (y
+       *   su fila durable) tal cual: el Agent sigue bloqueado. **LÍMITE CONOCIDO**: su
+       *   terminal real llegará por el socket del Manager anterior, así que este
+       *   proceso no lo verá nunca; la entrada se libera en un arranque posterior (ver
+       *   `loadUnverified`). No se adopta el turno.
+       * - `orphaned`: el turno ya no se ejecuta (Runner parado o gate libre). Se cierra
+       *   durablemente como `failed` con causa `turn_orphaned`, se libera la fila de
+       *   `agent_live_turns` y se borra la entrada: el Agent vuelve a admitir turnos.
+       *   Si el terminal durable no se puede escribir, NO se libera nada y se cuenta
+       *   como `deferred`.
+       *
+       * Una entrada de este proceso que NO sea «no verificada» (un turno vivo real) no
+       * se toca nunca: la memoria manda y borrarla liberaría la admisión de un Runner
+       * que está trabajando. Se cuenta como `deferred` y se loguea.
+       */
+      reconcileUnverified(
+        resolutions: ReadonlyArray<{
+          readonly agentName: string;
+          readonly turnId: string;
+          readonly outcome: "confirmed" | "orphaned";
+        }>,
+      ): { confirmed: number; orphaned: number; deferred: number } {
+        const aplicado = { confirmed: 0, orphaned: 0, deferred: 0 };
+        for (const resolution of resolutions) {
+          const { agentName, turnId, outcome } = resolution;
+          const clave = `${agentName}:${turnId}`;
+
+          if (outcome === "confirmed") {
+            aplicado.confirmed += 1;
+            continue;
+          }
+
+          const entrada = this.turnosVivos.get(clave);
+          if (entrada !== undefined && entrada.unverified !== true) {
+            console.error(
+              `[pihub] LIVE_TURN_RECONCILE_SKIPPED ${clave}: el turno está vivo en este proceso`,
+            );
+            aplicado.deferred += 1;
+            continue;
+          }
+
+          // Orden cerrado: terminal durable PRIMERO. Si falla de verdad, la fila y la
+          // entrada se quedan — liberar la admisión sin cierre durable dejaría al
+          // Agent libre con un turno que nadie cerró nunca.
+          if (!this.escribirTerminalHuerfano(agentName, turnId)) {
+            aplicado.deferred += 1;
+            continue;
+          }
+          this.releaseDurable(clave, agentName, turnId);
+          this.turnosVivos.delete(clave);
+          aplicado.orphaned += 1;
+        }
+        return aplicado;
+      }
 
   /**
    * Abre el WS contra el Runner, registra el turno como vivo y traduce los
@@ -247,6 +488,15 @@ export class TurnExecution {
    * una pausa cuyo write falla, que conserva ambos canales pendientes.
    * Un `close` sin terminal limpio, error de conexión o timeout publican
    * `turn-error` en vez del cierre mudo de la ruta original.
+   *
+   * **Admisión (T4a, S2)**: un Agent ejecuta como máximo UN turno, sin importar
+   * el origen (web, Telegram o autonomía). La comprobación y la reserva son
+   * SÍNCRONAS y ocurren ANTES de crear el socket: dos llamadas en el mismo tick
+   * no pueden colarse entre «mirar» y «abrir», y un turno rechazado no deja
+   * ningún WS abierto contra el Runner. La reserva se libera SOLO por el
+   * terminal (o por la pausa humana durable), nunca por un abort ni porque el
+   * cliente se vaya. Un segundo turno del mismo Agent lanza `DomainError`
+   * `TURN_IN_PROGRESS` (→ `409` en `/api/v1`).
    */
   startTurn(command: StartTurnCommand): TurnHandle {
     const {
@@ -259,11 +509,48 @@ export class TurnExecution {
       onEvent,
     } = command;
 
-    const ws = this.createWebSocket(
-      `ws://127.0.0.1:${runnerPort}/ws?sessionKey=${encodeURIComponent(sessionKey)}`,
-    );
-
     const clave = `${agentName}:${turnId}`;
+
+    if (this.hasLiveTurnForAgent(agentName)) {
+      throw new DomainError(
+        "TURN_IN_PROGRESS",
+        `agent "${agentName}" already has a live turn`,
+      );
+    }
+    const turno: TurnoVivo = { ws: undefined, abortRequested: false, pausing: false };
+    this.turnosVivos.set(clave, turno);
+
+    // T4-D/1: la MISMA reserva, espejada en disco, y ANTES de abrir el socket.
+    // Un fallo del claim deshace la reserva en memoria y se propaga: con una fila
+    // de una vida anterior del Manager el error es `TURN_IN_PROGRESS` (idéntico al
+    // de la memoria), y cualquier otro fallo de almacenamiento deja al Agent sin
+    // admisión en vez de admitirlo sin respaldo durable (fail-closed).
+    try {
+      this.liveTurns?.claimLiveTurn({
+        agentName,
+        turnId,
+        sessionKey,
+        startedAt: this.now(),
+      });
+    } catch (error) {
+      this.turnosVivos.delete(clave);
+      throw error;
+    }
+
+    let ws: WebSocket;
+    try {
+      ws = this.createWebSocket(
+        `ws://127.0.0.1:${runnerPort}/ws?sessionKey=${encodeURIComponent(sessionKey)}`,
+      );
+    } catch (error) {
+      // Sin socket no hay ningún camino que libere la reserva: o se libera
+      // aquí o el Agent queda bloqueado para siempre. Vale para las dos
+      // reservas, la de memoria y la durable.
+      this.turnosVivos.delete(clave);
+      this.releaseDurable(clave, agentName, turnId);
+      throw error;
+    }
+    turno.ws = ws;
 
     let resolveCompletion!: (terminal: TurnSseEvent) => void;
     const completion = new Promise<TurnSseEvent>((resolve) => {
@@ -279,8 +566,15 @@ export class TurnExecution {
         })
       : undefined;
 
-    let cerrado = false;
-    let timeoutHandle: TimerHandle | undefined;
+        let cerrado = false;
+        /**
+         * Respuesta acumulada del turno: `TurnExecution` es el único punto que ve
+         * todos los `text_delta` del Runner, así que aquí se forma el texto que
+         * después se entrega por el canal. Se reconstruye a partir del evento ya
+         * traducido (`chunk`) para no duplicar la tabla de equivalencias.
+         */
+        let replyText = "";
+        let timeoutHandle: TimerHandle | undefined;
     let handshakeTimeoutHandle: TimerHandle | undefined;
 
     /** `turn-error` público de una causa del catálogo (el código identifica la clase). */
@@ -312,11 +606,18 @@ export class TurnExecution {
     // terminal cerraría el stream antes de que su propia escritura se
     // vaciara y `turn-complete` NO llegaría nunca al cliente — encontrado
     // con un turno real, no en los tests unitarios.
-    let escrituras: Promise<void> = Promise.resolve();
-    const emitir = (evento: TurnSseEvent): Promise<void> => {
-      escrituras = escrituras.then(() => onEvent?.(evento) ?? Promise.resolve());
-      return escrituras;
-    };
+        let escrituras: Promise<void> = Promise.resolve();
+        /**
+         * Salida hacia el cliente HTTP/SSE de ESTE turno. `disconnect()` la anula:
+         * el cliente ya no está, así que ni sus eventos ni el terminal posterior se
+         * le entregan (el terminal se escribe igual en T6 y resuelve `completion`).
+         * Es por turno, no de la instancia: un turno nuevo no hereda una desconexión.
+         */
+        let sink = onEvent;
+        const emitir = (evento: TurnSseEvent): Promise<void> => {
+          escrituras = escrituras.then(() => sink?.(evento) ?? Promise.resolve());
+          return escrituras;
+        };
 
     const cerrarSocket = () => {
       try {
@@ -359,27 +660,50 @@ export class TurnExecution {
       }
     };
 
-    /** Emite el terminal, cierra el socket, escribe T6 y resuelve `completion`. */
-    const finalizar = (terminal: TurnSseEvent, failureCause?: FailureCause) => {
-      if (cerrado || this.turnosVivos.get(clave)?.pausing) return;
-      cerrado = true;
-      cancelarTimeout();
-      cancelarHandshakeTimeout();
-      this.turnosVivos.delete(clave);
-      const escrituraFinal = emitir(terminal);
-      void escrituraFinal.then(
-        () => {
-          cerrarSocket();
-          escribirTerminalDurable(terminal, failureCause);
-          resolveCompletion(terminal);
-        },
-        () => {
-          cerrarSocket();
-          escribirTerminalDurable(terminal, failureCause);
-          resolveCompletion(terminal);
-        },
-      );
-    };
+        /**
+         * Notificación de turno terminado (design §1.4). Fire-and-forget y
+         * enmudecida contra fallos: si el router de entrega lanza, el terminal
+         * del SSE y la resolución de `completion` siguen su camino — un canal
+         * caído no puede convertir un turno correcto en un turno fallido.
+         */
+        const notificarTurnoCompletado = (terminal: TurnSseEvent): void => {
+          if (!this.onTurnCompleted) return;
+          try {
+            this.onTurnCompleted({
+              agentName,
+              turnId,
+              origin: command.origin,
+              userText: message,
+              replyText,
+              finalEvent: terminal.event,
+              // T5b/2: la identidad del turno es la key con la que se abrió el
+              // contexto en el Runner, no la selección que haya ahora.
+              sessionKey,
+            });
+          } catch (error) {
+            console.error(`[pihub] TURN_COMPLETED_CALLBACK_FAILED ${clave}:`, error);
+          }
+        };
+
+        /** Emite el terminal, cierra el socket, escribe T6 y resuelve `completion`. */
+        const finalizar = (terminal: TurnSseEvent, failureCause?: FailureCause) => {
+          if (cerrado || this.turnosVivos.get(clave)?.pausing) return;
+          cerrado = true;
+          cancelarTimeout();
+          cancelarHandshakeTimeout();
+          this.turnosVivos.delete(clave);
+          this.releaseDurable(clave, agentName, turnId);
+          const escrituraFinal = emitir(terminal);
+          const cerrar = () => {
+            cerrarSocket();
+            escribirTerminalDurable(terminal, failureCause);
+            // Antes de resolver `completion`: el consumidor del hook (el router)
+            // debe ver el turno cerrado, no a medias.
+            notificarTurnoCompletado(terminal);
+            resolveCompletion(terminal);
+          };
+          void escrituraFinal.then(cerrar, cerrar);
+        };
 
     /**
      * Intercepta el mensaje crudo antes de `toTurnEvent`: ese traductor no
@@ -427,6 +751,7 @@ export class TurnExecution {
       cancelarTimeout();
       cancelarHandshakeTimeout();
       this.turnosVivos.delete(clave);
+      this.releaseDurable(clave, agentName, turnId);
       resolveWaitingHuman?.({ initiativeId: request.initiativeId, requestId: request.requestId });
       cerrarSocket();
       void Promise.resolve()
@@ -462,13 +787,13 @@ export class TurnExecution {
     };
 
     ws.on("open", () => {
-      if (cerrado) {
+      // La entrada del registro ya existe: la puso la reserva de admisión antes
+      // de crear este socket, así que aquí NO se reemplaza (borraría un
+      // `abortRequested` marcado en el intervalo).
+      if (cerrado || this.turnosVivos.get(clave) !== turno) {
         cerrarSocket();
         return;
       }
-      // Registrado solo tras `open`: mandar `{type:"abort"}` antes de que el
-      // WS esté realmente conectado no es seguro.
-      this.turnosVivos.set(clave, { ws, abortRequested: false, pausing: false });
 
       // No se envía el prompt inmediatamente: se espera `ready` del Runner.
       // El handshake tiene su propio watchdog (P3.1): si el Runner no envía
@@ -511,6 +836,7 @@ export class TurnExecution {
 
       // El watchdog se apaga con la primera actividad del Runner.
       if (evento.event === "turn-start") cancelarTimeout();
+      if (evento.event === "chunk") replyText += String(evento.data.delta ?? "");
 
       const terminal =
         evento.event === "turn-complete" ||
@@ -565,7 +891,13 @@ export class TurnExecution {
     return {
       completion,
       ...(waitingHuman ? { waitingHuman } : {}),
-      disconnect: () => finalizar(turnError("runner_unavailable"), "runner_unavailable"),
+          // El cliente se fue, pero la ejecución sigue: se pide el abort y el slot
+          // se conserva hasta el terminal real del Runner. Liberar aquí admitiría
+          // un segundo turno contra un Runner que aún está trabajando (S2).
+          disconnect: () => {
+            sink = undefined;
+            this.abort(agentName, turnId);
+          },
     };
   }
 
@@ -575,18 +907,40 @@ export class TurnExecution {
    * sin `agent_end` publican `turn-aborted`. Si el envío falla se cierra el
    * socket (el `close` resolverá el turno con `turn-aborted` igualmente).
    * Devuelve `false` si no hay ningún turno vivo con ese `(agentName, turnId)`.
+   *
+   * T4-D/1: un turno cargado del registro durable (`loadUnverified`) existe pero
+   * NO es alcanzable desde este proceso; se rechaza con `TURN_UNREACHABLE` (409)
+   * en vez de marcar un abort que nadie entregaría al Runner. El slot sigue
+   * ocupado.
    */
   abort(agentName: string, turnId: string): boolean {
     const turno = this.turnosVivos.get(`${agentName}:${turnId}`);
     if (!turno) return false;
 
+    if (turno.unverified === true) {
+      // Fail-closed honesto: el turno ocupa el slot en el registro durable, pero
+      // su socket no vive en este proceso. Marcarlo abortado mentiría (nadie
+      // enviaría el `abort` al Runner) y liberar la admisión admitiría un segundo
+      // turno contra un Runner que puede seguir trabajando.
+      throw new DomainError(
+        "TURN_UNREACHABLE",
+        `turno (${agentName}, ${turnId}) sobrevivió a un reinicio del Manager y no es alcanzable desde este proceso`,
+      );
+    }
+
     turno.abortRequested = true;
+    const ws = turno.ws;
+    if (ws === undefined) {
+      // Reserva de admisión todavía sin socket: el abort queda marcado y el
+      // cierre, cuando exista, publica `turn-aborted`. La admisión NO se libera.
+      return true;
+    }
     try {
-      turno.ws.send(JSON.stringify({ type: "abort" }));
+      ws.send(JSON.stringify({ type: "abort" }));
     } catch {
       // El close del socket resolverá el turno con turn-aborted igualmente.
       try {
-        turno.ws.close();
+        ws.close();
       } catch {
         // Ya estaba cerrado.
       }

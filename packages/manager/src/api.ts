@@ -32,6 +32,7 @@ import { panelDir } from "./paths.js";
 import {
   createApiV1Router,
   correlationIdOf,
+  type ApiV1ChannelDeps,
 } from "./api-v1/routes.js";
 import type { TurnExecution } from "./agenda/turn-execution.js";
 import { csrfCookie, generateCsrfToken } from "./api-v1/auth.js";
@@ -55,6 +56,12 @@ export const createAgentSchema = z.object({
   model: z.string().optional(),
   thinkingLevel: z.enum(thinkingLevels).optional(),
   systemPrompt: z.string().optional(),
+  /**
+   * LEGADO (cutover channels-and-mcp, part 3b): el panel gobernanado ya no puede
+   * configurar un bot aquí — el formulario de Telegram del panel local queda
+   * inerte y debe apuntar a los canales del Manager. Se acepta y se descarta.
+   * @deprecated
+   */
   telegramToken: z.string().optional(),
   ttsVoice: z.string().optional(),
   memory: memorySchema.optional(),
@@ -65,6 +72,7 @@ export const updateAgentSchema = z.object({
   model: z.string().optional(),
   thinkingLevel: z.enum(thinkingLevels).optional(),
   systemPrompt: z.string().optional(),
+  /** LEGADO: ver `createAgentSchema`; aceptado por compatibilidad, nunca escrito. @deprecated */
   telegramToken: z.string().nullable().optional(),
   ttsVoice: z.string().nullable().optional(),
   memory: memorySchema.nullable().optional(),
@@ -101,6 +109,13 @@ export function createApi(
     control: AutonomyControl;
     deliveries: Pick<HumanRequestDeliveries, "lookupDelivery">;
   },
+  /**
+   * Canales (slice (c) part 2b): el Manager compone el `ChannelRuntimeRegistry`
+   * en `index.ts` porque es también quien lo PARA en el apagado. Sin este puente
+   * el router se fabricaría un registry privado y el `stopAll()` del shutdown no
+   * vería ningún adapter vivo: los bots seguirían sondeando después del SIGTERM.
+   */
+  channels?: ApiV1ChannelDeps,
 ): Hono {
   const app = new Hono();
   const providers =
@@ -140,7 +155,7 @@ export function createApi(
   // resuelve en orden de registro, así que registrar el router primero deja
   // `/api/v1` con su propia auth de servicio (sin cookie) y no toca ninguna
   // ruta `/api/*` del panel.
-  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers, turns, autonomy));
+  app.route("/api/v1", createApiV1Router(env, supervisor, oauth, providers, turns, autonomy, channels));
 
   app.use("/api/*", async (c, next) => {
     const authorization = c.req.header("authorization");

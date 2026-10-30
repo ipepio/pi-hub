@@ -360,9 +360,56 @@ describe("startup.ts — shutdownRuntime, el orden del apagado (Fase 3.7, §9.7)
       },
     });
 
-    // `loop.stop` PRIMERO (§1.3, D3): es lo que evita que un apagado marque
-    // como `failed` turnos que solo fueron interrumpidos. El store SQLite se
-    // cierra antes que el socket HTTP, igual que en `index.ts`.
-    assert.deepEqual(calls, ["loop.stop", "stopAll", "store.close", "server.close"]);
-  });
+        // `loop.stop` PRIMERO (§1.3, D3): es lo que evita que un apagado marque
+        // como `failed` turnos que solo fueron interrumpidos. El store SQLite se
+        // cierra antes que el socket HTTP, igual que en `index.ts`.
+        assert.deepEqual(calls, ["loop.stop", "stopAll", "store.close", "server.close"]);
+      });
+    
+      // Slice (c) part 2b, item 2: los ChannelAdapter viven en el Manager, no en el
+      // Runner. Si el apagado no los para, el bot sigue haciendo long-polling contra
+      // Telegram durante el SIGTERM del proceso (y, con systemd, dos bots durante el
+      // reinicio). Van DESPUÉS de `loop.stop` — un turno de agenda ya no puede
+      // producir un mensaje que encolar — y ANTES de `supervisor.stopAll`, para que
+      // ningún inbound entre en un Runner que ya se está muriendo. `channels` es
+      // OPCIONAL: un arranque sin canales compuestos se apaga igual de bien.
+      it("para los adapters de canal tras el loop y antes que los Runners", async () => {
+        const calls: string[] = [];
+        await shutdownRuntime({
+          loop: {
+            start(): void {},
+            async stop(): Promise<void> {
+              calls.push("loop.stop");
+            },
+          },
+          channels: {
+            async stopAll(): Promise<void> {
+              calls.push("channels.stopAll");
+            },
+          },
+          supervisor: {
+            async stopAll(): Promise<void> {
+              calls.push("stopAll");
+            },
+          },
+          store: {
+            close(): void {
+              calls.push("store.close");
+            },
+          },
+          server: {
+            close(): void {
+              calls.push("server.close");
+            },
+          },
+        });
+    
+        assert.deepEqual(calls, [
+          "loop.stop",
+          "channels.stopAll",
+          "stopAll",
+          "store.close",
+          "server.close",
+        ]);
+      });
 });

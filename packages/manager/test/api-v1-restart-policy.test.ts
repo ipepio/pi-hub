@@ -17,16 +17,20 @@ import {
 // cambiaría nada observable y por tanto no se reinicia.
 
 function baseSnapshot() {
-  return {
+  const base = {
     model: "anthropic/claude-sonnet-5",
     thinkingLevel: "medium" as const,
-    telegramToken: "tg-token",
     ttsVoice: "af_heart",
     memory: { sharedAccess: "read" as const },
     systemPrompt: "Eres un asistente.",
     env: { FOO: "bar" },
     packages: ["npm:@scope/skill"],
+    channels: [{ kind: "telegram" as const, label: "personal", tokenDigest: "digest-1" }],
   };
+  // Cutover (slice (c) part 3b): `telegramToken` salió del snapshot. El campo
+  // sigue aceptándose como propiedad desconocida para que un caller que aún lo
+  // mande no rompa contra `tsc`, pero la huella lo ignora por completo.
+  return base as typeof base & { telegramToken?: string };
 }
 
 test("agentRuntimeFingerprint: dos snapshots idénticos dan la misma huella", () => {
@@ -51,7 +55,6 @@ test("agentRuntimeFingerprint: el orden de packages no importa", () => {
 const camposDeArranque: Array<[string, (s: ReturnType<typeof baseSnapshot>) => typeof s]> = [
   ["model", (s) => ({ ...s, model: "openai/gpt-5" })],
   ["thinkingLevel", (s) => ({ ...s, thinkingLevel: "high" })],
-  ["telegramToken", (s) => ({ ...s, telegramToken: "otro-token" })],
   ["ttsVoice", (s) => ({ ...s, ttsVoice: "otra-voz" })],
   ["memory.sharedAccess", (s) => ({ ...s, memory: { sharedAccess: "none" } })],
   ["systemPrompt", (s) => ({ ...s, systemPrompt: "Otra persona." })],
@@ -60,6 +63,15 @@ const camposDeArranque: Array<[string, (s: ReturnType<typeof baseSnapshot>) => t
   ["env (clave quitada)", (s) => ({ ...s, env: {} })],
   ["packages (añadido)", (s) => ({ ...s, packages: [...s.packages, "npm:@scope/otro"] })],
   ["packages (quitado)", (s) => ({ ...s, packages: [] })],
+  ["channels (digest rotado)", (s) => ({
+    ...s,
+    channels: [{ ...s.channels[0], tokenDigest: "digest-2" }],
+  })],
+  ["channels (añadido)", (s) => ({
+    ...s,
+    channels: [...s.channels, { kind: "telegram" as const, tokenDigest: "otro" }],
+  })],
+  ["channels (quitado)", (s) => ({ ...s, channels: [] })],
 ];
 
 for (const [campo, mutar] of camposDeArranque) {
@@ -70,10 +82,82 @@ for (const [campo, mutar] of camposDeArranque) {
   });
 }
 
-test("agentRuntimeFingerprint: telegramToken ausente vs undefined explícito dan la misma huella", () => {
-  const { telegramToken: _omitido, ...sinToken } = baseSnapshot();
-  const conUndefined = { ...baseSnapshot(), telegramToken: undefined };
-  assert.equal(agentRuntimeFingerprint(sinToken), agentRuntimeFingerprint(conUndefined));
+test("agentRuntimeFingerprint: el telegramToken LEGADO ya no forma parte de la huella", () => {
+  // Cutover R3: el token del Runner desapareció del proceso, así que un valor
+  // legado en el config no puede mover el arranque de nada. Lo que sí mueve la
+  // huella es el canal proyectado (`channels`), que es el dueño real del bot.
+  const sinLegado = baseSnapshot();
+  const conLegado = { ...baseSnapshot(), telegramToken: "otro-token" };
+  assert.equal(agentRuntimeFingerprint(sinLegado), agentRuntimeFingerprint(conLegado));
+  assert.equal(agentRuntimeFingerprint(conLegado).includes("otro-token"), false);
+});
+
+test("agentRuntimeFingerprint: la rotación del token vive en channels.tokenDigest", () => {
+  const antes = { ...baseSnapshot(), telegramToken: "tg-token" };
+  const despues = {
+    ...baseSnapshot(),
+    telegramToken: "tg-token",
+    channels: [{ kind: "telegram" as const, tokenDigest: "digest-2" }],
+  };
+  assert.notEqual(agentRuntimeFingerprint(antes), agentRuntimeFingerprint(despues));
+});
+
+// --- canales (channels-and-mcp, slice (c)) ---
+
+test("agentRuntimeFingerprint: cada canal entra como (kind, tokenDigest), nunca como token", () => {
+  const huella = agentRuntimeFingerprint({
+    ...baseSnapshot(),
+    telegramToken: "tg-token",
+  });
+  const parsed = JSON.parse(huella) as {
+    channels: Array<{ kind: string; tokenDigest: string | null }>;
+  };
+  assert.deepEqual(parsed.channels, [
+    { kind: "telegram", tokenDigest: "digest-1" },
+  ]);
+  // El digest sí viaja; cualquier secreto en claro (el del canal o el legado del
+  // Agent) y la etiqueta no.
+  assert.equal(huella.includes("digest-1"), true);
+  assert.equal(huella.includes("tg-token"), false);
+  assert.equal(huella.includes("personal"), false);
+});
+
+test("agentRuntimeFingerprint: cambiar solo la etiqueta de un canal NO cambia la huella", () => {
+  // La etiqueta no la lee nadie al arrancar: reiniciar por una etiqueta mataría
+  // un turno vivo sin ningún efecto observable (runtime-projection: «label
+  // changes do NOT trigger restart», tasks (c-T4)).
+  const antes = baseSnapshot();
+  const despues = {
+    ...baseSnapshot(),
+    channels: [{ ...baseSnapshot().channels[0], label: "renombrado" }],
+  };
+  assert.equal(agentRuntimeFingerprint(antes), agentRuntimeFingerprint(despues));
+});
+
+test("agentRuntimeFingerprint: channels [] y channels ausente dan la misma huella", () => {
+  // I2 del projection: el dashboard manda `[]` al borrar el último canal, y un
+  // reconcile sin canales puede omitir el campo. Ambos significan «ninguno».
+  const { channels: _omitido, ...sinCampo } = baseSnapshot();
+  const vacio = { ...baseSnapshot(), channels: [] };
+  assert.equal(agentRuntimeFingerprint(sinCampo), agentRuntimeFingerprint(vacio));
+});
+
+test("agentRuntimeFingerprint: el orden de los canales no importa", () => {
+  const a = {
+    ...baseSnapshot(),
+    channels: [
+      { kind: "telegram" as const, tokenDigest: "uno" },
+      { kind: "telegram" as const, tokenDigest: "dos" },
+    ],
+  };
+  const b = {
+    ...baseSnapshot(),
+    channels: [
+      { kind: "telegram" as const, tokenDigest: "dos" },
+      { kind: "telegram" as const, tokenDigest: "uno" },
+    ],
+  };
+  assert.equal(agentRuntimeFingerprint(a), agentRuntimeFingerprint(b));
 });
 
 // --- decideRuntimeAction: la tabla de verdad completa ---
@@ -136,31 +220,40 @@ test("decideRuntimeAction: Runner corriendo y huella distinta reinicia", () => {
 // persistir (y así poder rechazar con 409 sin dejar el config a medias).
 // Debe espejar exactamente el merge real de `updateAgent` en agents.ts.
 
-function baseConfig() {
+function baseConfig(): {
+  model?: string;
+  thinkingLevel?: "medium";
+  ttsVoice?: string;
+  memory?: { sharedAccess: "read" };
+  enabled: boolean;
+  telegramToken?: string;
+} {
   return {
     model: "anthropic/claude-sonnet-5",
     thinkingLevel: "medium" as const,
+    // Campo legado que un `agent.json` anterior al cutover aún puede tener.
     telegramToken: "tg-token",
     ttsVoice: "af_heart",
     memory: { sharedAccess: "read" as const },
     enabled: true,
   };
 }
-
-test("projectUpdatedAgent: input vacío conserva el config actual tal cual", () => {
-  assert.deepEqual(projectUpdatedAgent(baseConfig(), {}), baseConfig());
+  
+test("projectUpdatedAgent: input vacío conserva el config actual sin el token legado", () => {
+  const { telegramToken: _legado, ...esperado } = baseConfig();
+  assert.deepEqual(projectUpdatedAgent(baseConfig(), {}), esperado);
 });
 
 test("projectUpdatedAgent: un campo presente en input lo sobreescribe, el resto queda intacto", () => {
   const proyectado = projectUpdatedAgent(baseConfig(), { model: "openai/gpt-5" });
   assert.equal(proyectado.model, "openai/gpt-5");
   assert.equal(proyectado.thinkingLevel, "medium");
-  assert.equal(proyectado.telegramToken, "tg-token");
+  assert.equal(proyectado.telegramToken, undefined, "el token legado no se proyecta");
 });
-
-test("projectUpdatedAgent: null explícito limpia telegramToken/ttsVoice/memory", () => {
+  
+test("projectUpdatedAgent: null explícito limpia ttsVoice/memory; telegramToken se ignora", () => {
   const proyectado = projectUpdatedAgent(baseConfig(), {
-    telegramToken: null,
+    telegramToken: null as unknown as undefined,
     ttsVoice: null,
     memory: null,
   });

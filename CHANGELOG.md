@@ -5,6 +5,94 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-30
+
+### Added
+
+- **Workspace de sesiones de Agent (`feat/agent-session-workspace`)**: catálogo
+  durable de sesiones por Agent (schema v5 `agent_sessions` + `agent_session_selection`)
+  con selección por superficie (web/Telegram independientes), adopción legacy
+  determinista de `agent:<nombre>:main` y API `/api/v1` con claves validadas y
+  fail-closed.
+- **Admisión de un turno por Agent**: `409 TURN_IN_PROGRESS` antes de abrir el SSE,
+  reserva síncrona en `TurnExecution`, política por origen (Telegram avisa vía outbox,
+  Autonomía queda `queued`), gate de ejecución en el Runner, `disconnect()` ya no
+  corta el turno ni libera el slot, fence de arranque del Supervisor sobre puertos
+  ocupados.
+- **Registro durable de turnos vivos (schema v8 `agent_live_turns`)** con
+  reconciliación al arranque vía introspección de la gate del Runner
+  (`GET /api/status` expone `execution{busy,holder}`): el 409 sobrevive reinicios del
+  Manager y los turnos huérfanos se cierran `failed`/`turn_orphaned`; nunca se adopta
+  un turno no verificado.
+- **Transcript completo de filas nuevas** (schema v6, mitades hasta 32.768 chars con
+  `hasFull`) e **identidad de sesión del turno al espejo** (schema v7
+  `session_key`); filas legacy READ-ONLY para siempre.
+- **Comandos de sesión en Telegram**: `/new`, `/sessions`, `/session [nombre|id]`,
+  `/stop` (copy 100% vía `channels/labels.ts`, nunca gastan el slot de admisión) y
+  **teclado en línea**: un botón por sesión (`callback_query`, datos `s:<id>` opacos
+  para el transporte, parseados y validados contra el chat enlazado SOLO por el
+  Manager; ACK síncrono + resultado por outbox).
+- **Panel del Manager con sesiones**: el panel adopta el catálogo como única fuente
+  de la identidad del turno (crea, lista, selecciona; sin catálogo o sin selección
+  el turno se bloquea fail-closed); corrección de un import faltante pre-existente
+  que rompía el panel en el navegador.
+
+### Changed
+
+- `POST /api/packages` del Runner sigue aceptando `source` libre (hueco de
+  procedencia documentado en `docs/pi-mcp-adapter-compatibility.md`).
+
+### Security
+
+- Investigación read-only de `pi-mcp-adapter`:
+  **NO instalar por defecto** con SDK 0.80.3 (peer range incompatible, superficies
+  de config no administrables, herencia de env del Runner). Camino condicional
+  documentado en `docs/pi-mcp-adapter-compatibility.md`.
+
+## [0.11.0] — 2026-10-26
+
+### Added
+
+- **Canales Manager-owned (cutover de canales)**: el bot de Telegram vive en el
+  Manager (`packages/channels`, seam `ChannelAdapter` + adapter de grammy) — el
+  Runner queda como endpoint puro de turnos y `agent.json` ya no lleva
+  `telegramToken`. La única señal de canales que le queda al Runner es
+  `PIHUB_CHANNEL_KINDS` (sin secretos ni tokens).
+- **Pairing gobernado**: auto-pair del primer chat dentro de la ventana
+  proyectada por el dashboard (1 h); fuera de ventana, código + aprobación
+  (comparación timing-safe); unbind manual no re-arma la ventana
+  (`pairing_window_closed_at`).
+- **Outbox durable en SQLite (v4)**: entrega saliente con reserva, backoff
+  exponencial, idempotencia por `external_message_id` y drain a estado
+  terminal; sobrevive restarts del Manager.
+- **Delivery-by-origin + espejo projection-in**: el chat de Telegram comparte
+  la sesión principal del agent; lo hablado por web no se empuja al canal, lo
+  del canal se refleja en la web (feed `GET /agents/:name/channel-exchanges`
+  + tabla `channel_exchanges`); lo proactivo va a ambos.
+- **Superficie observada**: `GET /agents/:name` expone `channels[]` (estado
+  observado del Manager, lista blanca cerrada — jamás tokens ni hashes).
+- **Apagado ordenado**: los adapters se detienen entre `loop.stop` y
+  `supervisor.stopAll`; un arranque sin canales compuestos se apaga igual que
+  antes.
+
+### Changed
+
+- **Cutover**: `agent.json.telegramToken` dejó de escribirse y leerse; el
+  fingerprint de restart lleva `(kind, tokenDigest)` — nunca el token en
+  claro. El guard de doble bot limpia el residuo con warning (no aborta el
+  arranque). Migración de esquema a v4 (`channel_outbox`).
+- `PIHUB_TELEGRAM_ALLOWED_USERS` queda como segunda línea de defensa; su
+  re-enforcement por el adapter es follow-up.
+
+### Known issues (heredados, no regresiones de 0.11.0)
+
+- La idempotencia de la ruta de turnos sigue siendo in-memory (la reserva
+  durable de Agenda existe pero no está cableada a esa ruta).
+- El guard CSRF del panel legacy `/api/*` mantiene su hueco histórico.
+- `PIHUB_TELEGRAM_ALLOWED_USERS` no se re-fuerza todavía (ver Changed).
+
+
+
 ## [0.10.0] — 2026-09-04
 
 ### Added

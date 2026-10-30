@@ -6,6 +6,12 @@ export type ApiErrorCode =
   | "SESSION_EXPIRED"
   | "TURN_NOT_FOUND"
   | "TURN_IN_PROGRESS"
+  /**
+   * El turno vive en el registro durable pero este proceso no puede alcanzarlo
+   * (sobrevivió a un reinicio). Es un 409 como `TURN_IN_PROGRESS`: el Agent sigue
+   * ocupado, no es un turno inexistente.
+   */
+  | "TURN_UNREACHABLE"
   | "MODEL_FORBIDDEN"
   | "RESOURCE_UNAVAILABLE"
   | "VOICE_PROVIDER_ERROR"
@@ -24,7 +30,11 @@ export type ApiErrorCode =
   | "FORBIDDEN"
   | "AUTONOMY_DISABLED"
   | "TRIGGER_LIMIT_REACHED"
-  | "TRIGGER_AUTHORITY_CONFLICT";
+  | "TRIGGER_AUTHORITY_CONFLICT"
+  | "CHANNEL_NOT_FOUND"
+  | "CHANNEL_ALREADY_BOUND"
+  | "CHANNEL_PAIRING_LIMIT"
+  | "CHANNEL_PAIRING_CODE_INVALID";
 
 export const HTTP_STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   BAD_REQUEST: 400,
@@ -49,9 +59,17 @@ export const HTTP_STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   TURN_NOT_FOUND: 404,
   AGENT_ALREADY_EXISTS: 409,
   TURN_IN_PROGRESS: 409,
+  TURN_UNREACHABLE: 409,
   RESOURCE_UNAVAILABLE: 503,
   VOICE_PROVIDER_ERROR: 502,
   INTERNAL_ERROR: 500,
+  // Channels (channels-and-mcp, part 2a): closed catalogue — these are
+  // exactly the codes `channels/pairing.ts` throws. A machine code with no
+  // entry here is a bug, not a new case.
+  CHANNEL_NOT_FOUND: 404,
+  CHANNEL_ALREADY_BOUND: 409,
+  CHANNEL_PAIRING_LIMIT: 409,
+  CHANNEL_PAIRING_CODE_INVALID: 403,
 };
 
 /** Mensaje fijo para el error interno: el detalle real va al log del Manager, nunca al caller (spec §4.1, §7). */

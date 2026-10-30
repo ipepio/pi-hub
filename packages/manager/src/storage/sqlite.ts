@@ -3,6 +3,15 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runMigrations } from "./migrations.ts";
 import { AgendaRepository } from "../agenda/index.ts";
+import {
+  openChannelPersistence,
+  type ChannelPersistence,
+} from "../channels/persistence.ts";
+import {
+  openAgentSessionCatalogue,
+} from "../sessions/persistence.ts";
+import type { AgentSessionCatalogue } from "../sessions/catalogue.ts";
+import { openLiveTurnStore, type LiveTurnStore } from "./live-turns.ts";
 
 // Todo el acceso a SQLite del Manager pasa por este módulo. El driver es
 // `node:sqlite`, el módulo integrado de Node: pihub se instala como servicio
@@ -27,6 +36,36 @@ export interface SqliteDb {
 export interface ManagerStore {
   /** Repositorio de Agenda (barrel de `agenda/`). No expone el driver. */
   readonly agenda: AgendaRepository;
+  /**
+   * Persistencia de canales (migración v4: `channel_outbox` + `channel_exchanges`).
+   * Fachada estrecha, no el driver: `channels/persistence.ts` es la puerta para
+   * encolar dreñar y leer el espejo, igual que `agenda` encapsula su propio uso de
+   * SQLite. El `SqliteDb` crudo sigue sin salir de `storage/`.
+   */
+      readonly channels: ChannelPersistence;
+      /**
+       * Catálogo durable de sesiones de un Agent (migración v5: `agent_sessions` +
+       * `agent_session_selection`, T3 del ODD `agent-session-workspace`).
+       *
+       * Misma fachada estrecha que `channels`: quien lo consume no ve SQL ni el
+       * driver, y todas las invariantes del catálogo (identidad por Agent, unicidad
+       * de key, idempotencia de la entrada legacy, selección por superficie) viven
+       * en `sessions/catalogue.ts`. El `SqliteDb` crudo sigue sin salir de
+       * `storage/`.
+       */
+          readonly sessions: AgentSessionCatalogue;
+      /**
+       * Registro durable del turno vivo por Agent (migración v8:
+       * `agent_live_turns`, T4-D/1 del seguimiento del ODD
+       * `agent-session-workspace`).
+       *
+       * Misma fachada estrecha que `channels`/`sessions`: el arranque y
+       * `TurnExecution` ven operaciones (`claimLiveTurn`/`releaseLiveTurn`/
+       * `listLiveTurns`), nunca SQL. La invariante «un turno vivo por Agent» la
+       * sostiene la PK `agent_name`, y el `SqliteDb` crudo sigue sin salir de
+       * `storage/`.
+       */
+      readonly liveTurns: LiveTurnStore;
   /** Ruta completa del fichero `.db` (los ficheros WAL/SHM viven a su lado). */
   readonly file: string;
   close(): void;
@@ -61,7 +100,14 @@ export async function openManagerStore(dataDir: string): Promise<ManagerStore> {
   const db = new DatabaseSync(file);
   configurePragmas(db);
   runMigrations(db);
-  return { agenda: new AgendaRepository(db), file, close: () => db.close() };
+    return {
+      agenda: new AgendaRepository(db),
+      channels: openChannelPersistence(db),
+      sessions: openAgentSessionCatalogue(db),
+      liveTurns: openLiveTurnStore(db),
+      file,
+      close: () => db.close(),
+    };
 }
 
 /**

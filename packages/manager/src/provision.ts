@@ -12,12 +12,18 @@ import {
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 const sharedMemoryAccessValues = ["none", "read", "read-write"] as const;
 
-const manifestAgentSchema = z.object({
-  name: z.string(),
-  model: z.string().optional(),
-  thinkingLevel: z.enum(thinkingLevels).optional(),
-  telegramToken: z.string().optional(),
-  ttsVoice: z.string().optional(),
+    const manifestAgentSchema = z.object({
+      name: z.string(),
+      model: z.string().optional(),
+      thinkingLevel: z.enum(thinkingLevels).optional(),
+      /**
+       * LEGADO (cutover channels-and-mcp, part 3b). Se sigue aceptando solo para
+       * poder avisar: un manifiesto con `telegramToken` ya NO configura un bot —
+       * el canal es una entidad del Manager (PUT /api/v1/agents/:name/channels)
+       * y su credencial nunca se escribe en `agent.json`.
+       */
+      telegramToken: z.string().optional(),
+      ttsVoice: z.string().optional(),
   memory: z.object({ sharedAccess: z.enum(sharedMemoryAccessValues).optional() }).optional(),
   systemPrompt: z.string().optional(),
   systemPromptFile: z.string().optional(),
@@ -73,15 +79,18 @@ async function provisionOne(env: PihubEnv, raw: ManifestAgent): Promise<void> {
   const entry: ManifestAgent = {
     ...raw,
     model: raw.model !== undefined ? interpolate(raw.model) : undefined,
-    telegramToken: raw.telegramToken !== undefined ? interpolate(raw.telegramToken) : undefined,
     systemPrompt: raw.systemPrompt !== undefined ? interpolate(raw.systemPrompt) : undefined,
     systemPromptFile: raw.systemPromptFile !== undefined ? interpolate(raw.systemPromptFile) : undefined,
   };
 
-  // Un secreto sin resolver jamás se escribe como token literal.
-  if (entry.telegramToken?.includes("${")) {
-    warn(`"${entry.name}": telegramToken con variable sin resolver; se ignora el campo`);
-    entry.telegramToken = undefined;
+  // Cutover R3: el campo se descarta aquí mismo — no se interpola (un `${VAR}` de
+  // secreto no debe resolverse nunca para algo que no se escribe) y no llega a
+  // `createAgent`/`updateAgent`, que ya no lo aceptan.
+  if (entry.telegramToken !== undefined) {
+    warn(
+      `"${entry.name}": telegramToken es legado y se ignora; configura el canal ` +
+        `con PUT /api/v1/agents/${entry.name}/channels (el bot lo posee el Manager)`,
+    );
   }
 
   let systemPrompt = entry.systemPrompt;
@@ -101,7 +110,6 @@ async function provisionOne(env: PihubEnv, raw: ManifestAgent): Promise<void> {
       model: entry.model,
       thinkingLevel: entry.thinkingLevel,
       systemPrompt,
-      telegramToken: entry.telegramToken,
       ttsVoice: entry.ttsVoice,
       memory: entry.memory,
       packages: entry.packages,
@@ -116,9 +124,6 @@ async function provisionOne(env: PihubEnv, raw: ManifestAgent): Promise<void> {
   if (entry.model !== undefined && entry.model !== existing.model) patch.model = entry.model;
   if (entry.thinkingLevel !== undefined && entry.thinkingLevel !== existing.thinkingLevel) {
     patch.thinkingLevel = entry.thinkingLevel;
-  }
-  if (entry.telegramToken !== undefined && entry.telegramToken !== existing.telegramToken) {
-    patch.telegramToken = entry.telegramToken;
   }
   if (entry.ttsVoice !== undefined && entry.ttsVoice !== existing.ttsVoice) patch.ttsVoice = entry.ttsVoice;
   if (entry.memory !== undefined && entry.memory.sharedAccess !== existing.memory?.sharedAccess) {

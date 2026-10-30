@@ -22,6 +22,7 @@ import {
   type AgentPaths,
   type ModelInfo,
   type PihubEnv,
+  channelKindsOf,
   ASK_HUMAN_TOOL_NAME,
   type SessionType,
 } from "@pihub/shared";
@@ -185,10 +186,13 @@ export class SessionFactory {
 
   private platformSection(): string {
     if (!this.env.platformPromptEnabled) return "";
+    // `channelKinds` viene de PIHUB_CHANNEL_KINDS (cutover slice c part 3b):
+    // es la única señal de canales que le queda al Runner — el bot lo posee
+    // el Manager y el Runner no lee ningún secreto ni token.
     return buildPlatformPrompt({
       agentName: this.config.name,
       memoryEnabled: this.env.memoryEnabled,
-      telegram: Boolean(this.config.telegramToken),
+      telegram: channelKindsOf(this.env).includes("telegram"),
       sessionType: this.sessionType,
     });
   }

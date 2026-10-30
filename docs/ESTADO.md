@@ -1,13 +1,40 @@
 # Estado de pihub
 
-> Última verificación: **2026-09-04** · versión **v0.10.0** · release publicada
-> desde HEAD `05515f9` con digest
-> `ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4`.
+> Última verificación: **2026-10-30** · versión **v0.12.0** · release de
+> branch `feat/agent-session-workspace` (workspace de sesiones de Agent:
+> catálogo durable, admisión única con registro durable y reconciliación,
+> transcript completo, panel con sesiones, comandos + teclado en línea de
+> Telegram, investigación MCP) — PR a `main` abierto; imagen publicada por el
+> workflow al pushear el tag `v0.12.0`. La release publicada anterior es
+> v0.10.0 (HEAD `05515f9`, digest
+> `ghcr.io/ipepio/pi-hub@sha256:f37ba26747e2cfcf0a3c090af7b5f69ee95a0a38c74bf0fbdb277997a16adca4`);
+> el cutover de canales 0.11.0 viaja dentro de esta release (nunca se mergeó ni
+> tagueó por separado).
 
-## Verificado
+## Verificado (0.12.0, release)
+
+- Suite raíz completa: **1073/1073** (vs 1025 en el cierre del change),
+  `npm run verify` (typecheck + build + test) exit 0.
+- Focales del cierre: reconciliación 9/9, registro durable 8/8, canales
+  (adaptador Telegram) 25/25, runner 17/17, autonomía 178/178, gate T6b
+  102/102.
+- Despliegue sandbox: `pihub-standalone` en
+  `arn:aws:eks:eu-west-1:529850387144:cluster/goguest-ai-dashboard-sandbox`
+  fijado por digest de esta release.
+
+## Verificado (0.11.0, branch — viaja en 0.12.0)
+
+- Targeted suites del change de canales: 873+ tests, 0 fail (`channels-*`,
+  `api-v1-*`, storage, agenda, runner, shared; el root `npm test` sigue
+  sub-seleccionando suites).
+- Typecheck: 0 errores (7 workspaces).
+- Verificación integral del change (matriz + checklist de deploy):
+  `goguest-ai-dashboard-new/openspec/changes/archive/channels-and-mcp/verify-report.md`.
+
+## Verificado (0.10.0, publicada)
 
 | Capacidad | Estado |
-|---|---|
+| --- | --- |
 | Manager HTTP (Hono), Supervisor y panel web | Funciona |
 | Runner por Agent, memoria, Telegram, STT/TTS, paquetes y CLI | Funciona |
 | API privada `/api/v1` | Funciona |
@@ -46,7 +73,7 @@ verificación separada contra un Manager real; no forma parte de `npm test`.
 ## Modos de Runtime
 
 | Modo | Configuración | Administración | Panel |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Gobernador** | `PIHUB_PANEL_ENABLED=true` | Operador local | Montado |
 | **Gobernado** | `PIHUB_PANEL_ENABLED=false` | Dashboard/control plane externo | No montado |
 
@@ -137,7 +164,7 @@ Cada punto explica causa, impacto y desbloqueo en [`PENDIENTE.md`](PENDIENTE.md)
 ## Dónde encontrar cada cosa
 
 | Necesidad | Documento |
-|---|---|
+| --- | --- |
 | Instalar, operar y entender los modos | [`../README.md`](../README.md) |
 | Contribuir y probar | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | Métodos y contrato HTTP | [`manager-api-v1.md`](manager-api-v1.md) |

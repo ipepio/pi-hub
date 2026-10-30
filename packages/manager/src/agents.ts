@@ -22,7 +22,12 @@ export interface CreateAgentInput {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   systemPrompt?: string;
-  telegramToken?: string;
+  /**
+   * LEGADO (cutover channels-and-mcp, part 3b): NO se persiste. El bot de
+   * Telegram es ahora un `Channel` del Manager con su propia credencial; un
+   * `telegramToken` que llegue aquí se descarta y `agent.json` no lo escribe
+   * nunca (así el Runner no puede leer un secreto de canal).
+   */
   ttsVoice?: string;
   memory?: AgentMemoryConfig;
   packages?: string[];
@@ -32,7 +37,7 @@ export interface UpdateAgentInput {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   systemPrompt?: string;
-  telegramToken?: string | null;
+  /** LEGADO: ver `CreateAgentInput` — nunca se escribe; se limpia si estaba. */
   ttsVoice?: string | null;
   /** null elimina el override: el agente vuelve a PIHUB_SHARED_MEMORY_DEFAULT */
   memory?: AgentMemoryConfig | null;
@@ -54,7 +59,6 @@ export async function createAgent(env: PihubEnv, input: CreateAgentInput): Promi
     port: await allocatePort(env.dataDir, env.agentPortRange),
     model: input.model ?? env.defaultModel,
     thinkingLevel: input.thinkingLevel,
-    telegramToken: input.telegramToken,
     ttsVoice: input.ttsVoice,
     // Sin override no se materializa el default: así los cambios futuros de
     // PIHUB_SHARED_MEMORY_DEFAULT aplican a este agente.
@@ -87,9 +91,14 @@ export async function updateAgent(
   if (input.model !== undefined) config.model = input.model;
   if (input.thinkingLevel !== undefined) config.thinkingLevel = input.thinkingLevel;
   if (input.enabled !== undefined) config.enabled = input.enabled;
-  if (input.telegramToken !== undefined) config.telegramToken = input.telegramToken ?? undefined;
   if (input.ttsVoice !== undefined) config.ttsVoice = input.ttsVoice ?? undefined;
   if (input.memory !== undefined) config.memory = input.memory ?? undefined;
+  // Cutover R3: un `agent.json` anterior al corte puede traer el token legado.
+  // Cualquier escritura por el Manager lo borra: desde hoy no hay ningún camino
+  // por el que un secreto de canal acabe en el config con el que se spawna al
+  // Runner. (La lectura de ese residuo solo la hace `channels/cutover.ts` para
+  // abortar si además hay un canal proyectado.)
+  delete config.telegramToken;
   await writeAgent(env.dataDir, config);
 
   if (input.systemPrompt !== undefined) {

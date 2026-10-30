@@ -1,12 +1,15 @@
 /* pihub — panel del manager (vanilla JS, sin build) */
 import { createPanelApi, PanelApiError } from "/panel-api.js";
 import { createPanelTurns } from "/panel-turns.js";
+import { createPanelSessions } from "/panel-sessions.js";
+import { createSessionsPanel } from "/panel-sessions-ui.js";
+import { SESSIONS_PANEL_LABELS } from "/panel-labels.js";
 import { renderMarkdown } from "/markdown.js";
+import { createAutonomyPanel } from "/panel-autonomy.js";
 
 const $ = (id) => document.getElementById(id);
 let selectedAgent = null;
 let currentTurn = null;
-let sessionKey = null;
 let currentAgentResponse = null;
 let currentAgentThinking = null;
 const panelApi = createPanelApi();
@@ -61,6 +64,27 @@ const autonomyPanel = createAutonomyPanel({ api: panelApi, onError: (error) => {
   if (error instanceof PanelApiError && error.requiresLogin) showLogin();
 } });
 
+// ---------- Sesiones del Agent (catálogo durable, S2/S3) ----------
+// La identidad de la sesión la decide el catálogo del Manager: el panel adopta la
+// sesión seleccionada en web y abre el turno con SU key. Nunca inventa una.
+const panelSessions = createPanelSessions();
+const sessionsContainer = document.createElement("div");
+sessionsContainer.id = "agent-sessions";
+$("agent-panel-chat")?.prepend(sessionsContainer);
+const sessionsPanel = createSessionsPanel({
+  container: sessionsContainer,
+  panelSessions,
+  onSessionSelected: adoptPanelSession,
+});
+let activeSessionKey = null;
+
+// El catálogo llama aquí tras cada lectura/alta/selección con la sesión
+// seleccionada en WEB, o con `null` si no hay ninguna o si el catálogo falló (el
+// panel ya pintó el error). Sin key la web no puede abrir turno: fail-closed.
+function adoptPanelSession(session) {
+  activeSessionKey = session?.key || null;
+}
+
 // ---------- navigation ----------
 function navigate(screen) {
   if (screen !== "agent" && currentTurn) void abortCurrentTurn({ silent: true });
@@ -114,6 +138,7 @@ $("login-form").addEventListener("submit", async (e) => {
     const body = await res.json();
     panelApi.setCsrfToken(body.csrfToken || csrfCookieValue());
     panelTurns.setCsrfToken(body.csrfToken || csrfCookieValue());
+    panelSessions.setCsrfToken(body.csrfToken || csrfCookieValue());
     $("login-error").textContent = "";
     init();
   } else $("login-error").textContent = "Token incorrecto";
@@ -274,11 +299,15 @@ function setAgentModel(model) {
 // ---------- Agent workspace: chat + resources ----------
 function openAgent(agent) {
   selectedAgent = agent;
-  sessionKey = panelTurns.createSessionKey();
+  activeSessionKey = null;
   currentTurn = null;
   setAgentModel(agent.model || "");
   $("selected-agent-name").textContent = agent.name;
   $("agent-messages").innerHTML = "";
+  // La pantalla del Agent abre el catálogo: la sesión del turno es la que el
+  // humano tenga SELECCIONADA en web, no una key recién inventada por el panel.
+  sessionsPanel.open(agent.name);
+  void sessionsPanel.load();
   switchAgentPanel("chat");
   navigate("agent");
   setAgentConnection(true, "Listo");
@@ -410,7 +439,7 @@ function switchAgentPanel(panel) {
 $("agent-back").addEventListener("click", () => {
   if (currentTurn) void abortCurrentTurn({ silent: true });
   selectedAgent = null;
-  sessionKey = null;
+  activeSessionKey = null;
   navigate("agents");
 });
 $("agent-tab-chat").addEventListener("click", () => switchAgentPanel("chat"));
@@ -544,9 +573,13 @@ async function runChatCommand(line) {
         showPanelError(error);
       }
       break;
-    case "/new":
+    case "/new": {
       await abortCurrentTurn({ silent: true });
-      sessionKey = panelTurns.createSessionKey();
+      // Crear una sesión es del catálogo: el Manager genera la identidad, la web la
+      // selecciona y el panel adopta su key. Un fallo aquí NO rota nada en local
+      // (eso recrearía la sesión huérfana que el catálogo cierra).
+      const created = await sessionsPanel.createSession(arg);
+      if (!created) break;
       currentTurn = null;
       currentAgentResponse = null;
       currentAgentThinking = null;
@@ -555,6 +588,7 @@ async function runChatCommand(line) {
       addAgentSystem("— sesión nueva —");
       setAgentConnection(true, "Listo");
       break;
+    }
     case "/stop":
       if (currentTurn) await abortCurrentTurn();
       else addAgentSystem("No hay una respuesta en curso.");
@@ -578,9 +612,15 @@ async function runChatCommand(line) {
 }
 
 function sendToAgent(text) {
-  if (!selectedAgent || !sessionKey) return;
+  if (!selectedAgent) return;
   if (currentTurn) {
     addAgentSystem("Hay una respuesta en curso; espera a que termine o pulsa cancelar.");
+    return;
+  }
+  // Fail-closed: sin una sesión del catálogo (sin seleccionar o con el catálogo
+  // caído) el turno no se abre, porque la key la decide el Manager y no el panel.
+  if (!activeSessionKey) {
+    addAgentSystem(`⚠️ ${SESSIONS_PANEL_LABELS.sessionRequiredForTurn}`);
     return;
   }
   const input = $("agent-chat-input");
@@ -591,7 +631,7 @@ function sendToAgent(text) {
   currentAgentThinking = null;
   autoGrowTextarea(input);
 
-  const turn = panelTurns.startTurn({ agentName: selectedAgent.name, sessionKey, message: text });
+  const turn = panelTurns.startTurn({ agentName: selectedAgent.name, sessionKey: activeSessionKey, message: text });
   currentTurn = turn;
   void consumeTurn(turn);
 }
@@ -631,11 +671,6 @@ const TEXT_EXTENSIONS = /\.(txt|md|json|jsx?|tsx?|py|csv|log|ya?ml|html?|css|sh|
 let agentSttOn = false;
 let agentRecorder = null;
 let agentRecordedChunks = [];
-
-function setAgentSttUi(enabled) {
-  agentSttOn = Boolean(enabled);
-  $("agent-mic").classList.toggle("hidden", !agentSttOn);
-}
 
 function insertIntoAgentInput(text) {
   const input = $("agent-chat-input");
@@ -1106,6 +1141,7 @@ async function init() {
   const csrfToken = csrfCookieValue();
   panelApi.setCsrfToken(csrfToken);
   panelTurns.setCsrfToken(csrfToken);
+  panelSessions.setCsrfToken(csrfToken);
   try {
     const status = await panelApi.status();
     $("status-line").textContent = `pi ${status.pi} · ${status.agents} agentes`;
@@ -1127,7 +1163,6 @@ async function init() {
     // Primer badge tras cargar agentes
     setTimeout(scheduleBadgeRefresh, 500);
     // También en cada ciclo de loadAgents
-    const origLoadAgents = loadAgents;
     window.__autonomyBadgeRefresh = scheduleBadgeRefresh;
 
     // Visibility / focus para polling de autonomía
