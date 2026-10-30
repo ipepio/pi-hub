@@ -408,3 +408,130 @@ describe("outbox worker — teardown (I2)", () => {
     assert.equal(await outbox.deadForAgent("agent", "replay"), 0, "idempotente por estado");
   });
 });
+
+// T6b — el teclado en línea en la cola.
+//
+// La fila es el envelope serializado, así que el teclado viaja DENTRO del payload
+// (`{"text":…,"keyboard":…}`) y se re-lee al despertar la fila: un reinicio del
+// Manager no puede perder los botones de un mensaje ya aceptado. Dos reglas, y la
+// segunda es la que protege al transporte: un payload cuyo teclado no se puede leer
+// NUNCA se envía (un teclado mal formado no mejora reintentando).
+describe("outbox — teclado en línea (T6b)", () => {
+  const KEYBOARD = [[{ text: "trabajo (s2)", data: "s:s2" }]];
+
+  it("el teclado del payload viaja en la fila y llega al transporte", async () => {
+    const db = await migratedDb();
+    const time = clock();
+    const sent: OutboxRow[] = [];
+    const outbox = outboxWith(db, time, async (row) => {
+      sent.push(row);
+      return "msg-1";
+    });
+
+    const row = await outbox.enqueue({
+      ...BASE,
+      payload: JSON.stringify({ text: "elige una sesión", keyboard: KEYBOARD }),
+    });
+
+    assert.equal(row.text, "elige una sesión");
+    assert.deepEqual(row.keyboard, KEYBOARD, "el teclado se lee del payload al reservar");
+    const pending = await outbox.pendingOf("agent", "telegram");
+    assert.deepEqual(pending[0]?.keyboard, KEYBOARD);
+
+    await outbox.drain();
+    assert.deepEqual(sent[0]?.keyboard, KEYBOARD, "el worker se lo pasa tal cual al transporte");
+    assert.equal(sent[0]?.text, "elige una sesión");
+  });
+
+  it("un payload sin teclado no inventa uno: la fila es de solo texto", async () => {
+    const db = await migratedDb();
+    const outbox = outboxWith(db, clock(), async () => "msg-1");
+
+    const row = await outbox.enqueue(BASE);
+    assert.equal(row.keyboard, undefined);
+    assert.equal(row.text, "hola");
+  });
+
+  it("un teclado mal formado en un payload almacenado se descarta: la fila nunca se envía", async () => {
+    const db = await migratedDb();
+    const time = clock();
+    let sends = 0;
+    const logs: string[] = [];
+    const outbox = new ChannelOutbox(db, {
+      now: time.now,
+      send: async () => {
+        sends += 1;
+        return "msg-1";
+      },
+      log: (line) => logs.push(line),
+    });
+    // Fila escrita sin pasar por `enqueue` (una version anterior, o un tercero):
+    // nadie validó el payload al insertarlo, así que la defensa vive al leerlo.
+    db.prepare(
+      `INSERT INTO channel_outbox (id, agent_name, kind, target, payload, state, attempts, created_at, updated_at)
+       VALUES (?, 'agent', 'telegram', '555', ?, 'pending', 0, 1, 1)`,
+    ).run("pending:broken-keyboard", JSON.stringify({ text: "hola", keyboard: "no-es-un-teclado" }));
+
+    const drained = await outbox.drain();
+
+    assert.equal(sends, 0, "fail-closed: no llega al transporte");
+    assert.equal(drained.attempted, 0, "ni siquiera se intenta");
+    const stored = db
+      .prepare("SELECT state, last_error FROM channel_outbox WHERE id = ?")
+      .get("pending:broken-keyboard") as { state: string; last_error: string | null };
+    assert.equal(stored.state, "dead", "terminal: un teclado inválido no puede mejorar");
+    assert.match(String(stored.last_error), /unreadable_payload/);
+    assert.equal(
+      await outbox.byId("pending:broken-keyboard"),
+      undefined,
+      "no se expone una fila ilegible",
+    );
+    assert.equal((await outbox.counts()).dead, 1);
+    assert.ok(
+      logs.some(
+        (line) =>
+          line.includes("CHANNEL_OUTBOX_DIED") && line.includes("unreadable_payload"),
+      ),
+      `el descarte se registra: ${logs.join(" | ")}`,
+    );
+  });
+
+  it("enqueue rechaza un payload con teclado mal formado antes de escribir la fila", async () => {
+    const db = await migratedDb();
+    const outbox = outboxWith(db, clock(), async () => "msg-1");
+
+    await assert.rejects(
+      () =>
+        outbox.enqueue({
+          ...BASE,
+          payload: JSON.stringify({ text: "hola", keyboard: [[{ text: "sin datos", data: "" }]] }),
+        }),
+      RangeError,
+    );
+    assert.deepEqual(await outbox.counts(), {
+      pending: 0,
+      in_flight: 0,
+      delivered: 0,
+      dead: 0,
+    });
+  });
+
+  it("invalid_keyboard es terminal en el primer intento: reintentar no arregla el payload", async () => {
+    const db = await migratedDb();
+    const time = clock();
+    const { ChannelAdapterError } = await import("@pihub/channels");
+    const outbox = outboxWith(db, time, async () => {
+      throw new ChannelAdapterError({
+        code: "invalid_keyboard",
+        message: "invalid inline keyboard: row 0 button 0 carries 65 bytes",
+      });
+    });
+    const row = await outbox.enqueue({
+      ...BASE,
+      payload: JSON.stringify({ text: "elige", keyboard: KEYBOARD }),
+    });
+
+    await outbox.drain();
+    assert.equal((await outbox.byId(row.id))?.state, "dead");
+  });
+});

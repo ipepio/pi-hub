@@ -8,7 +8,7 @@ import {
   scaffoldGlobalDirs,
   writeAgent,
 } from "@pihub/shared";
-import type { ChannelAdapter, InboundMessage } from "@pihub/channels";
+import type { ChannelAdapter, InboundMessage, InlineKeyboardButton } from "@pihub/channels";
 import { openManagerStore, type ManagerStore } from "../src/storage/sqlite.ts";
 import { ChannelRuntimeRegistry } from "../src/channels/registry.ts";
 import { PairingMachine } from "../src/channels/pairing.ts";
@@ -67,19 +67,32 @@ afterEach(async () => {
 /** Fake transport: records sends and hands back the `onInbound` the registry gave it. */
 function fakeTransport() {
   const pollers: Array<(message: InboundMessage) => void> = [];
-  const sends: Array<{ chatId: string; text: string }> = [];
+  const sends: Array<{
+    chatId: string;
+    text: string;
+    keyboard?: InlineKeyboardButton[][];
+  }> = [];
+  /** ACKs de botón que llegaron al TRANSPORTE (T6b). */
+  const answerCallbacks: Array<{ queryId: string; text: string | null }> = [];
   const adapterFactory = (): ChannelAdapter => ({
     kind: "telegram",
     async start({ onInbound }): Promise<void> {
       pollers.push(onInbound);
     },
-    async send({ chatId, text }) {
-      sends.push({ chatId, text });
+    async send({ chatId, text, keyboard }) {
+      sends.push({
+        chatId,
+        text,
+        ...(keyboard === undefined ? {} : { keyboard }),
+      });
       return { messageId: `msg-${sends.length}` };
+    },
+    async answerCallback(callbackQueryId, text) {
+      answerCallbacks.push({ queryId: callbackQueryId, text: text ?? null });
     },
     async stop(): Promise<void> {},
   });
-  return { pollers, sends, adapterFactory };
+  return { pollers, sends, answerCallbacks, adapterFactory };
 }
 
 function record(pairingWindowEndsAt: string | null): ChannelRecord {
@@ -131,7 +144,7 @@ function channelTurn(turnId = "turn-1"): CompletedTurn {
 
 describe("composeChannels — el cableado de slice (c) part 3a", () => {
   /** Store + registry + pairing + turns, all real, one temp dataDir. */
-  async function harness(options: { window?: string | null } = {}) {
+  async function harness(options: { window?: string | null; withSessions?: boolean } = {}) {
     const dataDir = await setup();
     const store = await openManagerStore(dataDir);
     stores.push(store);
@@ -150,6 +163,9 @@ describe("composeChannels — el cableado de slice (c) part 3a", () => {
       registry,
       pairing,
       turns: bridge.turns,
+      // T6b: los comandos de sesión (y el teclado de `/sessions`) solo existen
+      // cuando el catálogo durable está inyectado, como en producción.
+      ...(options.withSessions ? { sessions: store.sessions } : {}),
       resolveRunner: async () => ({ port: 4100 }),
       now: () => 1_761_100_800_000,
       drainIntervalMs: 5,
@@ -309,5 +325,120 @@ describe("composeChannels — el cableado de slice (c) part 3a", () => {
       text: "nada que entregar",
     });
     assert.equal(without, false);
+  });
+
+  // T6b — el teclado en línea de punta a punta.
+  //
+  // Lo que se prueba aquí es SOLO el cableado que nadie más puede probar: que el ACK
+  // de una pulsación salga por el registry hasta el adaptador (no lo inventa el
+  // inbound) y que el teclado de `/sessions` sobreviva al viaje payload → fila →
+  // `adapter.send`. Las reglas (qué se selecciona, qué se contesta) viven en
+  // `channels-inbound.test.ts`; aquí solo se comprueba que están conectadas.
+  describe("teclado en línea y callback queries (T6b)", () => {
+    const NOW = 1_761_100_800_000;
+
+    async function live(withSessions: boolean) {
+      const h = await harness({ withSessions });
+      await h.pairing.requestPairing("agent", "telegram", "12345");
+      await h.registry.replaceAll("agent", [
+        {
+          kind: "telegram",
+          token: "771234:AA-token",
+          pairingWindowEndsAt: "2099-01-01T00:00:00.000Z",
+        },
+      ]);
+      assert.equal(h.transport.pollers.length, 1, "fixture: el adapter está vivo");
+      return h;
+    }
+
+    it("una pulsación de botón llega al adaptador como ACK y cambia la sesión del chat", async () => {
+      const h = await live(true);
+      const session = h.store.sessions.create({
+        agentName: "agent",
+        channel: "telegram",
+        name: "chat",
+        now: NOW,
+      });
+
+      h.transport.pollers[0]!({
+        externalChatId: "12345",
+        text: "",
+        messageId: "m-1",
+        callback: { id: "cbq-1", data: `s:${session.id}` },
+      });
+      await until(
+        async () => (await h.composition.outbox.pendingOf("agent", "telegram")).length === 1,
+      );
+      await h.composition.inbound.idle();
+
+      assert.deepEqual(h.transport.answerCallbacks, [{ queryId: "cbq-1", text: null }]);
+      const row = (await h.composition.outbox.pendingOf("agent", "telegram"))[0]!;
+      assert.match(row.text, /seguirá la sesión/, "la respuesta es la de `sessionSwitched`");
+      assert.equal(
+        row.keyboard,
+        undefined,
+        "la respuesta de un botón no vuelve a ofrecer botones",
+      );
+      assert.equal(
+        h.store.sessions.list("agent", NOW).selection.telegram,
+        session.id,
+        "el chat quedó en la sesión pulsada",
+      );
+      assert.equal(h.bridge.commands.length, 0, "una pulsación no gasta turno");
+    });
+
+    it("el teclado de /sessions viaja por el outbox y llega al adaptador", async () => {
+      const h = await live(true);
+
+      h.transport.pollers[0]!({
+        externalChatId: "12345",
+        text: "/sessions",
+        messageId: "m-1",
+      });
+      await until(
+        async () => (await h.composition.outbox.pendingOf("agent", "telegram")).length === 1,
+      );
+
+      const row = (await h.composition.outbox.pendingOf("agent", "telegram"))[0]!;
+      const payload = JSON.parse(row.payload) as {
+        text: string;
+        keyboard?: Array<Array<{ text: string; data: string }>>;
+      };
+      assert.equal(payload.text, row.text, "el texto del payload y el de la fila coinciden");
+      assert.equal(payload.keyboard?.length, 1, "una fila de botones por sesión");
+      assert.match(
+        payload.keyboard![0]![0]!.data,
+        /^s:/,
+        "los datos que vuelven son `s:<id>`",
+      );
+      assert.deepEqual(row.keyboard, payload.keyboard, "la fila lleva el teclado ya parseado");
+
+      h.composition.worker.start();
+      await until(
+        async () => (await h.composition.outbox.pendingOf("agent", "telegram")).length === 0,
+      );
+
+      assert.equal(h.transport.sends.length, 1);
+      assert.deepEqual(
+        h.transport.sends[0]!.keyboard,
+        payload.keyboard,
+        "el teclado llega al adapter.send sin tocar",
+      );
+    });
+
+    it("PRESERVE: sin catálogo inyectado un /sessions no es comando y sigue siendo texto", async () => {
+      const h = await live(false);
+
+      h.transport.pollers[0]!({
+        externalChatId: "12345",
+        text: "/sessions",
+        messageId: "m-1",
+      });
+      await until(() => h.bridge.commands.length === 1);
+      await h.composition.inbound.idle();
+
+      assert.equal(h.bridge.commands[0]!.message, "/sessions");
+      assert.deepEqual(h.transport.answerCallbacks, []);
+    });
   });
 });

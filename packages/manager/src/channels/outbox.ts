@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isChannelKind, type ChannelKind } from "@pihub/channels";
+import {
+  isChannelKind,
+  type ChannelKind,
+  type InlineKeyboardButton,
+} from "@pihub/channels";
 import type { SqliteDb } from "../storage/sqlite.ts";
 
 /**
@@ -73,7 +77,17 @@ const LAST_ERROR_LIMIT = 500;
 const TERMINAL_ERROR_CODES: ReadonlySet<string> = new Set([
   "invalid_chat",
   "invalid_token",
+  // T6b: the transport rejected the inline keyboard BEFORE any network call. The
+  // envelope is what is wrong, so every retry would carry the same rejected buttons.
+  "invalid_keyboard",
 ]);
+
+/**
+ * `last_error` of a row whose stored envelope cannot be read. Terminal by
+ * construction: a malformed keyboard in the payload is a caller bug already written,
+ * so the row is discarded instead of hammering the transport forever.
+ */
+export const OUTBOX_UNREADABLE_PAYLOAD = "unreadable_payload";
 
 export type OutboxState = "pending" | "in_flight" | "delivered" | "dead";
 
@@ -88,6 +102,12 @@ export interface OutboxRow {
   payload: string;
   /** Convenience view of `payload.text`, so a `send` closure has the body at hand. */
   text: string;
+  /**
+   * Buttons of the message (T6b), read out of `payload.keyboard`; absent when the
+   * envelope carries none. They ride on the first chunk only, so the transport is
+   * what decides how to render them.
+   */
+  keyboard?: InlineKeyboardButton[][];
   state: OutboxState;
   attempts: number;
   /** When a retryable row becomes claimable again; `null` = due now. */
@@ -228,6 +248,17 @@ const SQL_KILL = `
       in_flight_at = NULL, updated_at = ?
   WHERE id = ? AND state = 'in_flight'`;
 
+/**
+ * The discard of an unreadable envelope (T6b). Deliberately different from
+ * `SQL_KILL`: this one runs on a row that was never reserved, so it also has to
+ * accept `pending`, and it does not touch `attempts` — no delivery was attempted.
+ */
+const SQL_KILL_UNREADABLE = `
+  UPDATE channel_outbox
+  SET state = 'dead', last_error = ?, next_attempt_at = NULL, in_flight_at = NULL,
+      updated_at = ?
+  WHERE id = ? AND state IN ('pending', 'in_flight')`;
+
 const SQL_DEAD_FOR = `
   UPDATE channel_outbox
   SET state = 'dead', last_error = ?, next_attempt_at = NULL, in_flight_at = NULL,
@@ -262,6 +293,53 @@ interface RawRow {
 
 /** The text a transport sends: `payload.text` when the envelope is JSON, else the payload. */
 export function outboxTextOf(payload: string): string {
+  return outboxPayloadOf(payload)?.text ?? rawTextOf(payload);
+}
+
+/** The envelope as the transport needs it: a body, and the buttons that ride on it. */
+export interface OutboxPayload {
+  readonly text: string;
+  readonly keyboard?: InlineKeyboardButton[][];
+}
+
+/**
+ * Reads one stored envelope.
+ *
+ * Three outcomes, and the third one is the reason this is not just `JSON.parse`:
+ * - a payload that is not JSON (or not an object with a string `text`) IS the text —
+ *   the historical reading, kept byte for byte;
+ * - `{"text": …, "keyboard": …}` when the keyboard is well formed;
+ * - `undefined` when a keyboard is present but malformed. That row is DISCARDED: an
+ *   unreadable keyboard can never become valid, and handing it to the transport would
+ *   either send the wrong buttons or fail on every retry. Fail closed, loudly (the
+ *   caller logs and kills the row), instead of silently degrading it to text-only.
+ */
+export function outboxPayloadOf(payload: string): OutboxPayload | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    // Not JSON: the payload IS the text.
+    return { text: payload };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { text: rawTextOf(payload) };
+  }
+  const envelope = parsed as { text?: unknown; keyboard?: unknown };
+  if (typeof envelope.text !== "string") return { text: rawTextOf(payload) };
+  if (envelope.keyboard === undefined || envelope.keyboard === null) {
+    return { text: envelope.text };
+  }
+  const keyboard = keyboardOf(envelope.keyboard);
+  return keyboard === undefined ? undefined : { text: envelope.text, keyboard };
+}
+
+/**
+ * The historical text reader, kept verbatim: a fallback, not a second path. It is what
+ * `outboxTextOf` still answers for an envelope whose keyboard is unreadable, so a
+ * diagnostic view of a discarded row is never blank.
+ */
+function rawTextOf(payload: string): string {
   try {
     const parsed: unknown = JSON.parse(payload);
     if (parsed && typeof parsed === "object") {
@@ -274,14 +352,50 @@ export function outboxTextOf(payload: string): string {
   return payload;
 }
 
-function toRow(raw: RawRow): OutboxRow {
+/**
+ * Shape validation of a stored keyboard, or `undefined` when it cannot be one.
+ *
+ * Transport-NEUTRAL on purpose: what is checked here is that the value is rows of
+ * `{text, data}` with both strings non-empty — i.e. that no reader can choke on it and
+ * no adapter is handed a button it cannot render. Transport limits (Telegram's 64-byte
+ * `callback_data`) are NOT re-implemented here: the adapter owns them, validates them
+ * before any network call and answers `invalid_keyboard`, which is terminal.
+ */
+function keyboardOf(value: unknown): InlineKeyboardButton[][] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const rows: InlineKeyboardButton[][] = [];
+  for (const row of value) {
+    if (!Array.isArray(row) || row.length === 0) return undefined;
+    const buttons: InlineKeyboardButton[] = [];
+    for (const button of row) {
+      const candidate = button as { text?: unknown; data?: unknown } | null;
+      if (typeof candidate?.text !== "string" || candidate.text === "") return undefined;
+      if (typeof candidate.data !== "string" || candidate.data === "") return undefined;
+      buttons.push({ text: candidate.text, data: candidate.data });
+    }
+    rows.push(buttons);
+  }
+  return rows;
+}
+
+/**
+ * One row, or `undefined` when its stored envelope is unreadable.
+ *
+ * An unreadable row never reaches a caller: `claim()` kills it before reserving and
+ * `pendingOf`/`byId` hide it, so nothing can accidentally send a payload the queue
+ * itself cannot read.
+ */
+function toRow(raw: RawRow): OutboxRow | undefined {
+  const payload = outboxPayloadOf(raw.payload);
+  if (payload === undefined) return undefined;
   return {
     id: raw.id,
     agentName: raw.agent_name,
     kind: isChannelKind(raw.kind) ? raw.kind : (raw.kind as ChannelKind),
     target: raw.target,
     payload: raw.payload,
-    text: outboxTextOf(raw.payload),
+    text: payload.text,
+    ...(payload.keyboard === undefined ? {} : { keyboard: payload.keyboard }),
     state: raw.state as OutboxState,
     attempts: Number(raw.attempts),
     nextAttemptAt: raw.next_attempt_at === null ? null : Number(raw.next_attempt_at),
@@ -381,6 +495,11 @@ export class ChannelOutbox {
       throw new RangeError("outbox payload must be serialized before enqueue");
     }
 
+    // Nothing unreadable is ever persisted through this door: a keyboard the queue
+    // cannot parse would only become a row nobody can deliver (T6b).
+    if (outboxPayloadOf(input.payload) === undefined) {
+      throw new RangeError("outbox payload carries a malformed inline keyboard");
+    }
     const id = `pending:${randomUUID()}`;
     const now = this.now();
     this.db
@@ -411,7 +530,11 @@ export class ChannelOutbox {
     const raws = this.db
       .prepare(SQL_PENDING_OF)
       .all(agentName, kind) as RawRow[];
-    return raws.map(toRow);
+    // An unreadable row is already terminal: `claim()` kills it on the next tick.
+    // Showing it here would hand a caller a body nobody can deliver.
+    return raws
+      .map(toRow)
+      .filter((row): row is OutboxRow => row !== undefined);
   }
 
   /**
@@ -438,6 +561,13 @@ export class ChannelOutbox {
 
     const claimed: OutboxRow[] = [];
     for (const candidate of candidates) {
+      // Fail closed BEFORE reserving: an envelope nobody can read is discarded with
+      // a log line instead of being handed to a transport that would either send
+      // the wrong buttons or fail on every retry.
+      if (outboxPayloadOf(candidate.payload) === undefined) {
+        this.killUnreadable(candidate);
+        continue;
+      }
       const reserved = this.db
         .prepare(SQL_RESERVE)
         .run(now, now, candidate.id, leaseCutoff);
@@ -608,6 +738,25 @@ export class ChannelOutbox {
     this.db
       .prepare(SQL_RECORD_EXTERNAL)
       .run(externalMessageId, this.now(), id);
+  }
+
+  /**
+   * Terminal discard of a row whose stored envelope cannot be read (`claim()` calls
+   * it before reserving). It counts as `dead` in the TABLE, not in `DrainResult.dead`:
+   * that counter reports the rows this tick settled, and this one never became an
+   * attempt. The log line is what an operator has.
+   */
+  private killUnreadable(raw: RawRow): void {
+    this.db
+      .prepare(SQL_KILL_UNREADABLE)
+      .run(
+        `${OUTBOX_UNREADABLE_PAYLOAD}: the stored envelope has a malformed inline keyboard`,
+        this.now(),
+        raw.id,
+      );
+    this.log(
+      `CHANNEL_OUTBOX_DIED id=${raw.id} agent=${raw.agent_name} kind=${raw.kind} reason=${OUTBOX_UNREADABLE_PAYLOAD}`,
+    );
   }
 
   /** Second write of the confirmation pair: the row is terminally delivered. */

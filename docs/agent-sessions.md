@@ -271,9 +271,10 @@ puerto ocupado (ver la sección siguiente).
     | Comando | Qué hace |
     | --- | --- |
     | `/new [nombre]` | Crea una sesión del Agent y la **selecciona** en la superficie del canal. |
-    | `/sessions` | Lista las sesiones (máximo **10**, con `id` y marca de la seleccionada). |
+    | `/sessions` | Lista las sesiones (máximo **10**, con `id` y marca de la seleccionada) y añade un **teclado en línea**: un botón por sesión que la selecciona al pulsarlo (T6b). |
     | `/session` | Dice la sesión que este chat está usando y si el Agent está ocupado. |
     | `/session <nombre o id>` | Selecciona esa sesión **para este chat**. |
+    | botón de sesión (pulsación) | Selecciona esa sesión **para este chat**: el `callback_query` se valida contra el chat enlazado, se acusa recibo y el resultado viaja como mensaje de sistema (mismo reintento que el resto). Un `data` que no sea `s:<id>` no selecciona nada. |
     | `/stop` | Pide abortar el turno vivo del Agent; sin turno vivo contesta que no hay nada en marcha. |
     | cualquier otra cosa | «No conozco el comando» con la lista de comandos disponibles. |
 
@@ -538,8 +539,13 @@ Lo entregado en esta rama (`feat/agent-session-workspace`, commits locales):
 - T5a `34cdc87` / T5b/2 `232dcfd` — transcript completo en filas nuevas (v6) e
   identidad de sesión del turno al espejo (v7). Legacy: READ-ONLY para siempre.
 - T6a `f66426f` — comandos Telegram `/new` `/sessions` `/session` `/stop`, copy vía
-  `channels/labels.ts`, nunca gastan el slot de admisión. T6b (botones inline
-  `callback_query`) sigue pendiente.
+  `channels/labels.ts`, nunca gastan el slot de admisión.
+- T6b `2494e8a` + `e2bb…` — botones en línea: `/sessions` añade un teclado con un botón
+  por sesión (`data` opaco `s:<id>` transportado por el adaptador, parseado SOLO por el
+  Manager); la pulsación exige chat enlazado, se acusa recibo (`answerCallbackQuery`)
+  y el resultado viaja como mensaje de sistema por el outbox; un `data` que no es
+  `s:<id>` no selecciona nada; un teclado ilegible guardado en el outbox es terminal
+  (`invalid_keyboard`), nunca se reintenta.
 - T7/3 `abc7af3` — el panel del Manager adopta el catálogo como única fuente de la
   identidad de sesión del turno: crea, lista y selecciona sesiones; adopta la key de
   la sesión seleccionada en web; sin catálogo o sin selección el turno se bloquea

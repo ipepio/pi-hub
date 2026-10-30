@@ -6,6 +6,7 @@ import {
   type ChannelAdapterFactory,
   type ChannelKind,
   type InboundMessage,
+  type InlineKeyboardButton,
 } from "@pihub/channels";
 import type { ChannelObservedStatus, ChannelRecord } from "./store.js";
 
@@ -36,6 +37,12 @@ export interface ChannelRuntimeRegistryDeps {
     message: InboundMessage,
   ) => void;
   now?: () => number;
+  /**
+   * Sink for the failures that are reported and swallowed (a callback ACK). Default:
+   * one `console.error` line with the same `[channels]` prefix the rest of the runtime
+   * uses.
+   */
+  log?: (line: string) => void;
 }
 
 interface LiveAdapter {
@@ -69,6 +76,7 @@ export class ChannelRuntimeRegistry {
     | ((agentName: string, kind: ChannelKind, message: InboundMessage) => void)
     | undefined;
   private readonly now: () => number;
+  private readonly log: (line: string) => void;
   private readonly live = new Map<string, Map<ChannelKind, LiveAdapter>>();
   private readonly observed = new Map<string, Map<ChannelKind, ChannelRecord>>();
 
@@ -77,6 +85,7 @@ export class ChannelRuntimeRegistry {
           deps.adapterFactory ?? createDefaultChannelAdapterFactory();
         this.onInbound = deps.onInbound;
         this.now = deps.now ?? (() => Date.now());
+        this.log = deps.log ?? ((line) => console.error(`[channels] ${line}`));
       }
     
       /**
@@ -101,11 +110,16 @@ export class ChannelRuntimeRegistry {
        * credential) is a `unavailable` failure — i.e. a retryable one, because the
        * row that asked for it is still valid and the channel may come back. The
        * decision of *whether to retry* stays in the outbox; this only reports.
+       *
+       * `keyboard` (T6b) is passed through untouched: rows of buttons are part of
+       * the message the outbox already accepted, and validating them is the
+       * adapter's job (it answers `invalid_keyboard`, which the outbox treats as
+       * terminal). This layer transports, it does not interpret.
        */
       async send(
         agentName: string,
         kind: ChannelKind,
-        input: { chatId: string; text: string },
+        input: { chatId: string; text: string; keyboard?: InlineKeyboardButton[][] },
       ): Promise<{ messageId: string }> {
         const entry = this.live.get(agentName)?.get(kind);
         if (!entry) {
@@ -115,6 +129,36 @@ export class ChannelRuntimeRegistry {
           });
         }
         return entry.adapter.send(input);
+      }
+
+      /**
+       * Acknowledge a button press (T6b) so the sender's client stops its spinner.
+       *
+       * This is deliberately NOT a delivery: there is no queue, no retry and no
+       * `OutboxRow`, because an ACK is worthless once the press is old — the answer
+       * the human keeps is the message the outbox sends. So:
+       * - no live adapter, or an adapter written before keyboards existed → resolve
+       *   silently (nothing to answer through, nothing to report);
+       * - the transport rejecting the ACK → one log line, never a throw: the press
+       *   already happened and the inbound path that called this still owes the
+       *   human its real answer.
+       */
+      async answerCallback(
+        agentName: string,
+        kind: ChannelKind,
+        callbackQueryId: string,
+        text?: string,
+      ): Promise<void> {
+        const entry = this.live.get(agentName)?.get(kind);
+        const answer = entry?.adapter.answerCallback;
+        if (!entry || !answer) return;
+        try {
+          await answer.call(entry.adapter, callbackQueryId, text);
+      } catch (error) {
+          this.log(
+            `callback ACK failed agent=${agentName} kind=${kind}: ${String(error)}`,
+          );
+        }
       }
     
       /** Every Agent the registry is currently polling for (shutdown, drain-all). */

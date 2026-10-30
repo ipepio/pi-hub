@@ -8,7 +8,7 @@ import {
   scaffoldGlobalDirs,
   writeAgent,
 } from "@pihub/shared";
-import type { InboundMessage } from "@pihub/channels";
+import type { InboundMessage, InlineKeyboardButton } from "@pihub/channels";
 import { PairingMachine } from "../src/channels/pairing.ts";
 import { writeChannelRecords, type ChannelRecord } from "../src/channels/store.ts";
 import { openManagerStore } from "../src/storage/sqlite.ts";
@@ -105,7 +105,20 @@ function fakeTurns() {
 
 function inbound(text = "hola", messageId = "1", externalChatId = "12345"): InboundMessage {
   return { externalChatId, text, messageId, senderName: "pepio" };
-}
+    }
+
+    /**
+     * Una pulsación de botón tal y como la entrega el adaptador (T6b): MISMA forma que
+     * un mensaje más `callback`, con `text` vacío — es lo que obliga al handler a
+     * reconocer la pulsación antes del camino de turnos.
+     */
+    function callbackInbound(
+      data: string,
+      callbackId = "cbq-1",
+      externalChatId = "12345",
+    ): InboundMessage {
+      return { externalChatId, text: "", messageId: "m-callback", callback: { id: callbackId, data } };
+    }
 
 describe("ChannelInboundHandler — paired channel → turn", () => {
   it("un canal emparejado despacha un turno con origen canal y sesión unificada", async () => {
@@ -615,6 +628,8 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
         busy: boolean;
         abort: boolean;
         selected: string;
+        /** Lo que `selectSession` lanza (T6b): un id inexistente o un catálogo caído. */
+        selectError?: unknown;
       }
 
       /** Adaptador de comandos de mentira: registra las llamadas y muta su estado. */
@@ -641,6 +656,7 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
           },
           selectSession: (input: { sessionId: string }) => {
             calls.push(`select:${input.sessionId}`);
+            if (state.selectError !== undefined) throw state.selectError;
             state.selected = input.sessionId;
             return sessions.find((session) => session.id === input.sessionId) ??
               { id: input.sessionId, name: null };
@@ -662,6 +678,10 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
           pair?: boolean;
           selected?: string;
           initial?: Array<{ id: string; name: string | null }>;
+          /** Lo que `selectSession` lanza: id inexistente o catálogo caído (T6b). */
+          selectError?: unknown;
+          /** El ACK del transporte falla: el inbound no puede perder la respuesta. */
+          ackThrows?: boolean;
         } = {},
       ) {
         const dataDir = await setup();
@@ -674,21 +694,40 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
           busy: options.busy ?? false,
           abort: options.abort ?? false,
           selected: options.selected ?? "main",
-        };
+              ...(options.selectError === undefined ? {} : { selectError: options.selectError }),
+            };
         const fake = fakeCommands(state, options.initial);
-        const sink = fakeTurns();
-        const enqueued: Array<{ chatId: string; text: string }> = [];
-        const handler = new ChannelInboundHandler({
-          dataDir,
-          pairing,
-          turns: sink.turns,
-          resolveRunner: async () => ({ port: 4100 }),
-          enqueue: ((input) => {
-            enqueued.push({ chatId: input.chatId, text: input.text });
-          }) satisfies EnqueueFn,
+            const sink = fakeTurns();
+            const enqueued: Array<{
+              chatId: string;
+              text: string;
+              keyboard?: InlineKeyboardButton[][];
+            }> = [];
+            /** ACKs que el handler pidió al transporte (T6b). */
+            const acks: Array<{ id: string; text: string | null }> = [];
+            const logs: string[] = [];
+            const handler = new ChannelInboundHandler({
+              dataDir,
+              pairing,
+              turns: sink.turns,
+              resolveRunner: async () => ({ port: 4100 }),
+              enqueue: ((input) => {
+                enqueued.push({
+                  chatId: input.chatId,
+                  text: input.text,
+                  ...(input.keyboard === undefined ? {} : { keyboard: input.keyboard }),
+                });
+              }) satisfies EnqueueFn,
+              // T6b: en producción la composición cablea aquí `registry.answerCallback`.
+              // Aquí es un registro de llamadas: QUÉ se acusa y CON QUÉ texto.
+              answerCallback: async (_agentName, _kind, id, text) => {
+                if (options.ackThrows) throw new Error("ack failed");
+                acks.push({ id, text: text ?? null });
+              },
           sessionCommands: fake.commands,
-        });
-        return { handler, sink, enqueued, state, fake, pairing };
+              log: (line) => logs.push(line),
+            });
+            return { handler, sink, enqueued, state, fake, pairing, acks, logs };
       }
 
       it("/new crea y selecciona una sesión y contesta con su nombre, sin turno del Agent", async () => {
@@ -866,6 +905,253 @@ describe("ChannelInboundHandler — paired channel → turn", () => {
         assert.equal(sink.commands.length, 1);
         assert.equal(sink.commands[0]!.message, "mira /new x y /stop");
         assert.deepEqual(enqueued, []);
+      });
+
+      // T6b — el teclado en línea y la pulsación de un botón.
+      //
+      // Una pulsación NO es un mensaje de texto: llega con `text` vacío y un
+      // `callback` que el adaptador transporta opaco. El contrato que se fija aquí
+      // tiene tres partes y ninguna sobra: qué se SELECCIONA (`selectSession`), qué
+      // se ACUSA (el ACK del transporte, que apaga el spinner del cliente) y qué se
+      // CONTESTA (una fila del outbox, o ninguna cuando el propio ACK ya es la
+      // respuesta). Un `data` que no sea `s:<id>` no selecciona NADA: la pulsación de
+      // un botón ajeno no puede mover la sesión de un chat.
+      describe("callback queries y teclado en línea (T6b)", () => {
+        it("pulsar un botón selecciona la sesión, acusa el callback y contesta por el outbox", async () => {
+          const { handler, sink, enqueued, state, fake, acks } = await bound();
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", "cbq-1"));
+          await tick();
+
+          assert.deepEqual(fake.calls, ["select:s2"], "la pulsación selecciona el id del botón");
+          assert.equal(state.selected, "s2", "el chat pasa a esa sesión");
+          assert.deepEqual(
+            acks,
+            [{ id: "cbq-1", text: null }],
+            "el ACK viaja sin texto: la respuesta va por el outbox",
+          );
+          assert.deepEqual(enqueued, [
+            {
+              chatId: "12345",
+              text: systemLabel("sessionSwitched", {
+                session: systemLabel("sessionRef", { name: "trabajo", id: "s2" }),
+              }),
+            },
+          ]);
+          assert.equal(sink.commands.length, 0, "una pulsación no gasta turno del Agent");
+        });
+
+        it("un botón de una sesión inexistente acusa con el aviso y NO encola respuesta", async () => {
+          const { handler, enqueued, state, acks, sink } = await bound({
+            selectError: Object.assign(new Error("Session not found"), {
+              code: "SESSION_NOT_FOUND",
+            }),
+          });
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:fantasma", "cbq-1"));
+          await tick();
+
+          assert.deepEqual(
+            acks,
+            [
+              {
+                id: "cbq-1",
+                text: systemLabel("sessionUnknownTarget", { target: "fantasma" }),
+              },
+            ],
+            "el ACK es la respuesta: se ve en el cliente al instante",
+          );
+          assert.deepEqual(enqueued, [], "y no hay segunda respuesta por el outbox");
+          assert.equal(state.selected, "main", "la selección no se mueve");
+          assert.equal(sink.commands.length, 0);
+        });
+
+        it("un catálogo caído acusa de forma genérica y contesta commandFailed por el outbox", async () => {
+          const { handler, enqueued, acks } = await bound({
+            selectError: new Error("catalogue 503"),
+          });
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", "cbq-1"));
+          await tick();
+
+          const fallo = systemLabel("commandFailed", { command: "session" });
+          assert.deepEqual(acks, [{ id: "cbq-1", text: fallo }]);
+          assert.deepEqual(
+            enqueued,
+            [{ chatId: "12345", text: fallo }],
+            "el reintento sigue siendo del outbox",
+          );
+        });
+
+        it("un data que no es 's:<id>' se descarta: ni selección, ni ACK, ni respuesta", async () => {
+          const { handler, enqueued, fake, acks, sink, logs } = await bound();
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("otra-cosa", "cbq-1"));
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:", "cbq-2"));
+          await handler.handleAsync("agent", "telegram", callbackInbound("", "cbq-3"));
+          await tick();
+
+          assert.deepEqual(fake.calls, [], "basura no selecciona nada");
+          assert.deepEqual(acks, []);
+          assert.deepEqual(enqueued, []);
+          assert.equal(sink.commands.length, 0, "y no se convierte en un turno con texto vacío");
+          assert.equal(
+            logs.filter((line) => line.includes("callback ignored")).length,
+            3,
+            "cada pulsación descartada deja su línea de log",
+          );
+        });
+
+        it("un callback sin id de query se ignora: no hay nada que acusar", async () => {
+          const { handler, enqueued, fake, acks, sink } = await bound();
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", ""));
+          await tick();
+
+          assert.deepEqual(fake.calls, [], "sin query no se toca el catálogo");
+          assert.deepEqual(acks, []);
+          assert.deepEqual(enqueued, []);
+          assert.equal(sink.commands.length, 0, "y no se convierte en un turno con texto vacío");
+        });
+
+        it("un callback de un chat NO enlazado se descarta: ni emparejamiento ni respuesta", async () => {
+          const { handler, enqueued, fake, acks, pairing, sink } = await bound({ pair: false });
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", "cbq-1"));
+          await tick();
+
+          assert.deepEqual(enqueued, [], "ni código de emparejamiento ni respuesta");
+          assert.deepEqual(fake.calls, []);
+          assert.deepEqual(acks, []);
+          assert.equal(sink.commands.length, 0);
+          assert.equal(
+            await pairing.stateOf("agent", "telegram"),
+            undefined,
+            "un botón no abre ventana de emparejamiento",
+          );
+        });
+
+        it("un callback dirigido a otro chat no selecciona nada (no se roba el vínculo)", async () => {
+          const { handler, enqueued, fake, acks } = await bound();
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", "cbq-1", "99999"));
+          await tick();
+
+          assert.deepEqual(fake.calls, []);
+          assert.deepEqual(acks, []);
+          assert.deepEqual(enqueued, []);
+        });
+
+        it("un ACK que falla no se lleva la respuesta del outbox", async () => {
+          const { handler, enqueued, state, logs } = await bound({ ackThrows: true });
+
+          await handler.handleAsync("agent", "telegram", callbackInbound("s:s2", "cbq-1"));
+          await tick();
+
+          assert.equal(state.selected, "s2", "la selección sí ocurrió");
+          assert.equal(enqueued.length, 1, "y el humano recibe la respuesta igual");
+          assert.ok(
+            logs.some((line) => line.includes("callback ACK failed")),
+            "el fallo del ACK se registra",
+          );
+        });
+
+        it("/sessions añade un teclado con un botón por sesión y datos 's:<id>'", async () => {
+          const { handler, enqueued } = await bound();
+
+          await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+          await tick();
+
+          assert.equal(enqueued.length, 1);
+          assert.deepEqual(enqueued[0]!.keyboard, [
+            [
+              {
+                text: systemLabel("sessionRef", {
+                  name: systemLabel("sessionUnnamed"),
+                  id: "main",
+                }),
+                data: "s:main",
+              },
+            ],
+            [
+              { text: systemLabel("sessionRef", { name: "trabajo", id: "s2" }), data: "s:s2" },
+            ],
+          ]);
+        });
+
+        it("/sessions acota el teclado igual que el texto: como mucho diez botones", async () => {
+          const doce = Array.from({ length: 12 }, (_, index) => ({
+            id: `s${index + 1}`,
+            name: null,
+          }));
+          const { handler, enqueued } = await bound({ initial: doce });
+
+          await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+          await tick();
+
+          const teclado = enqueued[0]!.keyboard!;
+          assert.equal(teclado.length, 10, "el teclado no puede ser más largo que la lista");
+          assert.deepEqual(
+            teclado.map((row) => row[0]!.data),
+            doce.slice(0, 10).map((session) => `s:${session.id}`),
+            "las mismas diez sesiones y en el mismo orden que el texto",
+          );
+        });
+
+        it("/sessions sin sesiones no manda teclado: no hay nada que pulsar", async () => {
+          const { handler, enqueued } = await bound({ initial: [] });
+
+          await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+          await tick();
+
+          assert.equal(enqueued.length, 1);
+          assert.equal(enqueued[0]!.keyboard, undefined);
+        });
+
+        it("/sessions omite el botón de una sesión cuyo callback_data no cabe en el transporte", async () => {
+          // «s:» + 63 bytes = 65 > 64: Telegram rechazaría el mensaje ENTERO, así que
+          // la sesión se cae del teclado (con log) y sigue en el texto.
+          const larga = "x".repeat(63);
+          const { handler, enqueued, logs } = await bound({
+            initial: [
+              { id: larga, name: "larga" },
+              { id: "s2", name: "trabajo" },
+            ],
+          });
+
+          await handler.handleAsync("agent", "telegram", inbound("/sessions", "1"));
+          await tick();
+
+          assert.deepEqual(
+            enqueued[0]!.keyboard!.map((row) => row[0]!.data),
+            ["s:s2"],
+            "solo el botón que cabe",
+          );
+          assert.equal(
+            enqueued[0]!.text.split("\n").length,
+            1 + 2,
+            "el texto sigue listando las dos: el teclado es un atajo, no la lista",
+          );
+          assert.ok(
+            logs.some((line) => line.includes("callback data")),
+            "la sesión omitida deja su log",
+          );
+        });
+
+        it("PRESERVE: los comandos que no listan no llevan teclado", async () => {
+          const { handler, enqueued } = await bound();
+
+          await handler.handleAsync("agent", "telegram", inbound("/new trabajo", "1"));
+          await handler.handleAsync("agent", "telegram", inbound("/session s2", "2"));
+          await tick();
+
+          assert.equal(enqueued.length, 2);
+          assert.deepEqual(
+            enqueued.map((reply) => reply.keyboard),
+            [undefined, undefined],
+            "solo /sessions ofrece botones",
+          );
+        });
       });
     });
 

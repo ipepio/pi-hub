@@ -1,4 +1,4 @@
-import type { ChannelKind, InboundMessage } from "@pihub/channels";
+import type { ChannelKind, InboundMessage, InlineKeyboardButton } from "@pihub/channels";
 import type {
   CompletedTurn,
   TurnExecution,
@@ -69,8 +69,20 @@ export interface ChannelTransportLike {
   send(
     agentName: string,
     kind: ChannelKind,
-    input: { chatId: string; text: string },
+    input: { chatId: string; text: string; keyboard?: InlineKeyboardButton[][] },
   ): Promise<{ messageId: string }>;
+  /**
+   * ACK de una pulsación de botón (T6b). Best-effort por contrato: el registry nunca
+   * lo rechaza (un adaptador ausente resuelve en silencio y un fallo del transporte
+   * solo deja una línea de log), así que el inbound puede acusar sin proteger la
+   * respuesta que sí tiene reintento.
+   */
+  answerCallback(
+    agentName: string,
+    kind: ChannelKind,
+    callbackQueryId: string,
+    text?: string,
+  ): Promise<void>;
   attachInbound(
     handler: (agentName: string, kind: ChannelKind, message: InboundMessage) => void,
   ): void;
@@ -153,6 +165,9 @@ export function composeChannels(deps: ChannelCompositionDeps): ChannelCompositio
       const { messageId } = await deps.registry.send(row.agentName, row.kind, {
         chatId: row.target,
         text: row.text,
+        // T6b: los botones van DENTRO de la fila (payload), así que sobreviven al
+        // reinicio con el resto del mensaje y llegan al transporte sin cambios.
+        ...(row.keyboard === undefined ? {} : { keyboard: row.keyboard }),
       });
       return messageId;
     },
@@ -204,14 +219,26 @@ export function composeChannels(deps: ChannelCompositionDeps): ChannelCompositio
               },
             })
           : undefined,
+    // T6b: el ACK de una pulsación de botón sale por el MISMO registry que envía
+    // los mensajes, así que no hay una segunda ruta al transporte ni un segundo
+    // dueño de los fallos (el registry los registra y nunca los lanza).
+    answerCallback: (agentName, kind, callbackQueryId, text) =>
+      deps.registry.answerCallback(agentName, kind, callbackQueryId, text),
     // System replies (a pairing code) are outbox rows too: the transport is
     // never touched directly, so one owner keeps the retry policy.
+    //
+    // T6b: un teclado solo se serializa cuando EXISTE, así que el payload de todas
+    // las respuestas de sistema anteriores a esta unidad sigue siendo byte a byte el
+    // mismo (`{"text":…}`).
     enqueue: async (input) => {
       await outbox.enqueue({
         agentName: input.agentName,
         kind: input.kind,
         target: input.chatId,
-        payload: JSON.stringify({ text: input.text }),
+        payload:
+          input.keyboard === undefined
+            ? JSON.stringify({ text: input.text })
+            : JSON.stringify({ text: input.text, keyboard: input.keyboard }),
       });
     },
   });

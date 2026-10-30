@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ChannelKind, InboundMessage } from "@pihub/channels";
+import type { ChannelKind, InboundMessage, InlineKeyboardButton } from "@pihub/channels";
 import { DomainError } from "../agenda/errors.ts";
 import type { TurnExecution, TurnHandle } from "../agenda/turn-execution.ts";
 import { PairingError, type PairingMachine } from "./pairing.ts";
@@ -64,10 +64,45 @@ import type { AgentSessionCatalogue, SessionSurface } from "../sessions/catalogu
  * come in through the narrow `sessionCommands` port (production wires
  * `catalogueSessionCommands` over the durable catalogue): without that port a
  * `/…` message keeps following the historical text path.
+ *
+ * Buttons (T6b): `/sessions` also answers with an inline keyboard — one button per
+ * listed session, whose opaque `data` is `s:<sessionId>` — and a press comes back as
+ * an `InboundMessage` with `text: ""` plus `callback`. A press is therefore resolved
+ * BEFORE the command gate and before the queue: it is not prose, it is not a turn, and
+ * an empty body must never open one. Two decisions make the press cheap and safe:
+ * - **The Manager parses `s:<id>` itself.** The adapter transports the data opaquely;
+ *   anything that is not exactly `s:<id>` selects nothing (no catalogue call, no ACK).
+ * - **The press is answered twice, on purpose.** The ACK (`answerCallback`, through the
+ *   registry, best-effort) stops the client's spinner and — when the id does not exist —
+ *   IS the answer; the OUTCOME is a system message through the outbox, so a switch that
+ *   the catalogue confirms still gets the same retry/at-least-once treatment as every
+ *   other system reply. A press in an UNBOUND chat is dropped with a log line: a
+ *   keyboard can only exist in a chat that was bound when it was sent, and a press is
+ *   not a reason to open a pairing window.
  */
 
 /** Messages waiting behind a live turn, per `(agent, kind)`. */
 export const INBOUND_QUEUE_DEPTH = 10;
+
+/**
+ * Prefijo de los datos de un botón de sesión: `s:<sessionId>`.
+ *
+ * El adaptador transporta el `data` tal cual (es opaco para él), así que el contrato
+ * vive AQUÍ: quien lo escribe (`/sessions`) y quien lo lee (una pulsación) son el
+ * dueño único de su significado.
+ */
+export const SESSION_CALLBACK_PREFIX = "s:";
+
+/**
+ * Tope de bytes del `data` de un botón, el más pequeño de los transportes conocidos
+ * (Telegram: 64 bytes de `callback_data`, y lo RECHAZA, no lo trunca). Se mide con
+ * `Buffer.byteLength` y no con `.length` porque un emoji son cuatro bytes.
+ *
+ * Es una constante local a propósito: `@pihub/channels` deja la forma del teclado
+ * neutra y cada adaptador valida su propio límite. El Manager construye botones que
+ * cualquier transporte acepta, y el adaptador sigue siendo quien dice `invalid_keyboard`.
+ */
+export const CALLBACK_DATA_LIMIT = 64;
 
     /**
      * Cuántas sesiones caben en la respuesta de `/sessions`: la lista está ACOTADA.
@@ -231,6 +266,59 @@ export const INBOUND_QUEUE_DEPTH = 10;
       });
     }
 
+    /** `"s2"` → `"s:s2"`: los datos que viajan en el botón de esa sesión. */
+    export function sessionCallbackData(sessionId: string): string {
+      return `${SESSION_CALLBACK_PREFIX}${sessionId}`;
+    }
+
+    /**
+     * `"s:s2"` → `"s2"`; cualquier otra cosa → `undefined`.
+     *
+     * Estricto de propósito: el `data` es de quien pulsó, no una sugerencia. Un
+     * prefijo distinto (otro botón del bot, otra versión del Manager) o un id vacío no
+     * selecciona NADA — adivinar aquí sería mover la sesión de un chat por un dato que
+     * nadie emitió.
+     */
+    export function parseSessionCallbackData(data: string): string | undefined {
+      if (!data.startsWith(SESSION_CALLBACK_PREFIX)) return undefined;
+      const sessionId = data.slice(SESSION_CALLBACK_PREFIX.length);
+      return sessionId === "" ? undefined : sessionId;
+    }
+
+    /**
+     * El teclado de `/sessions`: una fila por sesión listada, con el nombre humano
+     * como texto y `s:<id>` como dato. `undefined` cuando no hay ninguna sesión (un
+     * teclado vacío se convierte en `reply_markup` vacío en algunos transportes).
+     *
+     * Una sesión cuyo dato no cabe en el transporte se cae del teclado con una línea
+     * de log y SIGUE en el texto: el id es lo único que hace falta para `/session`, así
+     * que perder el botón no pierde la sesión — y un solo botón demasiado largo haría
+     * que el transporte rechazara el mensaje entero.
+     */
+    function sessionsKeyboard(
+      sessions: readonly ChannelSessionView[],
+      log: (line: string) => void,
+    ): InlineKeyboardButton[][] | undefined {
+      const rows: InlineKeyboardButton[][] = [];
+      for (const session of sessions) {
+        const data = sessionCallbackData(session.id);
+        if (Buffer.byteLength(data, "utf8") > CALLBACK_DATA_LIMIT) {
+          log(
+            `session button skipped session=${session.id}: callback data exceeds ${CALLBACK_DATA_LIMIT} bytes`,
+          );
+          continue;
+        }
+        rows.push([{ text: sessionRef(session), data }]);
+      }
+      return rows.length > 0 ? rows : undefined;
+    }
+
+    /** Lo que contesta un comando: SIEMPRE un texto, y un teclado si hay algo que pulsar. */
+    export interface ChannelCommandReply {
+      readonly text: string;
+      readonly keyboard?: InlineKeyboardButton[][];
+    }
+
     /**
      * Resolución del argumento de `/session`: primero el **id** (opaco y sin ambigüedad),
      * después el **nombre exacto**. Un nombre inexistente —o repetido— no selecciona
@@ -247,18 +335,22 @@ export const INBOUND_QUEUE_DEPTH = 10;
     }
 
     /**
-     * El texto de respuesta de un comando, ya renderizado desde el catálogo de labels.
+     * La respuesta de un comando, ya renderizada desde el catálogo de labels.
      *
      * Vive fuera de la clase porque es una traducción «comando → copy», no estado: la
      * clase solo se encarga de enrutar la respuesta al outbox y de convertir un fallo
      * del catálogo en un mensaje de sistema.
+     *
+     * `/sessions` es el único comando que devuelve teclado (T6b): las mismas sesiones
+     * que lista el texto, una por botón, para que elegir no exija copiar un id.
      */
-    function commandText(
+    function commandReply(
       commands: ChannelSessionCommands,
       agentName: string,
       kind: ChannelKind,
       command: ChannelCommand,
-    ): string {
+      log: (line: string) => void,
+    ): ChannelCommandReply {
       switch (command.name) {
         case "new": {
           const created = commands.newSession({
@@ -266,7 +358,7 @@ export const INBOUND_QUEUE_DEPTH = 10;
             kind,
             ...(command.argument === "" ? {} : { name: command.argument }),
           });
-          return systemLabel("sessionCreated", { session: sessionRef(created) });
+          return { text: systemLabel("sessionCreated", { session: sessionRef(created) }) };
         }
         case "sessions": {
           const { sessions, selectedId } = commands.listSessions({ agentName, kind });
@@ -276,11 +368,15 @@ export const INBOUND_QUEUE_DEPTH = 10;
               ? `- ${sessionRef(session)} ${systemLabel("sessionSelectedMark")}`
               : `- ${sessionRef(session)}`,
           );
-          return systemLabel("sessionList", {
-            count: String(shown.length),
-            total: String(sessions.length),
-            lines: lines.join("\n"),
-          });
+          const keyboard = sessionsKeyboard(shown, log);
+          return {
+            text: systemLabel("sessionList", {
+              count: String(shown.length),
+              total: String(sessions.length),
+              lines: lines.join("\n"),
+            }),
+            ...(keyboard === undefined ? {} : { keyboard }),
+          };
         }
         case "session": {
           if (command.argument === "") {
@@ -289,47 +385,74 @@ export const INBOUND_QUEUE_DEPTH = 10;
             const status = systemLabel(
               commands.isBusy({ agentName }) ? "agentBusy" : "agentIdle",
             );
-            if (!current) return systemLabel("sessionNone", { status });
-            return systemLabel("sessionCurrent", { session: sessionRef(current), status });
+            if (!current) return { text: systemLabel("sessionNone", { status }) };
+            return {
+              text: systemLabel("sessionCurrent", {
+                session: sessionRef(current),
+                status,
+              }),
+            };
           }
           const { sessions } = commands.listSessions({ agentName, kind });
           const target = findSession(sessions, command.argument);
           if (!target) {
-            return systemLabel("sessionUnknownTarget", { target: command.argument });
+            return {
+              text: systemLabel("sessionUnknownTarget", { target: command.argument }),
+            };
           }
           const selected = commands.selectSession({ agentName, kind, sessionId: target.id });
-          return systemLabel("sessionSwitched", { session: sessionRef(selected) });
+          return { text: systemLabel("sessionSwitched", { session: sessionRef(selected) }) };
         }
-            case "stop":
-              // El binding ya está comprobado: solo el chat enlazado llega aquí, así que
-              // `/stop` no necesita (ni debe) otra condición de propiedad.
-              //
-              // T4-D/2: el turno vivo puede ser una reserva que sobrevivió al reinicio del
-              // Manager (`loadUnverified`). Existe —ocupa el slot— pero su socket no vive
-              // en este proceso, así que `abort` lo rechaza con `TURN_UNREACHABLE` en vez
-              // de fingir: el humano recibe un label que lo dice (y no el genérico
-              // `commandFailed`, que culpa al catálogo y sugiere reintentar en vano).
-              try {
-                return systemLabel(
-                  commands.abortIfLive({ agentName }) ? "stopRequested" : "stopNothing",
-                );
-              } catch (error) {
-                if (error instanceof DomainError && error.code === "TURN_UNREACHABLE") {
-                  return systemLabel("turnUnreachable");
-                }
-                throw error;
-              }
+        case "stop":
+          // El binding ya está comprobado: solo el chat enlazado llega aquí, así que
+          // `/stop` no necesita (ni debe) otra condición de propiedad.
+          //
+          // T4-D/2: el turno vivo puede ser una reserva que sobrevivió al reinicio del
+          // Manager (`loadUnverified`). Existe —ocupa el slot— pero su socket no vive
+          // en este proceso, así que `abort` lo rechaza con `TURN_UNREACHABLE` en vez
+          // de fingir: el humano recibe un label que lo dice (y no el genérico
+          // `commandFailed`, que culpa al catálogo y sugiere reintentar en vano).
+          try {
+            return {
+              text: systemLabel(
+                commands.abortIfLive({ agentName }) ? "stopRequested" : "stopNothing",
+              ),
+            };
+          } catch (error) {
+            if (error instanceof DomainError && error.code === "TURN_UNREACHABLE") {
+              return { text: systemLabel("turnUnreachable") };
+            }
+            throw error;
+          }
         default:
-          return systemLabel("unknownCommand", { command: command.name });
+          return { text: systemLabel("unknownCommand", { command: command.name }) };
       }
     }
 
-    /** Outbound delivery of a transport-level message (pairing code): the outbox. */
+    /**
+     * `SESSION_NOT_FOUND` leído ESTRUCTURALMENTE, no con `instanceof`.
+     *
+     * `sessions/catalogue.ts` importa `mainSessionKeyOf` de este fichero: importar su
+     * clase de error de vuelta sería un ciclo. Además un catálogo de mentira en un test
+     * (o la clase llegando por `dist`) tiene que clasificarse igual, y el código es el
+     * contrato, no la identidad del constructor.
+     */
+    function sessionNotFound(error: unknown): boolean {
+      return (error as { code?: unknown } | null)?.code === "SESSION_NOT_FOUND";
+    }
+
+/** Outbound delivery of a transport-level message (pairing code): the outbox. */
 export interface InboundEnqueueInput {
   agentName: string;
   kind: ChannelKind;
   chatId: string;
   text: string;
+  /**
+   * Botones que acompañan al mensaje (T6b). Opcional: una respuesta de sistema sin nada
+   * que pulsar no inventa un teclado vacío, y el payload que se serializa para ella es
+   * byte a byte el de siempre (`{"text":…}`).
+   */
+  keyboard?: InlineKeyboardButton[][];
 }
 
 export type EnqueueFn = (input: InboundEnqueueInput) => void | Promise<void>;
@@ -383,7 +506,7 @@ export interface ChannelInboundDeps {
        * un import de vuelta sería un ciclo. Sin inyección se conserva la main histórica
        * (`agent:<nombre>:main`), que es lo que usan los tests anteriores a esta unidad.
        */
-          sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
+      sessionKeyFor?: (agentName: string, kind: ChannelKind, chatId: string) => string;
       /**
        * Operaciones de catálogo para los comandos de texto (`/new`, `/sessions`,
        * `/session`, `/stop`). Se inyecta en la composición, que es quien sabe qué
@@ -394,6 +517,20 @@ export interface ChannelInboundDeps {
        * arranca la producción.
        */
       sessionCommands?: ChannelSessionCommands;
+      /**
+       * ACK de una pulsación de botón (T6b). La composición lo cablea al registry
+       * (`registry.answerCallback` → `adapter.answerCallback`), que es quien habla con
+       * el transporte y quien decide que un fallo del ACK se registra y no se propaga.
+       *
+       * Ausente = no hay a quién acusar: el handler sigue seleccionando y contestando
+       * por el outbox, que es lo que el humano conserva.
+       */
+      answerCallback?: (
+        agentName: string,
+        kind: ChannelKind,
+        callbackQueryId: string,
+        text?: string,
+      ) => Promise<void>;
       newTurnId?: () => string;
   log?: (line: string) => void;
 }
@@ -412,6 +549,9 @@ export class ChannelInboundHandler {
   private readonly enqueue: EnqueueFn;
   private readonly sessionKeyFor: (agentName: string, kind: ChannelKind, chatId: string) => string;
   private readonly sessionCommands: ChannelSessionCommands | undefined;
+  private readonly answerCallback:
+    | ((agentName: string, kind: ChannelKind, callbackQueryId: string, text?: string) => Promise<void>)
+    | undefined;
   private readonly newTurnId: () => string;
   private readonly log: (line: string) => void;
   private readonly queues = new Map<string, QueuedInbound[]>();
@@ -426,6 +566,7 @@ export class ChannelInboundHandler {
     this.sessionKeyFor =
       deps.sessionKeyFor ?? ((agentName) => mainSessionKeyOf(agentName));
     this.sessionCommands = deps.sessionCommands;
+    this.answerCallback = deps.answerCallback;
     this.newTurnId = deps.newTurnId ?? randomUUID;
     this.log = deps.log ?? ((line) => console.error(`[channels] ${line}`));
   }
@@ -460,15 +601,33 @@ export class ChannelInboundHandler {
     }
 
     const state = await this.pairing.stateOf(agentName, kind);
+    const bound =
+      state?.externalChatId !== null && state?.externalChatId !== undefined;
 
-    if (state?.externalChatId !== null && state?.externalChatId !== undefined) {
-      if (state.externalChatId !== chatId) {
+    if (bound && state.externalChatId !== chatId) {
         // Never steal: the binding is the owner's fact, not the sender's.
-        this.log(
+      this.log(
           `inbound ignored: channel "${kind}" of agent "${agentName}" already bound to another chat`,
+      );
+      return;
+    }
+
+    // T6b: una PULSACIÓN no es prosa. Se resuelve antes de la puerta de comandos y
+    // antes de la cola (su `text` viene vacío: encolarla abriría un turno sin
+    // mensaje), y exige vínculo activo: un teclado solo pudo existir en un chat
+    // enlazado, así que una pulsación NUNCA abre el flujo de emparejamiento.
+    if (message.callback !== undefined) {
+      if (!bound) {
+        this.log(
+          `callback ignored: channel "${kind}" of agent "${agentName}" is not bound to any chat`,
         );
         return;
       }
+      await this.handleCallback(agentName, kind, chatId, message.callback);
+      return;
+    }
+
+    if (bound) {
       // T6a: los comandos se resuelven ANTES del camino de turnos (no gastan el
       // turno del Agent) y DESPUÉS del binding — un chat sin enlazar recibe el
       // flujo de emparejamiento y nunca un comando.
@@ -524,6 +683,10 @@ export class ChannelInboundHandler {
        * El texto sale siempre del catálogo de labels (`labels.ts`): el handler no tiene
        * copy propio. Un fallo del catálogo de sesiones se convierte en «no he podido»
        * (y en una línea de log) en vez de en un turno o en un silencio.
+       *
+       * T6b: la respuesta puede llevar teclado (`/sessions`), y entonces viaja en la
+       * MISMA fila del outbox que el texto — misma política de reintento, mismo
+       * at-least-once, sin una segunda ruta al transporte.
        */
       private async replyCommand(
         agentName: string,
@@ -532,21 +695,117 @@ export class ChannelInboundHandler {
         commands: ChannelSessionCommands,
         command: ChannelCommand,
       ): Promise<void> {
-        let text: string;
+        let reply: ChannelCommandReply;
         try {
-          text = commandText(commands, agentName, kind, command);
+          reply = commandReply(commands, agentName, kind, command, this.log);
         } catch (error) {
           this.log(
             `command failed agent=${agentName} kind=${kind} command=/${command.name}: ${String(error)}`,
           );
-          text = systemLabel("commandFailed", { command: command.name });
+          reply = { text: systemLabel("commandFailed", { command: command.name }) };
         }
-        await this.enqueue({ agentName, kind, chatId, text });
+        await this.enqueue({
+          agentName,
+          kind,
+          chatId,
+          text: reply.text,
+          ...(reply.keyboard === undefined ? {} : { keyboard: reply.keyboard }),
+        });
+      }
+
+      /**
+       * Una pulsación de botón (T6b): selecciona la sesión que el botón ofrece y
+       * contesta por las DOS vías que existen, cada una con su trabajo.
+       *
+       * | caso | ACK (`answerCallback`) | outbox |
+       * | --- | --- | --- |
+       * | `s:<id>` + sesión seleccionada | sin texto (apaga el spinner) | `sessionSwitched` |
+       * | `s:<id>` + sesión inexistente | `sessionUnknownTarget` | nada: el ACK ES la respuesta |
+       * | `s:<id>` + catálogo caído | `commandFailed` | `commandFailed` (reintento del outbox) |
+       * | `data` que no es `s:<id>`, id vacío, o chat sin enlazar | nada | nada |
+       *
+       * La asimetría de la segunda fila es deliberada: un id que no existe no va a
+       * existir en el siguiente intento, así que una fila de outbox solo añadiría una
+       * respuesta lenta y un reintento inútil a algo que el cliente ya mostró. Un
+       * catálogo caído, en cambio, SÍ puede volver — y entonces la respuesta que el
+       * humano conserva es la del outbox.
+       */
+      private async handleCallback(
+        agentName: string,
+        kind: ChannelKind,
+        chatId: string,
+        callback: { id: string; data: string },
+      ): Promise<void> {
+        const where = `agent=${agentName} kind=${kind} chat=${chatId}`;
+        const sessionId = parseSessionCallbackData(callback.data);
+        if (sessionId === undefined) {
+          this.log(
+            `callback ignored ${where}: data is not "${SESSION_CALLBACK_PREFIX}<sessionId>"`,
+          );
+          return;
+        }
+        if (callback.id === "") {
+          this.log(`callback ignored ${where}: the query carries no id to acknowledge`);
+          return;
+        }
+        const commands = this.sessionCommands;
+        if (commands === undefined) {
+          this.log(`callback ignored ${where}: no session catalogue is wired`);
+          return;
+        }
+
+        let selected: ChannelSessionView;
+        try {
+          selected = commands.selectSession({ agentName, kind, sessionId });
+        } catch (error) {
+          if (sessionNotFound(error)) {
+            await this.acknowledge(
+              agentName,
+              kind,
+              callback.id,
+              systemLabel("sessionUnknownTarget", { target: sessionId }),
+            );
+            return;
+          }
+          this.log(`callback failed ${where} session=${sessionId}: ${String(error)}`);
+          const text = systemLabel("commandFailed", { command: "session" });
+          await this.acknowledge(agentName, kind, callback.id, text);
+          await this.enqueue({ agentName, kind, chatId, text });
+          return;
+        }
+
+        await this.acknowledge(agentName, kind, callback.id);
+        await this.enqueue({
+          agentName,
+          kind,
+          chatId,
+          text: systemLabel("sessionSwitched", { session: sessionRef(selected) }),
+        });
+      }
+
+      /**
+       * El ACK del transporte, best-effort: la pulsación ya ocurrió y lo que el humano
+       * conserva es la respuesta del outbox. Un fallo aquí se REGISTRA y no se propaga
+       * — jamás puede llevarse la respuesta que sí tiene reintento.
+       */
+      private async acknowledge(
+        agentName: string,
+        kind: ChannelKind,
+        callbackQueryId: string,
+        text?: string,
+      ): Promise<void> {
+        const answer = this.answerCallback;
+        if (answer === undefined) return;
+        try {
+          await answer(agentName, kind, callbackQueryId, text);
+        } catch (error) {
+          this.log(`callback ACK failed agent=${agentName} kind=${kind}: ${String(error)}`);
+        }
       }
 
       /** Messages waiting behind a live turn for one `(agent, kind)`. */
       queueDepth(agentName: string, kind: ChannelKind): number {
-    return this.queues.get(queueKey(agentName, kind))?.length ?? 0;
+        return this.queues.get(queueKey(agentName, kind))?.length ?? 0;
   }
 
   /** Resolves when every queue and drain has settled (test seam, no sleeps). */
