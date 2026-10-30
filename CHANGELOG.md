@@ -5,6 +5,50 @@ Todas las Notables Changes (semver) se documentan aquí. El formato se basa en
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-30
+
+### Added
+
+- **Workspace de sesiones de Agent (`feat/agent-session-workspace`)**: catálogo
+  durable de sesiones por Agent (schema v5 `agent_sessions` + `agent_session_selection`)
+  con selección por superficie (web/Telegram independientes), adopción legacy
+  determinista de `agent:<nombre>:main` y API `/api/v1` con claves validadas y
+  fail-closed.
+- **Admisión de un turno por Agent**: `409 TURN_IN_PROGRESS` antes de abrir el SSE,
+  reserva síncrona en `TurnExecution`, política por origen (Telegram avisa vía outbox,
+  Autonomía queda `queued`), gate de ejecución en el Runner, `disconnect()` ya no
+  corta el turno ni libera el slot, fence de arranque del Supervisor sobre puertos
+  ocupados.
+- **Registro durable de turnos vivos (schema v8 `agent_live_turns`)** con
+  reconciliación al arranque vía introspección de la gate del Runner
+  (`GET /api/status` expone `execution{busy,holder}`): el 409 sobrevive reinicios del
+  Manager y los turnos huérfanos se cierran `failed`/`turn_orphaned`; nunca se adopta
+  un turno no verificado.
+- **Transcript completo de filas nuevas** (schema v6, mitades hasta 32.768 chars con
+  `hasFull`) e **identidad de sesión del turno al espejo** (schema v7
+  `session_key`); filas legacy READ-ONLY para siempre.
+- **Comandos de sesión en Telegram**: `/new`, `/sessions`, `/session [nombre|id]`,
+  `/stop` (copy 100% vía `channels/labels.ts`, nunca gastan el slot de admisión) y
+  **teclado en línea**: un botón por sesión (`callback_query`, datos `s:<id>` opacos
+  para el transporte, parseados y validados contra el chat enlazado SOLO por el
+  Manager; ACK síncrono + resultado por outbox).
+- **Panel del Manager con sesiones**: el panel adopta el catálogo como única fuente
+  de la identidad del turno (crea, lista, selecciona; sin catálogo o sin selección
+  el turno se bloquea fail-closed); corrección de un import faltante pre-existente
+  que rompía el panel en el navegador.
+
+### Changed
+
+- `POST /api/packages` del Runner sigue aceptando `source` libre (hueco de
+  procedencia documentado en `docs/pi-mcp-adapter-compatibility.md`).
+
+### Security
+
+- Investigación read-only de `pi-mcp-adapter`:
+  **NO instalar por defecto** con SDK 0.80.3 (peer range incompatible, superficies
+  de config no administrables, herencia de env del Runner). Camino condicional
+  documentado en `docs/pi-mcp-adapter-compatibility.md`.
+
 ## [0.11.0] — 2026-10-26
 
 ### Added
