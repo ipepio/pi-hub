@@ -9,6 +9,7 @@ import {
 import type {
   TelegramBotLike,
   TelegramInboundContext,
+  TelegramCallbackContext,
 } from "../dist/index.js";
 
 // ChannelAdapter seam under a fake transport: every assertion here runs with
@@ -24,10 +25,26 @@ import type {
 // `stop()` (or with the injected `startError`), and `loopState` says which of
 // the three the bot is in.
 
+/**
+ * One `api.sendMessage` call as the transport saw it. `argc` is the real argument
+ * count, so "no options were passed" is asserted at the call site and not only
+ * through `options === undefined` (a third explicit `undefined` is a difference
+ * the transport can see).
+ */
+interface SentRecord {
+  chatId: string;
+  text: string;
+  options?: unknown;
+  argc: number;
+}
+
 interface FakeBot extends TelegramBotLike {
   events: string[];
   inboundHandlers: Array<(ctx: TelegramInboundContext) => unknown>;
-  sent: Array<{ chatId: string; text: string }>;
+  callbackHandlers: Array<(ctx: TelegramCallbackContext) => unknown>;
+  sent: SentRecord[];
+  answered: Array<{ id: string; text?: string }>;
+  answerError: unknown;
   sendOutcomes: Array<{ ok: boolean; error?: unknown }>;
   calls: string[];
   getMeError: unknown;
@@ -36,6 +53,7 @@ interface FakeBot extends TelegramBotLike {
   /** `polling` = the grammy loop is running and its promise is still pending. */
   loopState: "idle" | "polling" | "stopped" | "failed";
   emit(ctx: TelegramInboundContext): void;
+  emitCallback(ctx: TelegramCallbackContext): void;
 }
 
 const TOKEN = "123456:AAAA-secret-token-value";
@@ -43,23 +61,29 @@ const TOKEN = "123456:AAAA-secret-token-value";
 function fakeBot(options: {
   getMeError?: unknown;
   startError?: unknown;
+  answerError?: unknown;
   sendOutcomes?: Array<{ ok: boolean; error?: unknown }>;
 } = {}): FakeBot {
   const state = {
     calls: [] as string[],
-    sent: [] as Array<{ chatId: string; text: string }>,
+    sent: [] as SentRecord[],
+    answered: [] as Array<{ id: string; text?: string }>,
     sendOutcomes: [...(options.sendOutcomes ?? [])],
     stopCount: 0,
     loopState: "idle" as FakeBot["loopState"],
   };
   const handlers: Array<(ctx: TelegramInboundContext) => unknown> = [];
+  const callbackHandlers: Array<(ctx: TelegramCallbackContext) => unknown> = [];
   /** Settles the pending loop the way grammy does: from the other side of `stop()`. */
   let settleLoop: ((error?: unknown) => void) | undefined;
 
   return {
     events: [],
     inboundHandlers: handlers,
+    callbackHandlers,
     sent: state.sent,
+    answered: state.answered,
+    answerError: options.answerError,
     sendOutcomes: state.sendOutcomes,
     calls: state.calls,
     getMeError: options.getMeError,
@@ -73,7 +97,11 @@ function fakeBot(options: {
     on(event, handler) {
       state.calls.push("on");
       this.events.push(event);
-      handlers.push(handler);
+      if (event === "callback_query:data") {
+        callbackHandlers.push(handler as (ctx: TelegramCallbackContext) => unknown);
+        return;
+      }
+      handlers.push(handler as (ctx: TelegramInboundContext) => unknown);
     },
     api: {
       getMe: async () => {
@@ -81,12 +109,19 @@ function fakeBot(options: {
         if (options.getMeError) throw options.getMeError;
         return { id: 1, is_bot: true, username: "pihub_test_bot" };
       },
-      sendMessage: async (chatId: string, text: string) => {
+      // Rest args on purpose: `argc` records whether the adapter really passed
+      // the optional third argument, which is what "no keyboard" means on wire.
+      sendMessage: async (chatId: string, text: string, ...rest: unknown[]) => {
         state.calls.push("sendMessage");
-        state.sent.push({ chatId, text });
+        state.sent.push({ chatId, text, options: rest[0], argc: rest.length + 2 });
         const outcome = state.sendOutcomes.shift() ?? { ok: true };
         if (!outcome.ok) throw outcome.error;
         return { messageId: `${1000 + state.sent.length}` };
+      },
+      answerCallbackQuery: async (id: string, text?: string) => {
+        state.calls.push("answerCallbackQuery");
+        state.answered.push({ id, text });
+        if (options.answerError) throw options.answerError;
       },
     },
     start: () => {
@@ -117,6 +152,9 @@ function fakeBot(options: {
     emit(ctx) {
       for (const handler of handlers) handler(ctx);
     },
+    emitCallback(ctx) {
+      for (const handler of callbackHandlers) handler(ctx);
+    },
   };
 }
 
@@ -139,8 +177,10 @@ test("start verifies the token before polling and registers the inbound handler"
 
   assert.equal(adapter.kind, "telegram");
   // getMe first: an invalid token must never reach the long-poll loop.
-  assert.deepEqual(bot.calls, ["getMe", "on", "start"]);
-  assert.deepEqual(bot.events, ["message:text"]);
+  assert.deepEqual(bot.calls, ["getMe", "on", "on", "start"]);
+  // Deliberate additive pin (T6b/1): the adapter now subscribes to the button
+  // presses too, because an inline keyboard that nobody listens to is a dead end.
+  assert.deepEqual(bot.events, ["message:text", "callback_query:data"]);
   assert.equal(seen.length, 0);
 });
 
@@ -220,10 +260,13 @@ test("send posts the text and returns the external message id", async () => {
   const adapter = adapterWith(bot);
   await adapter.start({ token: TOKEN, onInbound: () => {} });
 
-  const result = await adapter.send({ chatId: "55", text: "respuesta" });
+      const result = await adapter.send({ chatId: "55", text: "respuesta" });
 
-  assert.deepEqual(bot.sent, [{ chatId: "55", text: "respuesta" }]);
-  assert.equal(result.messageId, "1001");
+      // PRESERVE: no keyboard means the transport is called with two arguments only.
+      assert.deepEqual(bot.sent, [
+        { chatId: "55", text: "respuesta", options: undefined, argc: 2 },
+      ]);
+      assert.equal(result.messageId, "1001");
 });
 
 test("send chunks a text longer than the transport limit and reports the first id", async () => {
@@ -332,9 +375,11 @@ test("start es síncrona respecto al loop: el bot se entrega ANTES de que el pol
   bot.emit({ chatId: "-1001", messageId: "7", text: "¿hora en Madrid?" });
   assert.equal(received.length, 1, "inbound fluye con el loop aún abierto");
 
-  const sent = await adapter.send({ chatId: "-1001", text: "las 10" });
-  assert.equal(sent.messageId, "1001");
-  assert.deepEqual(bot.sent, [{ chatId: "-1001", text: "las 10" }]);
+      const sent = await adapter.send({ chatId: "-1001", text: "las 10" });
+      assert.equal(sent.messageId, "1001");
+      assert.deepEqual(bot.sent, [
+        { chatId: "-1001", text: "las 10", options: undefined, argc: 2 },
+      ]);
 
   // `stop()` is what ends the loop, and it resolves: no unstoppable poller.
   await adapter.stop();
@@ -401,4 +446,194 @@ test("redactTelegramError tolerates a non-Error throwable", async () => {
   const { redactTelegramError } = await import("../dist/grammy-bot.js");
   assert.equal(redactTelegramError(undefined, TOKEN), "unknown error");
   assert.equal(redactTelegramError({ message: "x" }, TOKEN), "[object Object]");
+});
+
+// --- callback queries and inline keyboards (T6b/1) ---------------------------
+//
+// The seam grows two additive capabilities: an inbound button press arrives as an
+// InboundMessage carrying `callback`, and an outbound message may carry an inline
+// keyboard whose `callback_data` the transport echoes back. Nothing here is
+// Telegram-specific on purpose: the Manager only ever sees `{id, data}` and rows of
+// `{text, data}`.
+
+test("un callback_query:data llega como InboundMessage con callback y sin texto", async () => {
+  const bot = fakeBot();
+  const adapter = adapterWith(bot);
+  const received: Array<Record<string, unknown>> = [];
+
+  await adapter.start({
+    token: TOKEN,
+    onInbound: (message) => received.push({ ...message }),
+  });
+  bot.emitCallback({
+    chatId: "-100123",
+    messageId: "42",
+    id: "cb-1",
+    data: "approve:turn-7",
+    senderName: "Pepe",
+  });
+
+  // `text` is empty, not absent: a press carries no prose, and a consumer that
+  // matches on `callback` never has to guard a missing field.
+  assert.deepEqual(received, [
+    {
+      externalChatId: "-100123",
+      text: "",
+      messageId: "42",
+      senderName: "Pepe",
+      callback: { id: "cb-1", data: "approve:turn-7" },
+    },
+  ]);
+});
+
+test("un callback sin mensaje asociado se descarta en vez de reventar el poller", async () => {
+  const logs: string[] = [];
+  const bot = fakeBot();
+  const adapter = createTelegramChannelAdapter({
+    botFactory: () => bot,
+    log: (line) => logs.push(line),
+  });
+  const received: unknown[] = [];
+
+  await adapter.start({ token: TOKEN, onInbound: (message) => received.push(message) });
+  // Telegram still delivers button presses whose message was deleted when the bot
+  // was offline. Fail closed: drop it and say so, never throw out of the poller.
+  assert.doesNotThrow(() =>
+    bot.emitCallback({ chatId: "", messageId: "", id: "cb-2", data: "stale" }),
+  );
+  assert.deepEqual(received, []);
+  assert.match(logs.join("\n"), /callback/);
+  assert.equal(logs.join("\n").includes(TOKEN), false);
+});
+
+test("send con keyboard manda el reply_markup solo en el primer chunk", async () => {
+  const bot = fakeBot();
+  const adapter = createTelegramChannelAdapter({
+    botFactory: () => bot,
+    textLimit: 10,
+  });
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  await adapter.send({
+    chatId: "55",
+    text: "A".repeat(25),
+    keyboard: [
+      [{ text: "Sí", data: "approve:7" }, { text: "No", data: "reject:7" }],
+      [{ text: "Luego", data: "later:7" }],
+    ],
+  });
+
+  assert.equal(bot.sent.length, 3);
+  // Buttons belong to the message that asks the question, never to its tail.
+  assert.deepEqual(bot.sent[0].options, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "Sí", callback_data: "approve:7" },
+          { text: "No", callback_data: "reject:7" },
+        ],
+        [{ text: "Luego", callback_data: "later:7" }],
+      ],
+    },
+  });
+  assert.equal(bot.sent[0].argc, 3);
+  assert.equal(bot.sent[1].options, undefined);
+  assert.equal(bot.sent[1].argc, 2);
+  assert.equal(bot.sent[2].options, undefined);
+  assert.equal(bot.sent[2].argc, 2);
+});
+
+test("un keyboard vacío se comporta como no mandar keyboard", async () => {
+  const bot = fakeBot();
+  const adapter = adapterWith(bot);
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  await adapter.send({ chatId: "55", text: "hola", keyboard: [] });
+
+  assert.deepEqual(bot.sent, [{ chatId: "55", text: "hola", options: undefined, argc: 2 }]);
+});
+
+test("un callback_data de más de 64 bytes falla antes de cualquier llamada de red", async () => {
+  const bot = fakeBot();
+  const adapter = adapterWith(bot);
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  await assert.rejects(
+    () =>
+      adapter.send({
+        chatId: "55",
+        text: "¿aprobar?",
+        keyboard: [[{ text: "OK", data: "x".repeat(65) }]],
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ChannelAdapterError);
+      assert.equal(error.code, "invalid_keyboard");
+      return true;
+    },
+  );
+  // Fail fast: the transport is never asked to reject what we already know is bad.
+  assert.deepEqual(bot.sent, []);
+  assert.deepEqual(bot.calls, ["getMe", "on", "on", "start"]);
+});
+
+test("un callback_data vacío o no-string también es invalid_keyboard", async () => {
+  const bot = fakeBot();
+  const adapter = adapterWith(bot);
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  await assert.rejects(
+    () => adapter.send({ chatId: "55", text: "x", keyboard: [[{ text: "OK", data: "" }]] }),
+    (error: unknown) =>
+      error instanceof ChannelAdapterError && error.code === "invalid_keyboard",
+  );
+  await assert.rejects(
+    () =>
+      adapter.send({
+        chatId: "55",
+        text: "x",
+        keyboard: [[{ text: "OK", data: 42 as unknown as string }]],
+      }),
+    (error: unknown) =>
+      error instanceof ChannelAdapterError && error.code === "invalid_keyboard",
+  );
+  assert.deepEqual(bot.sent, []);
+});
+
+test("answerCallback acusa el callback con y sin texto de aviso", async () => {
+  const bot = fakeBot();
+  const adapter = adapterWith(bot);
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  await adapter.answerCallback?.("cb-1", "Turno aprobado");
+  await adapter.answerCallback?.("cb-2");
+
+  assert.deepEqual(bot.answered, [
+    { id: "cb-1", text: "Turno aprobado" },
+    { id: "cb-2", text: undefined },
+  ]);
+});
+
+test("answerCallback es best-effort: un transporte que falla se registra y no escapa", async () => {
+  const logs: string[] = [];
+  const bot = fakeBot({ answerError: new Error("400: Bad Request: query is too old") });
+  const adapter = createTelegramChannelAdapter({
+    botFactory: () => bot,
+    log: (line) => logs.push(line),
+  });
+  await adapter.start({ token: TOKEN, onInbound: () => {} });
+
+  // A stale ack is harmless: the buttons are gone anyway. Throwing here would
+  // break the inbound turn that merely tried to acknowledge a press.
+  await assert.doesNotReject(() => adapter.answerCallback!("cb-3", "ok"));
+  assert.match(logs.join("\n"), /unavailable/);
+});
+
+test("answerCallback antes de start es un unavailable tipado, no un TypeError", async () => {
+  const adapter = adapterWith(fakeBot());
+
+  await assert.rejects(
+    () => adapter.answerCallback!("cb-1"),
+    (error: unknown) =>
+      error instanceof ChannelAdapterError && error.code === "unavailable",
+  );
 });

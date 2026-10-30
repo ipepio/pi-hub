@@ -33,18 +33,52 @@ export function isChannelKind(value: unknown): value is ChannelKind {
   );
 }
 
-/** One inbound message, already normalized out of the transport's own shape. */
+/**
+ * One button of an inline keyboard: a label the human reads and an opaque
+ * `data` the transport echoes back verbatim when it is pressed.
+ *
+ * `data` is transport payload, not prose: it travels in the transport's own
+ * `callback_data` field, which Telegram caps at 64 UTF-8 bytes and rejects
+ * (rather than truncates) past that. The cap is validated at the transport seam
+ * — the shape here stays transport-neutral, the limit does not.
+ */
+export interface InlineKeyboardButton {
+  text: string;
+  data: string;
+}
+
+/**
+ * One inbound message, already normalized out of the transport's own shape.
+ *
+ * A button press is the same shape as a text message plus `callback`: a press
+ * carries no prose (`text` is `""`, never absent) and `callback.data` is exactly
+ * what the sender keyboard's button was created with. Consumers that only care
+ * about prose keep matching on `text`; consumers that only care about presses
+ * match on `callback`. Existing producers that never set it stay valid.
+ */
 export interface InboundMessage {
   /** External chat id as a string: the wire contract never carries numbers. */
   externalChatId: string;
   text: string;
   messageId: string;
   senderName?: string;
+  /** Present only when the inbound event was an inline-keyboard press. */
+  callback?: { id: string; data: string };
 }
 
+/**
+ * Transport failure in a form the Manager can decide on without parsing strings.
+ *
+ * `invalid_keyboard` is the one code that is NOT a transport failure: it means the
+ * caller handed `send` a keyboard the transport can never accept (empty
+ * `callback_data`, more than 64 bytes, a label-less button). It is detected
+ * before any network call, so retrying it is pointless by construction — a
+ * caller must treat it as terminal and fix its own payload.
+ */
 export type ChannelAdapterErrorCode =
   | "invalid_token"
   | "invalid_chat"
+  | "invalid_keyboard"
   | "rate_limited"
   | "unavailable";
 
@@ -76,7 +110,24 @@ export interface ChannelAdapter {
     token: string;
     onInbound: (message: InboundMessage) => void;
   }): Promise<void>;
-  send(input: { chatId: string; text: string }): Promise<{ messageId: string }>;
+  /**
+   * Deliver one message. `keyboard` is additive: rows of buttons that ride on the
+   * FIRST chunk of the text only (a keyboard under a continuation chunk would ask
+   * the same question twice). Omitting it, or passing `[]`, must reach the
+   * transport as a plain message — no empty markup is ever sent.
+   */
+  send(input: {
+    chatId: string;
+    text: string;
+    keyboard?: InlineKeyboardButton[][];
+  }): Promise<{ messageId: string }>;
+  /**
+   * Acknowledge a button press (`InboundMessage.callback.id`) so the sender's
+   * client stops showing a spinner. Optional so adapters and fakes that were
+   * written before keyboards existed stay source-compatible; `text` is the short
+   * toast the transport may show instead of the message's own answer.
+   */
+  answerCallback?(callbackQueryId: string, text?: string): Promise<void>;
   stop(): Promise<void>;
 }
 
